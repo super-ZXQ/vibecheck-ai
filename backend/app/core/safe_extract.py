@@ -7,11 +7,14 @@ Security guarantees:
   single file size) — extraction aborts immediately when any limit is hit.
 - Never executes any code, build script, or test from the extracted files.
 - All temp files cleaned up via try/finally on success or failure.
+- Cleanup handles read-only files via onerror callback.
+- Persistent cleanup failures are logged without sensitive content.
 """
 
 import io
 import os
 import shutil
+import stat
 import tarfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -120,6 +123,43 @@ def _is_within_directory(directory: Path, target: Path) -> bool:
         target_resolved = target.resolve()
         return str(target_resolved).startswith(str(directory_resolved))
     except (OSError, ValueError):
+        return False
+
+
+def _remove_readonly(func, path, exc_info):
+    """Error handler for shutil.rmtree — force-remove read-only files."""
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except Exception:
+        pass
+
+
+def _safe_remove_tree(path: Path) -> bool:
+    """Remove a directory tree, handling read-only files. Returns True on success.
+
+    On persistent failure, logs an error message without sensitive content
+    (file paths in temp dirs are not considered sensitive).
+    """
+    if not path.exists():
+        return True
+    try:
+        shutil.rmtree(path, onerror=_remove_readonly)
+        if path.exists():
+            # Persistent failure — log without sensitive content
+            import logging
+            logging.error(
+                "Failed to fully clean up temp directory: %s "
+                "(some files may remain)", path
+            )
+            return False
+        return True
+    except Exception as e:
+        import logging
+        logging.error(
+            "Failed to clean up temp directory: %s (error: %s, no sensitive content)",
+            path, type(e).__name__
+        )
         return False
 
 
@@ -248,17 +288,9 @@ def safe_extract(
             tar.close()
 
     finally:
-        # Clean up on failure
+        # Clean up on failure — handle read-only files via onerror
         if not extracted:
-            if dest_path.exists():
-                shutil.rmtree(dest_path, ignore_errors=True)
-            raise_last = True
-        else:
-            raise_last = False
-
-    if raise_last:
-        # This shouldn't be reached, but just in case
-        raise ExtractionError("Extraction failed for unknown reason")
+            _safe_remove_tree(dest_path)
 
     return result
 
@@ -286,7 +318,9 @@ def safe_extract_to_temp(
 
 
 def cleanup_temp_dir(dest_dir: str | Path) -> None:
-    """Clean up a temporary extraction directory."""
-    dest_path = Path(dest_dir)
-    if dest_path.exists():
-        shutil.rmtree(dest_path, ignore_errors=True)
+    """Clean up a temporary extraction directory.
+
+    Handles read-only files via onerror callback. On persistent failure,
+    logs an error without sensitive content.
+    """
+    _safe_remove_tree(Path(dest_dir))

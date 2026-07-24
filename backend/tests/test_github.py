@@ -62,26 +62,76 @@ class TestParseRepoUrl:
 
 
 class TestIsAllowedRedirect:
-    """Test redirect host checking."""
+    """Test redirect host and scheme checking — HTTPS only."""
 
     @pytest.mark.parametrize("url", [
         "https://github.com/user/repo/tarball",
         "https://codeload.github.com/user/repo/tar.gz",
-        "http://github.com/some/path",
         "https://codeload.github.com/some/path",
     ])
     def test_allowed_hosts(self, url):
-        """Redirects to github.com and codeload.github.com should be allowed."""
+        """HTTPS redirects to github.com and codeload.github.com should be allowed."""
         assert is_allowed_redirect(url) is True
 
     @pytest.mark.parametrize("url", [
         "https://evil.com/path",
         "https://attacker.com/github.com",
         "https://github.com.evil.com/path",
-        "ftp://codeload.github.com/path",
+        "http://github.com/some/path",  # HTTP not allowed for redirects
+        "http://codeload.github.com/some/path",  # HTTP not allowed
+        "ftp://codeload.github.com/path",  # FTP not allowed
         "not a url",
         "",
     ])
     def test_disallowed_hosts(self, url):
-        """Redirects to non-allowed hosts should be rejected."""
+        """Non-HTTPS or non-allowed hosts should be rejected."""
         assert is_allowed_redirect(url) is False
+
+
+class TestStripAuthHeaders:
+    """Test that auth headers are properly stripped on cross-host redirects."""
+
+    def test_strips_authorization(self):
+        from app.core.github import _strip_auth_headers
+        headers = {
+            "Accept": "application/json",
+            "Authorization": "Bearer ghp_test",
+            "User-Agent": "VibeCheck/0.1",
+        }
+        result = _strip_auth_headers(headers)
+        assert "Authorization" not in result
+        assert "authorization" not in result
+        assert result["Accept"] == "application/json"
+        assert result["User-Agent"] == "VibeCheck/0.1"
+
+    def test_strips_cookie(self):
+        from app.core.github import _strip_auth_headers
+        headers = {
+            "Cookie": "session=abc123",
+            "Authorization": "Bearer token",
+        }
+        result = _strip_auth_headers(headers)
+        assert "Cookie" not in result
+        assert "Authorization" not in result
+
+    def test_strips_all_auth_variants(self):
+        from app.core.github import _strip_auth_headers
+        headers = {
+            "authorization": "Bearer lower",
+            "COOKIE": "session=x",
+            "X-API-Key": "key123",
+            "X-Auth-Token": "token456",
+            "Proxy-Authorization": "Basic xyz",
+        }
+        result = _strip_auth_headers(headers)
+        assert len(result) == 0
+
+    def test_preserves_non_auth_headers(self):
+        from app.core.github import _strip_auth_headers
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/octet-stream",
+            "User-Agent": "VibeCheck/0.1",
+        }
+        result = _strip_auth_headers(headers)
+        assert result == headers
