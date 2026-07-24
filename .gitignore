@@ -1,0 +1,56 @@
+# === Secrets & Environment ===
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+id_rsa
+id_rsa.pub
+credentials.json
+*.p12
+*.pfx
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+*.db
+*.sqlite3
+
+# === Node.js ===
+node_modules/
+.next/
+out/
+.npm
+.pnpm-debug.log*
+
+# === IDE ===
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# === OS ===
+.DS_Store
+Thumbs.db
+
+# === Temp & Snapshots ===
+tmp/
+temp/
+*.tar.gz
+*.zip
+repo_snapshots/
