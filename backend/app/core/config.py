@@ -26,6 +26,22 @@ class Settings(BaseSettings):
     scan_timeout: int = 120  # seconds
     scan_concurrency: int = 1  # single worker, low concurrency
     max_line_read: int = 5000  # only read first N lines per file
+    scan_max_file_size: int = 1024 * 1024  # 1 MB — skip files larger than this
+    scan_ignore_dirs: list[str] = [
+        "node_modules", ".next", "dist", "build", "coverage",
+        "__pycache__", ".git", "vendor", ".venv", "venv",
+        ".pytest_cache", ".mypy_cache", ".idea", ".vscode",
+    ]
+    scan_binary_extensions: list[str] = [
+        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp",
+        ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar",
+        ".exe", ".dll", ".so", ".dylib", ".o", ".a", ".lib",
+        ".pyc", ".pyo", ".class", ".jar", ".war",
+        ".pdf", ".doc", ".docx", ".xls", ".xlsx",
+        ".mp3", ".mp4", ".avi", ".mov", ".mkv", ".wav", ".flv",
+        ".ttf", ".otf", ".woff", ".woff2", ".eot",
+        ".sqlite", ".db", ".db3", ".s3db",
+    ]
 
     # --- LLM ---
     llm_timeout: int = 30  # seconds
