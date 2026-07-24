@@ -751,3 +751,502 @@ class TestPathContainmentFunction:
                 outside_file.unlink()
             if outside_dir.exists():
                 outside_dir.rmdir()
+
+
+# ============================================================================
+# --- Final review gap tests (tests 28+) ---
+# ============================================================================
+
+class TestQuotedValueMasking:
+    """Tests for unified assignment value parser — quoted values with spaces."""
+
+    def test_double_quoted_value_with_spaces(self, tmp_path):
+        """password="alpha beta gamma" masks the ENTIRE value, not just alpha."""
+        synth_pw = "alpha beta gamma"
+        (tmp_path / "config.py").write_text(
+            f'password="{synth_pw}"\n', encoding="utf-8",
+        )
+
+        result = scan_directory(tmp_path)
+
+        r006 = [f for f in result.findings if f.rule_id == "R006_PASSWORD_ASSIGNMENT"]
+        assert len(r006) == 1
+
+        # No part of the original value may appear in any field
+        for f in result.findings:
+            for field in dataclasses.fields(f):
+                val = getattr(f, field.name)
+                if isinstance(val, str):
+                    assert "alpha" not in val
+                    assert "beta" not in val
+                    assert "gamma" not in val
+
+    def test_single_quoted_value_with_spaces(self, tmp_path):
+        """token='abc def ghi' masks the ENTIRE value."""
+        synth_val = "abc def ghi"
+        (tmp_path / "config.py").write_text(
+            f"token='{synth_val}'\n", encoding="utf-8",
+        )
+
+        result = scan_directory(tmp_path)
+
+        # R007 should detect it
+        r007 = [f for f in result.findings if f.rule_id == "R007_GENERIC_TOKEN_ASSIGNMENT"]
+        assert len(r007) == 1
+
+        # No part of the original value in any field
+        for f in result.findings:
+            for field in dataclasses.fields(f):
+                val = getattr(f, field.name)
+                if isinstance(val, str):
+                    assert "abc" not in val
+                    assert "def" not in val
+                    assert "ghi" not in val
+
+    def test_multiple_quoted_values_same_line(self, tmp_path):
+        """Multiple quoted values with spaces on the same line are all masked."""
+        line = 'password="alpha beta" token="gamma delta"'
+        (tmp_path / "config.py").write_text(line + "\n", encoding="utf-8")
+
+        result = scan_directory(tmp_path)
+
+        # No part of any original value in any snippet or field
+        forbidden = ["alpha", "beta", "gamma", "delta"]
+        for f in result.findings:
+            for field in dataclasses.fields(f):
+                val = getattr(f, field.name)
+                if isinstance(val, str):
+                    for word in forbidden:
+                        assert word not in val, f"'{word}' found in {field.name}"
+
+    def test_quoted_value_not_in_repr_or_json(self, tmp_path):
+        """Quoted value with spaces does not appear in repr or JSON."""
+        synth_pw = "alpha beta gamma"
+        (tmp_path / "config.py").write_text(
+            f'password="{synth_pw}"\n', encoding="utf-8",
+        )
+
+        result = scan_directory(tmp_path)
+
+        for f in result.findings:
+            assert "alpha" not in repr(f)
+            assert "beta" not in repr(f)
+            assert "gamma" not in repr(f)
+
+        # JSON serialization
+        findings_list = [
+            {field.name: str(getattr(f, field.name)) for field in dataclasses.fields(f)}
+            for f in result.findings
+        ]
+        json_str = json.dumps(findings_list)
+        assert "alpha" not in json_str
+        assert "beta" not in json_str
+        assert "gamma" not in json_str
+
+
+class TestR011CoexistenceWithSpecificRules:
+    """Tests that R011 coexists with specific rules on different lines."""
+
+    def test_github_token_and_jwt_secret_both_present(self, tmp_path):
+        """File with GITHUB_TOKEN and JWT_SECRET must have BOTH R001 and R011."""
+        (tmp_path / ".env.production").write_text(
+            f'GITHUB_TOKEN={SYNTH_GITHUB_TOKEN}\n'
+            'JWT_SECRET=runtime_constructed_secret_value\n',
+            encoding="utf-8",
+        )
+
+        result = scan_directory(tmp_path)
+
+        # R001 must be present (from GITHUB_TOKEN line)
+        r001 = [f for f in result.findings if f.rule_id == "R001_GITHUB_TOKEN"]
+        assert len(r001) == 1
+        assert r001[0].line_start == 1
+
+        # R011 must be present (from JWT_SECRET line)
+        r011 = [f for f in result.findings if f.rule_id == "R011_PRODUCTION_ENV_WITH_SECRET"]
+        assert len(r011) == 1
+        assert r011[0].line_start == 2
+
+    def test_same_value_r001_suppresses_r011(self):
+        """When R001 and R011 hit the SAME value on the same line, only R001 remains."""
+        from app.scanner.rules import GitHubTokenRule, ProductionEnvWithSecretRule
+        from app.scanner.sensitive import _deduplicate_findings
+
+        lines = [f'GITHUB_TOKEN="{SYNTH_GITHUB_TOKEN}"']
+
+        findings = []
+        findings.extend(GitHubTokenRule().scan_content(".env.production", lines))
+        findings.extend(ProductionEnvWithSecretRule().scan_content(".env.production", lines))
+
+        # Before dedup, both R001 and R011 exist
+        assert any(f.rule_id == "R001_GITHUB_TOKEN" for f in findings)
+        assert any(f.rule_id == "R011_PRODUCTION_ENV_WITH_SECRET" for f in findings)
+
+        deduped = _deduplicate_findings(findings)
+
+        # After dedup, only R001 remains (same line, overlapping columns)
+        r001 = [f for f in deduped if f.rule_id == "R001_GITHUB_TOKEN"]
+        assert len(r001) == 1
+
+        r011 = [f for f in deduped if f.rule_id == "R011_PRODUCTION_ENV_WITH_SECRET"]
+        assert len(r011) == 0
+
+
+class TestFindingContract:
+    """Verify Finding has the required new fields and no raw secret fields."""
+
+    def test_finding_has_new_fields(self, tmp_path):
+        """Finding objects have category, secret_type, message, repair_template_key."""
+        (tmp_path / "config.py").write_text(
+            f'token="{SYNTH_GITHUB_TOKEN}"\n', encoding="utf-8",
+        )
+
+        result = scan_directory(tmp_path)
+
+        assert len(result.findings) >= 1
+        f = result.findings[0]
+
+        # New fields must exist and be non-empty strings
+        assert hasattr(f, "category")
+        assert hasattr(f, "secret_type")
+        assert hasattr(f, "message")
+        assert hasattr(f, "repair_template_key")
+        assert isinstance(f.category, str) and f.category
+        assert isinstance(f.secret_type, str) and f.secret_type
+        assert isinstance(f.message, str) and f.message
+        assert isinstance(f.repair_template_key, str) and f.repair_template_key
+
+    def test_finding_no_raw_secret_fields(self, tmp_path):
+        """Finding must NOT have raw_value, raw_snippet, original_secret fields."""
+        (tmp_path / "config.py").write_text(
+            f'token="{SYNTH_GITHUB_TOKEN}"\n', encoding="utf-8",
+        )
+
+        result = scan_directory(tmp_path)
+        f = result.findings[0]
+
+        field_names = {field.name for field in dataclasses.fields(f)}
+        forbidden_fields = {"raw_value", "raw_snippet", "original_secret"}
+        assert forbidden_fields.isdisjoint(field_names)
+
+    def test_all_rules_fill_new_fields(self):
+        """Every rule that produces a Finding fills the new contract fields."""
+        from app.scanner.rules import (
+            AWSAccessKeyRule,
+            AWSSecretKeyRule,
+            ConnectionStringRule,
+            EnvFilePresentRule,
+            GenericTokenAssignmentRule,
+            GitHubTokenRule,
+            GoogleAPIKeyRule,
+            PasswordAssignmentRule,
+            PrivateKeyRule,
+            ProductionEnvWithSecretRule,
+        )
+        from app.scanner.base import Confidence
+
+        # Test data for each rule
+        test_cases = [
+            (GitHubTokenRule(), "scan_content", ["config.py", [f'TOKEN="{SYNTH_GITHUB_TOKEN}"']]),
+            (AWSAccessKeyRule(), "scan_content", ["config.py", [f"KEY={SYNTH_AWS_KEY}"]]),
+            (AWSSecretKeyRule(), "scan_content", ["config.py", [f"aws_secret_access_key={'D'*40}"]]),
+            (GoogleAPIKeyRule(), "scan_content", ["config.py", [f'KEY="AIza{"C"*35}"']]),
+            (PrivateKeyRule(), "scan_content", ["key.pem", [
+                "-----BEGIN RSA PRIVATE KEY-----", "MIIEowIBAAKCAQEA" + "D"*400,
+                "-----END RSA PRIVATE KEY-----",
+            ]]),
+            (PasswordAssignmentRule(), "scan_content", ["config.py", ['password="real_secret_123"']]),
+            (GenericTokenAssignmentRule(), "scan_content", ["config.py", ['secret="my_api_secret_value"']]),
+            (ConnectionStringRule(), "scan_content", ["config.py", ['URL="postgres://admin:s3cr3tpw@host:5432/db"']]),
+            (EnvFilePresentRule(), "check_file", [".env", 100]),
+        ]
+
+        for rule, method_name, args in test_cases:
+            method = getattr(rule, method_name)
+            result = method(*args)
+            if isinstance(result, list):
+                findings = result
+            else:
+                findings = [result] if result else []
+
+            assert len(findings) > 0, f"{rule.rule_id} produced no findings"
+            for f in findings:
+                assert f.category, f"{rule.rule_id} missing category"
+                assert f.secret_type, f"{rule.rule_id} missing secret_type"
+                assert f.message, f"{rule.rule_id} missing message"
+                assert f.repair_template_key, f"{rule.rule_id} missing repair_template_key"
+
+        # Test R011 separately (needs production env file)
+        r011_rule = ProductionEnvWithSecretRule()
+        r011_findings = r011_rule.scan_content(
+            ".env.production", ["JWT_SECRET=runtime_constructed_value"]
+        )
+        assert len(r011_findings) > 0
+        for f in r011_findings:
+            assert f.category
+            assert f.secret_type
+            assert f.message
+            assert f.repair_template_key
+
+
+class TestAdjacentPrivateKeys:
+    """Tests for adjacent private key blocks — loop index fix."""
+
+    def test_two_adjacent_rsa_keys(self):
+        """Two adjacent RSA private key blocks are both detected with correct lines."""
+        rule = PrivateKeyRule()
+        lines = [
+            "-----BEGIN RSA PRIVATE KEY-----",   # line 1
+            "MIIEowIBAAKCAQEA" + "D" * 400,       # line 2
+            "-----END RSA PRIVATE KEY-----",       # line 3
+            "-----BEGIN RSA PRIVATE KEY-----",     # line 4
+            "MIIEowIBAAKCAQEA" + "E" * 400,        # line 5
+            "-----END RSA PRIVATE KEY-----",        # line 6
+        ]
+
+        findings = rule.scan_content("keys.pem", lines)
+
+        assert len(findings) == 2
+        # First key: lines 1-3
+        assert findings[0].line_start == 1
+        assert findings[0].line_end == 3
+        # Second key: lines 4-6
+        assert findings[1].line_start == 4
+        assert findings[1].line_end == 6
+
+    def test_adjacent_different_key_types(self):
+        """Adjacent RSA and OPENSSH keys are both detected."""
+        rule = PrivateKeyRule()
+        lines = [
+            "-----BEGIN RSA PRIVATE KEY-----",           # line 1
+            "MIIEowIBAAKCAQEA" + "D" * 400,               # line 2
+            "-----END RSA PRIVATE KEY-----",               # line 3
+            "-----BEGIN OPENSSH PRIVATE KEY-----",         # line 4
+            "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAA",          # line 5
+            "-----END OPENSSH PRIVATE KEY-----",            # line 6
+        ]
+
+        findings = rule.scan_content("keys.pem", lines)
+
+        assert len(findings) == 2
+        assert findings[0].line_start == 1
+        assert findings[0].line_end == 3
+        assert findings[1].line_start == 4
+        assert findings[1].line_end == 6
+
+
+class TestConnectionStringPasswordExtraction:
+    """Tests for accurate connection string password extraction (R008)."""
+
+    def test_placeholder_password_no_finding(self, tmp_path):
+        """postgres://user:changeme@host/db does not produce a high-risk Finding."""
+        (tmp_path / "config.py").write_text(
+            'DATABASE_URL="postgres://admin:changeme@db.example.com:5432/mydb"\n',
+            encoding="utf-8",
+        )
+
+        result = scan_directory(tmp_path)
+
+        # R008 should NOT fire (changeme is a placeholder)
+        r008 = [f for f in result.findings if f.rule_id == "R008_CONNECTION_STRING"]
+        assert len(r008) == 0
+
+    def test_real_password_produces_r008(self, tmp_path):
+        """postgres://user:real_password@host/db produces R008."""
+        synth_pw = "SynthR3alPassw0rd2024"
+        (tmp_path / "config.py").write_text(
+            f'DATABASE_URL="postgres://admin:{synth_pw}@db.example.com:5432/mydb"\n',
+            encoding="utf-8",
+        )
+
+        result = scan_directory(tmp_path)
+
+        r008 = [f for f in result.findings if f.rule_id == "R008_CONNECTION_STRING"]
+        assert len(r008) == 1
+        assert r008[0].is_blocking is False  # R008 is non-blocking
+
+    def test_password_fully_replaced_in_snippet(self, tmp_path):
+        """Snippet has password fully replaced with ***."""
+        synth_pw = "SynthR3alPassw0rd2024"
+        (tmp_path / "config.py").write_text(
+            f'DATABASE_URL="postgres://admin:{synth_pw}@db.example.com:5432/mydb"\n',
+            encoding="utf-8",
+        )
+
+        result = scan_directory(tmp_path)
+
+        r008 = [f for f in result.findings if f.rule_id == "R008_CONNECTION_STRING"]
+        assert len(r008) == 1
+
+        snippet = r008[0].snippet_masked
+        assert synth_pw not in snippet
+        assert "***" in snippet
+
+
+class TestCrossPlatformPathContainment:
+    """True cross-platform path containment test — no symlinks, no skipif."""
+
+    def test_inside_and_outside_without_symlinks(self, tmp_path):
+        """Directly test _is_path_inside_root for inside and outside files.
+
+        Creates root/inside.txt and root-level outside.txt (sibling of root).
+        Runs on BOTH Windows and Linux — no symlinks, no skipif.
+        """
+        from app.scanner.sensitive import _is_path_inside_root
+
+        # Create root directory
+        root = tmp_path / "root"
+        root.mkdir()
+
+        # Create inside.txt inside root
+        inside_file = root / "inside.txt"
+        inside_file.write_text("inside\n", encoding="utf-8")
+
+        # Create outside.txt as a SIBLING of root (not inside root)
+        outside_file = tmp_path / "outside.txt"
+        outside_file.write_text("outside\n", encoding="utf-8")
+
+        root_resolved = root.resolve()
+
+        # inside.txt must return (True, "inside.txt")
+        is_inside, posix_path = _is_path_inside_root(str(inside_file), root_resolved)
+        assert is_inside is True
+        assert posix_path == "inside.txt"
+
+        # outside.txt must return (False, None)
+        is_inside, posix_path = _is_path_inside_root(str(outside_file), root_resolved)
+        assert is_inside is False
+        assert posix_path is None
+
+
+class TestStableSorting:
+    """Tests for deterministic scan result ordering."""
+
+    def test_different_creation_order_same_result(self, tmp_path):
+        """Files created in different order produce the same finding order."""
+        from app.scanner.sensitive import scan_directory
+
+        # Create directory A with files in one order
+        dir_a = tmp_path / "dir_a"
+        dir_a.mkdir()
+        (dir_a / "z_file.py").write_text(
+            f'token="{SYNTH_GITHUB_TOKEN}"\n', encoding="utf-8",
+        )
+        (dir_a / "a_file.py").write_text(
+            f'password="secret_value_123"\n', encoding="utf-8",
+        )
+        (dir_a / "m_file.py").write_text(
+            f'AWS_KEY="{SYNTH_AWS_KEY}"\n', encoding="utf-8",
+        )
+
+        # Create directory B with files in reverse order
+        dir_b = tmp_path / "dir_b"
+        dir_b.mkdir()
+        (dir_b / "m_file.py").write_text(
+            f'AWS_KEY="{SYNTH_AWS_KEY}"\n', encoding="utf-8",
+        )
+        (dir_b / "a_file.py").write_text(
+            f'password="secret_value_123"\n', encoding="utf-8",
+        )
+        (dir_b / "z_file.py").write_text(
+            f'token="{SYNTH_GITHUB_TOKEN}"\n', encoding="utf-8",
+        )
+
+        result_a = scan_directory(dir_a)
+        result_b = scan_directory(dir_b)
+
+        # Both should have the same number of findings
+        assert len(result_a.findings) == len(result_b.findings)
+
+        # The ORDER must be identical (sorted by file_path, line_start, etc.)
+        sig_a = tuple(
+            (f.rule_id, f.file_path, f.line_start, f.column_start)
+            for f in result_a.findings
+        )
+        sig_b = tuple(
+            (f.rule_id, f.file_path, f.line_start, f.column_start)
+            for f in result_b.findings
+        )
+        assert sig_a == sig_b
+
+        # Verify the order is by file_path first
+        file_paths = [f.file_path for f in result_a.findings]
+        assert file_paths == sorted(file_paths)
+
+
+class TestRuleSemantics:
+    """Tests for corrected rule confidence and blocking semantics."""
+
+    def test_r003_high_confidence_blocking(self):
+        """R003 (AWS Secret Key) is high confidence and blocking after strict context match."""
+        from app.scanner.rules import AWSSecretKeyRule
+        from app.scanner.base import Confidence
+
+        rule = AWSSecretKeyRule()
+        lines = [f"aws_secret_access_key={'D' * 40}"]
+        findings = rule.scan_content("config.py", lines)
+
+        assert len(findings) == 1
+        f = findings[0]
+        assert f.confidence == Confidence.HIGH
+        assert f.is_blocking is True
+
+    def test_r011_high_confidence_blocking(self, tmp_path):
+        """R011 is high confidence and blocking after production file + sensitive name + non-placeholder."""
+        from app.scanner.base import Confidence
+
+        (tmp_path / ".env.production").write_text(
+            "JWT_SECRET=runtime_constructed_secret_value\n",
+            encoding="utf-8",
+        )
+
+        result = scan_directory(tmp_path)
+
+        r011 = [f for f in result.findings if f.rule_id == "R011_PRODUCTION_ENV_WITH_SECRET"]
+        assert len(r011) == 1
+        assert r011[0].confidence == Confidence.HIGH
+        assert r011[0].is_blocking is True
+
+    def test_r006_r008_medium_confidence_non_blocking(self):
+        """R006-R008 remain medium confidence and non-blocking."""
+        from app.scanner.rules import (
+            PasswordAssignmentRule,
+            GenericTokenAssignmentRule,
+            ConnectionStringRule,
+        )
+        from app.scanner.base import Confidence
+
+        # R006
+        r006 = PasswordAssignmentRule()
+        r006_findings = r006.scan_content("config.py", ['password="real_secret_123"'])
+        assert len(r006_findings) == 1
+        assert r006_findings[0].confidence == Confidence.MEDIUM
+        assert r006_findings[0].is_blocking is False
+
+        # R007
+        r007 = GenericTokenAssignmentRule()
+        r007_findings = r007.scan_content("config.py", ['secret="my_api_secret_value"'])
+        assert len(r007_findings) == 1
+        assert r007_findings[0].confidence == Confidence.MEDIUM
+        assert r007_findings[0].is_blocking is False
+
+        # R008
+        r008 = ConnectionStringRule()
+        r008_findings = r008.scan_content("config.py", ['URL="postgres://admin:s3cr3tpw@host:5432/db"'])
+        assert len(r008_findings) == 1
+        assert r008_findings[0].confidence == Confidence.MEDIUM
+        assert r008_findings[0].is_blocking is False
+
+    def test_false_positive_variable_names_no_r011(self, tmp_path):
+        """SECRETARY_EMAIL, TOKENIZER_MODEL, PASSWORDLESS_MODE do NOT trigger R011."""
+        (tmp_path / ".env.production").write_text(
+            "SECRETARY_EMAIL=secretary@example.com\n"
+            "TOKENIZER_MODEL=gpt2-large\n"
+            "PASSWORDLESS_MODE=enabled\n",
+            encoding="utf-8",
+        )
+
+        result = scan_directory(tmp_path)
+
+        r011 = [f for f in result.findings if f.rule_id == "R011_PRODUCTION_ENV_WITH_SECRET"]
+        assert len(r011) == 0

@@ -62,8 +62,11 @@ class TestProductionEnvDedup:
     """Tests for R011 ProductionEnvWithSecretRule dedup suppression."""
 
     def test_production_env_with_secret_dedup(self):
-        """R011 is suppressed when a specific rule (R001) finds something in the same file."""
-        # Create a production env file with both a GitHub token and a generic secret
+        """R011 on the SAME LINE as R001 is suppressed (column overlap).
+        R011 on a DIFFERENT line is kept.
+        """
+        # Line 1: GITHUB_TOKEN with a format token — R001 and R011 both find it
+        # Line 2: MY_CUSTOM_CONFIG — R011 doesn't flag it (not sensitive name)
         lines = [
             f'GITHUB_TOKEN = "{SYNTH_GITHUB_TOKEN}"',
             "MY_CUSTOM_CONFIG = some_production_value",
@@ -80,13 +83,16 @@ class TestProductionEnvDedup:
         # Before dedup, there should be at least 2 findings (1 from R001, 1+ from R011)
         assert len(findings) >= 2
 
-        # After dedup, R011 should be suppressed
+        # After dedup, R011 on the same line as R001 should be suppressed
         from app.scanner.sensitive import _deduplicate_findings
         deduped = _deduplicate_findings(findings)
 
-        # R011 findings should be suppressed
-        r011_findings = [f for f in deduped if f.rule_id == "R011_PRODUCTION_ENV_WITH_SECRET"]
-        assert len(r011_findings) == 0
+        # R011 findings on the same line as R001 should be suppressed
+        r011_on_line1 = [
+            f for f in deduped
+            if f.rule_id == "R011_PRODUCTION_ENV_WITH_SECRET" and f.line_start == 1
+        ]
+        assert len(r011_on_line1) == 0
 
         # R001 finding should be preserved
         r001_findings = [f for f in deduped if f.rule_id == "R001_GITHUB_TOKEN"]

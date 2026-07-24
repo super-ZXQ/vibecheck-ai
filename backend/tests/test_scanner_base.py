@@ -42,6 +42,10 @@ class TestImmutability:
             is_blocking=True,
             finding_type=FindingType.CONTENT,
             description="test",
+            category="token",
+            secret_type="github_token",
+            message="GitHub token detected",
+            repair_template_key="R001_revoke_and_rotate",
         )
         with pytest.raises(dataclasses.FrozenInstanceError):
             finding.rule_id = "CHANGED"  # type: ignore

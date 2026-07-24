@@ -75,6 +75,14 @@ class Finding:
         is_blocking:   If True, this finding triggers BLOCKED status.
         finding_type:  CONTENT (line-level) or FILE (file-level).
         description:   Human-readable description of the issue.
+        category:      Broad category (e.g., "token", "password", "private_key").
+        secret_type:   Specific secret type identifier (e.g., "github_token").
+        message:       Short human-readable message for display.
+        repair_template_key: Stable identifier for the repair template
+                       (full template not implemented in this phase).
+
+    SECURITY: This dataclass must NEVER contain raw_value, raw_snippet,
+    original_secret, or any field that holds the original secret text.
     """
     rule_id: str
     rule_name: str
@@ -89,6 +97,10 @@ class Finding:
     is_blocking: bool
     finding_type: FindingType
     description: str
+    category: str
+    secret_type: str
+    message: str
+    repair_template_key: str
 
 
 @dataclass(frozen=True)

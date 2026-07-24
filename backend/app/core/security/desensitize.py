@@ -111,15 +111,16 @@ def _mask_key_with_prefix(value: str) -> str:
 def _mask_connection_string(value: str) -> str:
     """Mask the password portion of a connection string.
 
-    Replaces the password between the first ':' after scheme and the '@'
-    before the host with '***'.
+    Accurately captures scheme://user:password@host and replaces ONLY
+    the password with '***'.
 
     Example: postgres://user:secretpass@host:5432/db
              -> postgres://user:***@host:5432/db
     """
-    # Match scheme://user:password@host
+    # Match scheme://user:password@host — password is everything between
+    # the last ':' before '@' and the '@' itself.
     pattern = re.compile(
-        r"^([a-zA-Z][a-zA-Z0-9+.-]*://[^:/@]+):([^@]+)@(.*)$"
+        r"^([a-zA-Z][a-zA-Z0-9+.-]*://[^:/@\s]+):([^@\s]+)@(.*)$"
     )
     match = pattern.match(value)
     if match:
@@ -128,6 +129,94 @@ def _mask_connection_string(value: str) -> str:
         return f"{scheme_user}:***@{host_rest}"
     # If no password found, redact entirely to be safe
     return "<REDACTED>"
+
+
+# ---------------------------------------------------------------------------
+# --- Unified assignment value parser ---
+# ---------------------------------------------------------------------------
+
+def parse_assignment_value(line: str, key_end: int) -> tuple[int, int, str] | None:
+    """Parse an assignment value starting after a key-name match.
+
+    This is the SINGLE shared parser used by PasswordAssignmentRule,
+    GenericTokenAssignmentRule, AWSSecretKeyRule, and mask_snippet.
+    No rule or function may duplicate this logic with a different regex.
+
+    Starting from ``key_end``, finds the assignment operator (``=`` or
+    ``:``) -- skipping whitespace -- then parses the value which may be:
+
+    - **Double-quoted** with escape characters (``\\"`` inside ``"..."``)
+    - **Single-quoted** with escape characters (``\\'`` inside ``'...'``)
+    - **Unquoted** -- stops at whitespace or a ``#`` comment marker
+
+    Args:
+        line:    The full line of text.
+        key_end: Position in ``line`` right after the key name.
+
+    Returns:
+        ``(value_start, value_end, value_content)`` or ``None``.
+
+        - ``value_start``: 0-based start of value content (after opening quote)
+        - ``value_end``:   0-based end of value content (before closing quote)
+        - ``value_content``: the value with escape characters processed
+          (quotes stripped)
+
+        If no assignment operator or no value is found, returns ``None``.
+    """
+    i = key_end
+
+    # --- Find assignment operator (= or :) skipping whitespace ---
+    found_op = False
+    while i < len(line):
+        ch = line[i]
+        if ch.isspace():
+            i += 1
+        elif ch in "=:":
+            found_op = True
+            i += 1
+            break
+        else:
+            # Non-space, non-operator -- not an assignment
+            return None
+
+    if not found_op:
+        return None
+
+    # --- Skip whitespace after operator ---
+    while i < len(line) and line[i].isspace():
+        i += 1
+
+    if i >= len(line):
+        return None
+
+    # --- Quoted value (double or single) ---
+    if line[i] in ('"', "'"):
+        quote_char = line[i]
+        value_start = i + 1
+        j = value_start
+        content_chars: list[str] = []
+        while j < len(line):
+            if line[j] == "\\" and j + 1 < len(line):
+                # Escape: include the escaped character literally
+                content_chars.append(line[j + 1])
+                j += 2
+            elif line[j] == quote_char:
+                # Closing quote found
+                return (value_start, j, "".join(content_chars))
+            else:
+                content_chars.append(line[j])
+                j += 1
+        # Unterminated quote -- take everything to end of line
+        return (value_start, len(line), "".join(content_chars))
+
+    # --- Unquoted value -- stop at whitespace or # comment ---
+    value_start = i
+    while i < len(line) and not line[i].isspace() and line[i] != "#":
+        i += 1
+    value_content = line[value_start:i]
+    if not value_content:
+        return None
+    return (value_start, i, value_content)
 
 
 # ---------------------------------------------------------------------------
@@ -159,14 +248,15 @@ _SNIPPET_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://[^:/@\s]+:[^@\s]+@\S+)"), CONNECTION_STRING),
 ]
 
-# Separate pattern for assignment-style secrets (password=, secret=, etc.)
-# Captures the value portion (group 2) for masking.
+# Key-only pattern for assignment-style secrets (password=, secret=, etc.).
+# Only matches the KEY NAME -- the value is parsed by the unified
+# parse_assignment_value() function, which correctly handles quoted values
+# with spaces and escape characters.
 # Longer keywords listed first to ensure correct alternation matching
 # (e.g., "aws_secret_access_key" before "aws_secret" before "secret").
-_ASSIGNMENT_PATTERN = re.compile(
+_ASSIGNMENT_KEY_PATTERN = re.compile(
     r"(?i)(aws_secret_access_key|secret_access_key|aws_secret"
     r"|password|passwd|pwd|secret|api_key|apikey|token|access_token)"
-    r"\s*[:=]\s*['\"]?([^\s'\"]+)['\"]?"
 )
 
 
@@ -205,8 +295,13 @@ def mask_snippet(line_text: str) -> str:
             ))
 
     # 2. Collect assignment-style secret ranges (value portion only)
-    for match in _ASSIGNMENT_PATTERN.finditer(line_text):
-        value = match.group(2)
+    #    Uses the UNIFIED parse_assignment_value() — same parser as all
+    #    assignment rules.  Correctly handles quoted values with spaces.
+    for match in _ASSIGNMENT_KEY_PATTERN.finditer(line_text):
+        result = parse_assignment_value(line_text, match.end())
+        if result is None:
+            continue
+        value_start, value_end, value = result
         # Skip env var references
         if value.startswith("${") or value.startswith("process.env") or value.startswith("os."):
             continue
@@ -215,8 +310,8 @@ def mask_snippet(line_text: str) -> str:
             continue
         masked = mask_secret(value, GENERIC)
         ranges.append(_SecretRange(
-            start=match.start(2),
-            end=match.end(2),
+            start=value_start,
+            end=value_end,
             secret_type=GENERIC,
             masked_value=masked,
         ))

@@ -40,7 +40,8 @@ DEFAULT_RULES: list = [
 ]
 
 # Priority map: lower number = higher priority.
-# When two content findings overlap on the same line, the higher-priority
+# When two content findings overlap on the same line (same file_path,
+# same line_start, overlapping column ranges), the higher-priority
 # (lower number) finding is kept and the other is dropped.
 #
 # Explicit format rules (R001-R005) have the highest priority.
@@ -61,15 +62,3 @@ RULE_PRIORITY_MAP: dict[str, int] = {
     "R008_CONNECTION_STRING": 9,
     "R009_ENV_FILE_PRESENT": 100,  # file-type, doesn't participate in line dedup
 }
-
-# Rule IDs considered "specific" — if any of these produce a finding in a file,
-# PRODUCTION_ENV_WITH_SECRET (R011) findings for that file are suppressed.
-# Only explicit format rules (R001-R005) suppress R011 — generic heuristics
-# (R006-R008) do NOT suppress R011.
-SPECIFIC_RULE_IDS: frozenset[str] = frozenset({
-    "R001_GITHUB_TOKEN",
-    "R002_AWS_ACCESS_KEY",
-    "R003_AWS_SECRET_KEY",
-    "R004_GOOGLE_API_KEY",
-    "R005_PRIVATE_KEY",
-})

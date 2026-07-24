@@ -19,8 +19,15 @@ Deduplication (per file):
 1. Content findings on the same line with overlapping column ranges:
    keep the higher-priority finding (lower RULE_PRIORITY_MAP number).
 2. File-type findings never overlap with content-type findings.
-3. PRODUCTION_ENV_WITH_SECRET (R011) is suppressed entirely for a file
-   if any specific rule (R001-R008) already produced a finding in that file.
+3. R011 is only suppressed on the SAME LINE where it column-overlaps
+   with a higher-priority specific format rule (R001-R005). R011 on a
+   different line is always kept.
+
+Stable ordering:
+- dirnames and filenames are sorted in os.walk for deterministic traversal.
+- Final findings are sorted by (file_path, line_start, column_start,
+  rule_priority, rule_id).
+- notices, skipped_files, and scan_errors are also stably sorted.
 
 Import structure (no circular imports):
 - imports from: base, default_rules, core.config
@@ -43,7 +50,6 @@ from app.scanner.base import (
 from app.scanner.default_rules import (
     DEFAULT_RULES,
     RULE_PRIORITY_MAP,
-    SPECIFIC_RULE_IDS,
 )
 
 
@@ -140,9 +146,11 @@ def _deduplicate_findings(findings: list[Finding]) -> list[Finding]:
     1. Separate content-type and file-type findings.
     2. Line-level dedup: group content findings by (file_path, line_start),
        sort by priority, keep non-overlapping ones.
-    3. File-level suppression: if any specific rule (R001-R008) produced a
-       finding, suppress all R011 findings for this file.
-    4. File-type findings are kept as-is (they don't overlap with content).
+    3. File-type findings are kept as-is (they don't overlap with content).
+
+    NOTE: There is NO file-level suppression of R011. R011 is only
+    suppressed when it column-overlaps with a higher-priority finding
+    on the SAME LINE (handled by step 2).
     """
     if not findings:
         return []
@@ -150,7 +158,7 @@ def _deduplicate_findings(findings: list[Finding]) -> list[Finding]:
     content_findings = [f for f in findings if f.finding_type == FindingType.CONTENT]
     file_findings = [f for f in findings if f.finding_type == FindingType.FILE]
 
-    # --- Step 1: Line-level dedup for content findings ---
+    # --- Line-level dedup for content findings ---
     # Group by (file_path, line_start)
     groups: dict[tuple[str, int | None], list[Finding]] = {}
     for f in content_findings:
@@ -174,30 +182,7 @@ def _deduplicate_findings(findings: list[Finding]) -> list[Finding]:
                 kept.append(f)
         deduped_content.extend(kept)
 
-    # --- Step 2: File-level suppression of R011 ---
-    # Collect files that have specific sensitive findings
-    files_with_specific: set[str] = set()
-    for f in deduped_content:
-        if f.rule_id in SPECIFIC_RULE_IDS:
-            files_with_specific.add(f.file_path)
-    for f in file_findings:
-        if f.rule_id in SPECIFIC_RULE_IDS:
-            files_with_specific.add(f.file_path)
-
-    # Suppress R011 findings for files that already have specific findings
-    final_content: list[Finding] = []
-    for f in deduped_content:
-        if f.rule_id == "R011_PRODUCTION_ENV_WITH_SECRET" and f.file_path in files_with_specific:
-            continue
-        final_content.append(f)
-
-    final_file: list[Finding] = []
-    for f in file_findings:
-        if f.rule_id == "R011_PRODUCTION_ENV_WITH_SECRET" and f.file_path in files_with_specific:
-            continue
-        final_file.append(f)
-
-    return final_content + final_file
+    return deduped_content + file_findings
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +228,12 @@ def scan_directory(
     binary_exts = set(settings.scan_binary_extensions)
 
     for dirpath, dirnames, filenames in os.walk(str(root_dir)):
+        # --- Stable ordering: sort dirnames and filenames ---
+        # This ensures deterministic traversal order regardless of
+        # filesystem creation order or OS-specific ordering.
+        dirnames.sort()
+        filenames.sort()
+
         # --- Remove ignored directories (in-place) ---
         # This includes .git — Git history is NOT scanned.
         dirnames[:] = [
@@ -358,6 +349,22 @@ def scan_directory(
             # --- Deduplicate findings for this file ---
             deduped = _deduplicate_findings(file_findings)
             all_findings.extend(deduped)
+
+    # --- Stable sorting of all result collections ---
+    # Findings: sort by file_path, line_start, column_start, rule_priority, rule_id
+    all_findings.sort(key=lambda f: (
+        f.file_path,
+        f.line_start if f.line_start is not None else -1,
+        f.column_start if f.column_start is not None else -1,
+        RULE_PRIORITY_MAP.get(f.rule_id, 999),
+        f.rule_id,
+    ))
+    # Notices: sort by file_path, then rule_id
+    all_notices.sort(key=lambda n: (n.file_path or "", n.rule_id))
+    # Skipped files: sort by file_path, then reason
+    all_skipped.sort(key=lambda s: (s.file_path, s.reason))
+    # Scan errors: sort by file_path, then error_type
+    all_errors.sort(key=lambda e: (e.file_path, e.error_type))
 
     return ScanResult(
         findings=tuple(all_findings),
