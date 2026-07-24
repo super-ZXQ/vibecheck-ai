@@ -27,8 +27,9 @@ from app.scanner.rules import (
 from app.scanner.sensitive import scan_directory
 
 
-# --- Synthetic test constants (NOT real credentials) ---
-SYNTH_GITHUB_TOKEN = "ghp_" + "A" * 36
+# --- Runtime-constructed mixed-character synthetic values (NOT real credentials) ---
+_MIXED = "aB1cD2eF3gH4iJ5kL6mN7oP8qR9sT0uV1wX2yZ3aB1cD2eF3gH4"
+SYNTH_GITHUB_TOKEN = "ghp_" + _MIXED[:36]
 SYNTH_PASSWORD = "s3cur3P@ssw0rd!"
 
 

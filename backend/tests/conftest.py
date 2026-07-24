@@ -16,10 +16,12 @@ import pytest
 
 # --- Synthetic test constants ---
 # These strings have the correct FORMAT but are NOT real, valid credentials.
-# They are randomly generated and have no actual permissions.
-SYNTHETIC_GITHUB_TOKEN = "ghp_" + "A" * 36  # Format-correct, not a real token
-SYNTHETIC_AWS_KEY = "AKIA" + "B" * 16  # Format-correct, not a real key
-SYNTHETIC_GOOGLE_KEY = "AIza" + "C" * 35  # Format-correct, not a real key
+# Runtime-constructed mixed-character values to avoid low-entropy patterns.
+_MIXED = "aB1cD2eF3gH4iJ5kL6mN7oP8qR9sT0uV1wX2yZ3aB1cD2eF3gH4"
+_MIXED_UPPER = "ABCDEF1234567890GHIJKLMNOP"
+SYNTHETIC_GITHUB_TOKEN = "ghp_" + _MIXED[:36]  # Format-correct, not a real token
+SYNTHETIC_AWS_KEY = "AKIA" + _MIXED_UPPER[:16]  # Format-correct, not a real key
+SYNTHETIC_GOOGLE_KEY = "AIza" + _MIXED[:35]  # Format-correct, not a real key
 SYNTHETIC_PRIVATE_KEY = (
     "-----BEGIN RSA PRIVATE KEY-----\n"
     "MIIEowIBAAKCAQEA" + "D" * 400 + "\n"

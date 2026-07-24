@@ -3,7 +3,7 @@
 ALL test strings are SYNTHETIC -- correct format but NO actual validity.
 No real credentials are used.
 
-Test count: 15
+Test count: 28
 """
 
 import pytest
@@ -19,15 +19,23 @@ from app.scanner.rules import (
     GoogleAPIKeyRule,
     PasswordAssignmentRule,
     PrivateKeyRule,
+    ProductionEnvWithSecretRule,
 )
 
 
-# --- Synthetic test constants (NOT real credentials) ---
-SYNTH_GITHUB_TOKEN = "ghp_" + "A" * 36
-SYNTH_AWS_KEY = "AKIA" + "B" * 16
-SYNTH_GOOGLE_KEY = "AIza" + "C" * 35
-SYNTH_AWS_SECRET = "D" * 40
+# --- Runtime-constructed mixed-character synthetic values (NOT real credentials) ---
+_MIXED = "aB1cD2eF3gH4iJ5kL6mN7oP8qR9sT0uV1wX2yZ3aB1cD2eF3gH4"
+_MIXED_UPPER = "ABCDEF1234567890GHIJKLMNOP"
+SYNTH_GITHUB_TOKEN = "ghp_" + _MIXED[:36]
+SYNTH_AWS_KEY = "AKIA" + _MIXED_UPPER[:16]
+SYNTH_GOOGLE_KEY = "AIza" + _MIXED[:35]
+SYNTH_AWS_SECRET = ("AbCdEf1234" * 4)[:40]
 SYNTH_PASSWORD = "s3cur3P@ssw0rd!"
+# Low-entropy placeholder token (all same char after prefix)
+SYNTH_LOW_ENTROPY_TOKEN = "ghp_" + "X" * 36
+SYNTH_LOW_ENTROPY_AWS_KEY = "AKIA" + "X" * 16
+SYNTH_LOW_ENTROPY_GOOGLE_KEY = "AIza" + "X" * 35
+SYNTH_LOW_ENTROPY_AWS_SECRET = "X" * 40
 
 
 # ============================================================================
@@ -61,6 +69,31 @@ class TestGitHubTokenRule:
         findings = rule.scan_content("config.py", lines)
         assert len(findings) == 0
 
+    def test_github_token_low_entropy_downgraded(self):
+        """Low-entropy token (all same char) is downgraded to low/low/non-blocking."""
+        rule = GitHubTokenRule()
+        lines = [f'TOKEN = "{SYNTH_LOW_ENTROPY_TOKEN}"']
+        findings = rule.scan_content("config.py", lines)
+
+        assert len(findings) == 1
+        f = findings[0]
+        assert f.rule_id == "R001_GITHUB_TOKEN"
+        assert f.severity == Severity.LOW
+        assert f.confidence == Confidence.LOW
+        assert f.is_blocking is False
+
+    def test_github_token_mixed_char_still_blocking(self):
+        """Mixed-character token is NOT downgraded -- remains critical/blocking."""
+        rule = GitHubTokenRule()
+        lines = [f'TOKEN = "{SYNTH_GITHUB_TOKEN}"']
+        findings = rule.scan_content("config.py", lines)
+
+        assert len(findings) == 1
+        f = findings[0]
+        assert f.severity == Severity.CRITICAL
+        assert f.confidence == Confidence.HIGH
+        assert f.is_blocking is True
+
 
 class TestAWSAccessKeyRule:
     """Tests for R002 AWSAccessKeyRule."""
@@ -77,6 +110,18 @@ class TestAWSAccessKeyRule:
         assert f.severity == Severity.CRITICAL
         assert f.is_blocking is True
         assert SYNTH_AWS_KEY not in f.snippet_masked
+
+    def test_aws_access_key_low_entropy_downgraded(self):
+        """Low-entropy AWS key (all same char) is downgraded."""
+        rule = AWSAccessKeyRule()
+        lines = [f"KEY = {SYNTH_LOW_ENTROPY_AWS_KEY}"]
+        findings = rule.scan_content("config.py", lines)
+
+        assert len(findings) == 1
+        f = findings[0]
+        assert f.severity == Severity.LOW
+        assert f.confidence == Confidence.LOW
+        assert f.is_blocking is False
 
 
 class TestAWSSecretKeyRule:
@@ -101,6 +146,18 @@ class TestAWSSecretKeyRule:
         findings = rule.scan_content("config.py", lines)
         assert len(findings) == 0
 
+    def test_aws_secret_key_low_entropy_downgraded(self):
+        """Low-entropy AWS secret (all same char) is downgraded."""
+        rule = AWSSecretKeyRule()
+        lines = [f"aws_secret_access_key = {SYNTH_LOW_ENTROPY_AWS_SECRET}"]
+        findings = rule.scan_content("config.py", lines)
+
+        assert len(findings) == 1
+        f = findings[0]
+        assert f.severity == Severity.LOW
+        assert f.confidence == Confidence.LOW
+        assert f.is_blocking is False
+
 
 class TestGoogleAPIKeyRule:
     """Tests for R004 GoogleAPIKeyRule."""
@@ -116,6 +173,18 @@ class TestGoogleAPIKeyRule:
         assert f.rule_id == "R004_GOOGLE_API_KEY"
         assert f.severity == Severity.CRITICAL
         assert SYNTH_GOOGLE_KEY not in f.snippet_masked
+
+    def test_google_api_key_low_entropy_downgraded(self):
+        """Low-entropy Google API key (all same char) is downgraded."""
+        rule = GoogleAPIKeyRule()
+        lines = [f'KEY = "{SYNTH_LOW_ENTROPY_GOOGLE_KEY}"']
+        findings = rule.scan_content("config.py", lines)
+
+        assert len(findings) == 1
+        f = findings[0]
+        assert f.severity == Severity.LOW
+        assert f.confidence == Confidence.LOW
+        assert f.is_blocking is False
 
 
 # ============================================================================
@@ -218,6 +287,15 @@ class TestPasswordAssignmentRule:
         findings = rule.scan_content("config.py", lines)
         assert len(findings) == 0
 
+    def test_password_dollar_lowercase_detected(self):
+        """password=$uperSecret123 (lowercase $u) IS detected -- not env ref."""
+        rule = PasswordAssignmentRule()
+        lines = ['password = "$uperSecret123"']
+        findings = rule.scan_content("config.py", lines)
+
+        assert len(findings) == 1
+        assert "$uperSecret123" not in findings[0].snippet_masked
+
 
 class TestGenericTokenAssignmentRule:
     """Tests for R007 GenericTokenAssignmentRule."""
@@ -278,3 +356,149 @@ class TestEnvFilePresentRule:
         assert f.finding_type == FindingType.FILE
         assert f.line_start is None
         assert f.column_start is None
+
+
+# ============================================================================
+# --- JSON/TOML quoted key tests (3 tests) ---
+# ============================================================================
+
+class TestQuotedJSONTomlKeys:
+    """Tests for quoted JSON/TOML attribute name support."""
+
+    def test_json_double_quoted_key_password(self):
+        """"password": "alpha beta gamma" produces R006 with correct columns."""
+        rule = PasswordAssignmentRule()
+        line = '"password": "alpha beta gamma"'
+        lines = [line]
+        findings = rule.scan_content("config.json", lines)
+
+        assert len(findings) == 1
+        f = findings[0]
+        assert f.rule_id == "R006_PASSWORD_ASSIGNMENT"
+        # Column range must point to the full value
+        assert f.column_start is not None
+        assert f.column_end is not None
+        # Extract the value at the column range from the original line
+        value_at_range = line[f.column_start:f.column_end]
+        assert value_at_range == "alpha beta gamma"
+        # Snippet must be fully masked
+        assert "alpha" not in f.snippet_masked
+        assert "beta" not in f.snippet_masked
+        assert "gamma" not in f.snippet_masked
+
+    def test_toml_single_quoted_key_token(self):
+        """'token': 'abc def ghi' produces R007 with correct columns."""
+        rule = GenericTokenAssignmentRule()
+        line = "'token': 'abc def ghi'"
+        lines = [line]
+        findings = rule.scan_content("config.toml", lines)
+
+        assert len(findings) == 1
+        f = findings[0]
+        assert f.rule_id == "R007_GENERIC_TOKEN_ASSIGNMENT"
+        # Column range must point to the full value
+        value_at_range = line[f.column_start:f.column_end]
+        assert value_at_range == "abc def ghi"
+        # Snippet must be fully masked
+        assert "abc" not in f.snippet_masked
+        assert "def" not in f.snippet_masked
+        assert "ghi" not in f.snippet_masked
+
+    def test_quoted_key_with_equals_api_key(self):
+        """"api_key" = "some value" produces R007 with correct columns."""
+        rule = GenericTokenAssignmentRule()
+        line = '"api_key" = "some value"'
+        lines = [line]
+        findings = rule.scan_content("config.toml", lines)
+
+        assert len(findings) == 1
+        f = findings[0]
+        assert f.rule_id == "R007_GENERIC_TOKEN_ASSIGNMENT"
+        value_at_range = line[f.column_start:f.column_end]
+        assert value_at_range == "some value"
+        assert "some value" not in f.snippet_masked
+
+    def test_existing_python_assignment_no_regression(self):
+        """Existing Python-style password= still works after JSON/TOML support."""
+        rule = PasswordAssignmentRule()
+        lines = [f'password = "{SYNTH_PASSWORD}"']
+        findings = rule.scan_content("config.py", lines)
+
+        assert len(findings) == 1
+        assert SYNTH_PASSWORD not in findings[0].snippet_masked
+
+    def test_existing_env_assignment_no_regression(self):
+        """Existing .env-style KEY=value still works."""
+        rule = GenericTokenAssignmentRule()
+        lines = ["TOKEN=my_secret_token_value"]
+        findings = rule.scan_content(".env", lines)
+
+        assert len(findings) == 1
+        assert "my_secret_token_value" not in findings[0].snippet_masked
+
+
+# ============================================================================
+# --- Unquoted # value tests (2 tests) ---
+# ============================================================================
+
+class TestUnquotedHashValue:
+    """Tests for # in unquoted values -- full value including # is masked."""
+
+    def test_password_alpha_hash_omega(self):
+        """password=alpha#omega -- snippet has no alpha or omega."""
+        rule = PasswordAssignmentRule()
+        lines = ["password=alpha#omega"]
+        findings = rule.scan_content("config.py", lines)
+
+        assert len(findings) == 1
+        assert "alpha" not in findings[0].snippet_masked
+        assert "omega" not in findings[0].snippet_masked
+
+    def test_token_abc_hash_def(self):
+        """token=abc#def -- snippet has no abc or def."""
+        rule = GenericTokenAssignmentRule()
+        lines = ["token=abc#def"]
+        findings = rule.scan_content("config.py", lines)
+
+        assert len(findings) == 1
+        assert "abc" not in findings[0].snippet_masked
+        assert "def" not in findings[0].snippet_masked
+
+
+# ============================================================================
+# --- Strict env reference tests (3 tests) ---
+# ============================================================================
+
+class TestStrictEnvReference:
+    """Tests for strict environment variable reference detection."""
+
+    def test_dollar_lowercase_password_detected(self):
+        """password='$uperSecret123' (quoted) is detected as real secret."""
+        rule = PasswordAssignmentRule()
+        lines = ['password = "$uperSecret123"']
+        findings = rule.scan_content("config.py", lines)
+
+        assert len(findings) == 1
+        assert "$uperSecret123" not in findings[0].snippet_masked
+
+    def test_dollar_brace_literal_detected(self):
+        """password='\\${LITERAL_VALUE}' (quoted, escaped) is detected as real secret."""
+        rule = PasswordAssignmentRule()
+        lines = ['password = "\\${LITERAL_VALUE}"']
+        findings = rule.scan_content("config.py", lines)
+
+        assert len(findings) == 1
+        # The escaped value becomes ${LITERAL_VALUE} -- still masked
+        assert "LITERAL_VALUE" not in findings[0].snippet_masked
+
+    def test_real_env_references_not_detected(self):
+        """Genuine env references ($VAR, ${VAR}, etc.) are NOT detected."""
+        rule = PasswordAssignmentRule()
+        lines = [
+            "password = $DB_PASSWORD",
+            "password = ${DB_PASSWORD}",
+            "password = ${DB_PASSWORD:-default}",
+        ]
+        for line in lines:
+            findings = rule.scan_content("config.py", [line])
+            assert len(findings) == 0, f"False positive on: {line}"

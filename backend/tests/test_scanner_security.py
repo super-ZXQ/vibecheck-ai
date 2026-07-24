@@ -37,9 +37,12 @@ from app.scanner.rules import PrivateKeyRule
 from app.scanner.sensitive import scan_directory
 
 
-# --- Synthetic test constants (NOT real credentials) ---
-SYNTH_GITHUB_TOKEN = "ghp_" + "A" * 36
-SYNTH_AWS_KEY = "AKIA" + "B" * 16
+# --- Runtime-constructed mixed-character synthetic values (NOT real credentials) ---
+_MIXED = "aB1cD2eF3gH4iJ5kL6mN7oP8qR9sT0uV1wX2yZ3aB1cD2eF3gH4"
+_MIXED_UPPER = "ABCDEF1234567890GHIJKLMNOP"
+SYNTH_GITHUB_TOKEN = "ghp_" + _MIXED[:36]
+SYNTH_AWS_KEY = "AKIA" + _MIXED_UPPER[:16]
+SYNTH_AWS_SECRET = ("AbCdEf1234" * 4)[:40]
 SYNTH_PASSWORD = "s3cur3P@ssw0rd!"
 
 
@@ -189,8 +192,8 @@ class TestMaskingSafety:
         # The full original token must not appear
         assert SYNTH_GITHUB_TOKEN not in snippet
         # No partial fragment of the token should appear
-        # The token is "ghp_" + "A"*36, so check that no long run of A's survives
-        assert "A" * 10 not in snippet  # No 10+ consecutive A's from the token
+        # Check that no 10-char substring of the mixed token body survives
+        assert _MIXED[:10] not in snippet
 
 
 # ============================================================================
@@ -392,7 +395,7 @@ class TestTokenAndKeyCoverage:
     def test_token_with_test_chars_still_detected(self, tmp_path):
         """Test 15: Format token containing 'test' characters is still detected."""
         # A GitHub token that contains "test" in the character sequence
-        token_with_test = "ghp_" + "test" + "A" * 32  # 4 + 36 = 40 chars total
+        token_with_test = "ghp_" + "test" + _MIXED[:32]  # 4 + 36 = 40 chars total
         (tmp_path / "config.py").write_text(
             f'token="{token_with_test}"\n', encoding="utf-8",
         )
@@ -949,8 +952,8 @@ class TestFindingContract:
         test_cases = [
             (GitHubTokenRule(), "scan_content", ["config.py", [f'TOKEN="{SYNTH_GITHUB_TOKEN}"']]),
             (AWSAccessKeyRule(), "scan_content", ["config.py", [f"KEY={SYNTH_AWS_KEY}"]]),
-            (AWSSecretKeyRule(), "scan_content", ["config.py", [f"aws_secret_access_key={'D'*40}"]]),
-            (GoogleAPIKeyRule(), "scan_content", ["config.py", [f'KEY="AIza{"C"*35}"']]),
+            (AWSSecretKeyRule(), "scan_content", ["config.py", [f"aws_secret_access_key={SYNTH_AWS_SECRET}"]]),
+            (GoogleAPIKeyRule(), "scan_content", ["config.py", [f'KEY="AIza{_MIXED[:35]}"']]),
             (PrivateKeyRule(), "scan_content", ["key.pem", [
                 "-----BEGIN RSA PRIVATE KEY-----", "MIIEowIBAAKCAQEA" + "D"*400,
                 "-----END RSA PRIVATE KEY-----",
@@ -1183,7 +1186,7 @@ class TestRuleSemantics:
         from app.scanner.base import Confidence
 
         rule = AWSSecretKeyRule()
-        lines = [f"aws_secret_access_key={'D' * 40}"]
+        lines = [f"aws_secret_access_key={SYNTH_AWS_SECRET}"]
         findings = rule.scan_content("config.py", lines)
 
         assert len(findings) == 1
@@ -1250,3 +1253,219 @@ class TestRuleSemantics:
 
         r011 = [f for f in result.findings if f.rule_id == "R011_PRODUCTION_ENV_WITH_SECRET"]
         assert len(r011) == 0
+
+
+# ============================================================================
+# --- Masking escape regression tests (10 tests) ---
+# ============================================================================
+
+class TestMaskingEscapeRegression:
+    """10 regression tests for masking escape prevention.
+
+    Each test verifies a specific escape vector is closed:
+    1. mask indicator substring (..., ***) does not bypass masking
+    2. os./process.env approximate strings do not bypass masking
+    3. unquoted # value does not leak suffix
+    4. JSON double-quoted key is recognized
+    5. TOML single/double-quoted key is recognized
+    6. $-prefixed real password is recognized (not treated as env ref)
+    7. genuine environment variable reference does not false-positive
+    8. same-line second secret is fully masked
+    9. repeated-character format placeholder is non-blocking
+    10. mixed-character explicit format value is still blocking
+    """
+
+    def test_mask_indicator_substring_no_escape(self, tmp_path):
+        """Regression 1: password='alpha...omega' and 'abc***def' produce Findings.
+        The ... and *** substrings must NOT be treated as already-masked indicators.
+        Both snippets, repr, and JSON must not contain the original values.
+        """
+        (tmp_path / "config.py").write_text(
+            'password="alpha...omega"\n'
+            'password="abc***def"\n',
+            encoding="utf-8",
+        )
+        result = scan_directory(tmp_path)
+
+        # Must produce Findings
+        r006 = [f for f in result.findings if f.rule_id == "R006_PASSWORD_ASSIGNMENT"]
+        assert len(r006) >= 2
+
+        for f in r006:
+            # Snippet must not contain original values
+            assert "alpha" not in f.snippet_masked
+            assert "omega" not in f.snippet_masked
+            assert "abc" not in f.snippet_masked
+            assert "def" not in f.snippet_masked
+            # repr must not contain original values
+            assert "alpha" not in repr(f)
+            assert "omega" not in repr(f)
+            assert "abc" not in repr(f)
+            assert "def" not in repr(f)
+
+        # JSON serialization must not contain original values
+        import json as _json
+        findings_json = _json.dumps([
+            {field.name: str(getattr(f, field.name)) for field in dataclasses.fields(f)}
+            for f in r006
+        ])
+        assert "alpha" not in findings_json
+        assert "omega" not in findings_json
+        assert "abc" not in findings_json
+        assert "def" not in findings_json
+
+    def test_os_process_env_approximate_no_escape(self, tmp_path):
+        """Regression 2: os.supersecret and process.environmentSecret are masked.
+
+        These are NOT valid env references and must NOT bypass masking.
+        """
+        (tmp_path / "config.py").write_text(
+            'password="os.supersecret"\n'
+            'password="process.environmentSecret"\n',
+            encoding="utf-8",
+        )
+        result = scan_directory(tmp_path)
+
+        r006 = [f for f in result.findings if f.rule_id == "R006_PASSWORD_ASSIGNMENT"]
+        assert len(r006) >= 2
+
+        for f in r006:
+            assert "os.supersecret" not in f.snippet_masked
+            assert "supersecret" not in f.snippet_masked
+            assert "process.environmentSecret" not in f.snippet_masked
+            assert "environmentSecret" not in f.snippet_masked
+
+    def test_unquoted_hash_no_suffix_leak(self, tmp_path):
+        """Regression 3: password=alpha#omega -- snippet has no alpha or omega."""
+        (tmp_path / "config.py").write_text(
+            "password=alpha#omega\n"
+            "token=abc#def\n",
+            encoding="utf-8",
+        )
+        result = scan_directory(tmp_path)
+
+        all_findings = [f for f in result.findings if f.rule_id in (
+            "R006_PASSWORD_ASSIGNMENT", "R007_GENERIC_TOKEN_ASSIGNMENT"
+        )]
+        assert len(all_findings) >= 2
+
+        for f in all_findings:
+            assert "alpha" not in f.snippet_masked
+            assert "omega" not in f.snippet_masked
+            assert "abc" not in f.snippet_masked
+            assert "def" not in f.snippet_masked
+
+    def test_json_double_quoted_key_recognized(self, tmp_path):
+        """Regression 4: "password": "alpha beta gamma" produces R006."""
+        (tmp_path / "config.json").write_text(
+            '"password": "alpha beta gamma"\n',
+            encoding="utf-8",
+        )
+        result = scan_directory(tmp_path)
+
+        r006 = [f for f in result.findings if f.rule_id == "R006_PASSWORD_ASSIGNMENT"]
+        assert len(r006) == 1
+        f = r006[0]
+        # Column range points to full value
+        line = '"password": "alpha beta gamma"'
+        value_at_range = line[f.column_start:f.column_end]
+        assert value_at_range == "alpha beta gamma"
+        # Snippet fully masked
+        assert "alpha" not in f.snippet_masked
+        assert "beta" not in f.snippet_masked
+        assert "gamma" not in f.snippet_masked
+
+    def test_toml_quoted_key_recognized(self, tmp_path):
+        """Regression 5: 'token': 'abc def ghi' and "api_key" = "value" produce findings."""
+        (tmp_path / "config.toml").write_text(
+            "'token': 'abc def ghi'\n"
+            '"api_key" = "some value"\n',
+            encoding="utf-8",
+        )
+        result = scan_directory(tmp_path)
+
+        r007 = [f for f in result.findings if f.rule_id == "R007_GENERIC_TOKEN_ASSIGNMENT"]
+        assert len(r007) >= 2
+
+        for f in r007:
+            assert "abc" not in f.snippet_masked
+            assert "def" not in f.snippet_masked
+            assert "ghi" not in f.snippet_masked
+            assert "some value" not in f.snippet_masked
+
+    def test_dollar_prefixed_real_password_detected(self, tmp_path):
+        """Regression 6: password='$uperSecret123' (lowercase $u) is detected as real secret."""
+        (tmp_path / "config.py").write_text(
+            'password = "$uperSecret123"\n'
+            'password = "\\${LITERAL_VALUE}"\n',
+            encoding="utf-8",
+        )
+        result = scan_directory(tmp_path)
+
+        r006 = [f for f in result.findings if f.rule_id == "R006_PASSWORD_ASSIGNMENT"]
+        assert len(r006) >= 2
+
+        for f in r006:
+            assert "$uperSecret123" not in f.snippet_masked
+            assert "LITERAL_VALUE" not in f.snippet_masked
+
+    def test_genuine_env_reference_no_false_positive(self, tmp_path):
+        """Regression 7: $VAR, ${VAR}, process.env.NAME, os.getenv('NAME') are NOT secrets."""
+        (tmp_path / "config.py").write_text(
+            "password = $DB_PASSWORD\n"
+            "password = ${DB_PASSWORD}\n"
+            "password = ${DB_PASSWORD:-default}\n"
+            "password = process.env.DB_PASSWORD\n"
+            'password = os.getenv("DB_PASSWORD")\n',
+            encoding="utf-8",
+        )
+        result = scan_directory(tmp_path)
+
+        r006 = [f for f in result.findings if f.rule_id == "R006_PASSWORD_ASSIGNMENT"]
+        assert len(r006) == 0
+
+    def test_same_line_second_secret_fully_masked(self, tmp_path):
+        """Regression 8: token='<format>' password='os.supersecret' -- both masked."""
+        line = f'token="{SYNTH_GITHUB_TOKEN}" password="os.supersecret"'
+        (tmp_path / "config.py").write_text(line + "\n", encoding="utf-8")
+        result = scan_directory(tmp_path)
+
+        # All findings on line 1
+        line1_findings = [f for f in result.findings if f.line_start == 1]
+        assert len(line1_findings) >= 1
+
+        for f in line1_findings:
+            # Neither secret should appear in snippet
+            assert SYNTH_GITHUB_TOKEN not in f.snippet_masked
+            assert "os.supersecret" not in f.snippet_masked
+            assert "supersecret" not in f.snippet_masked
+
+    def test_repeated_char_placeholder_non_blocking(self, tmp_path):
+        """Regression 9: ghp_+X*36 (all same char) is downgraded to non-blocking."""
+        low_entropy_token = "ghp_" + "X" * 36
+        (tmp_path / "config.py").write_text(
+            f'token="{low_entropy_token}"\n', encoding="utf-8",
+        )
+        result = scan_directory(tmp_path)
+
+        r001 = [f for f in result.findings if f.rule_id == "R001_GITHUB_TOKEN"]
+        assert len(r001) == 1
+        f = r001[0]
+        assert f.is_blocking is False
+        assert f.severity == Severity.LOW
+        # Original token must not appear in snippet
+        assert low_entropy_token not in f.snippet_masked
+
+    def test_mixed_char_format_value_still_blocking(self, tmp_path):
+        """Regression 10: mixed-character GitHub token is still critical/blocking."""
+        (tmp_path / "config.py").write_text(
+            f'token="{SYNTH_GITHUB_TOKEN}"\n', encoding="utf-8",
+        )
+        result = scan_directory(tmp_path)
+
+        r001 = [f for f in result.findings if f.rule_id == "R001_GITHUB_TOKEN"]
+        assert len(r001) == 1
+        f = r001[0]
+        assert f.is_blocking is True
+        assert f.severity == Severity.CRITICAL
+        assert SYNTH_GITHUB_TOKEN not in f.snippet_masked

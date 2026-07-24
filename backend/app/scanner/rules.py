@@ -31,6 +31,9 @@ from typing import Optional
 
 from app.core.security.desensitize import (
     GENERIC,
+    is_already_masked,
+    is_env_reference,
+    is_low_entropy,
     mask_secret,
     mask_snippet,
     parse_assignment_value,
@@ -73,42 +76,6 @@ PLACEHOLDER_VALUES: frozenset[str] = frozenset({
 def _is_placeholder(value: str) -> bool:
     """Check if a value is an exact-match known placeholder (case-insensitive)."""
     return value.lower() in PLACEHOLDER_VALUES
-
-
-# Indicators that a value has already been masked/redacted.
-# Used to skip already-desensitized values in documentation or examples.
-_MASKED_INDICATORS: frozenset[str] = frozenset({
-    "<REDACTED>", "<PRIVATE_KEY_REDACTED>", "***",
-})
-
-
-def _is_already_masked(value: str) -> bool:
-    """Check if a value appears to be already masked/redacted."""
-    return any(indicator in value for indicator in _MASKED_INDICATORS)
-
-
-def _is_env_reference(value: str) -> bool:
-    """Check if a value is an environment variable reference, not a hardcoded secret.
-
-    Skips:
-    - ${VAR} or ${VAR:-default}  (shell/Docker env reference)
-    - process.env.XXX            (Node.js)
-    - os.environ['XXX']          (Python)
-    - os.getenv('XXX')           (Python)
-    - $VAR                       (shell variable)
-    """
-    value = value.strip()
-    if value.startswith("${"):
-        return True
-    if value.startswith("process.env."):
-        return True
-    if value.startswith("os.environ"):
-        return True
-    if value.startswith("os.getenv"):
-        return True
-    if value.startswith("$") and len(value) > 1 and not value.startswith("$("):
-        return True
-    return False
 
 
 def _is_likely_non_secret(value: str) -> bool:
@@ -226,18 +193,27 @@ class GitHubTokenRule(Rule):
         for i, line in enumerate(lines):
             for match in self._pattern.finditer(line):
                 token = match.group()
+                # Low-entropy placeholder downgrade (e.g., ghp_AAAAAA...)
+                if is_low_entropy(token, prefix_len=4):
+                    severity = Severity.LOW
+                    confidence = Confidence.LOW
+                    blocking = False
+                else:
+                    severity = self.severity
+                    confidence = self.confidence
+                    blocking = self.is_blocking
                 findings.append(Finding(
                     rule_id=self.rule_id,
                     rule_name=self.rule_name,
-                    severity=self.severity,
-                    confidence=self.confidence,
+                    severity=severity,
+                    confidence=confidence,
                     file_path=file_path,
                     line_start=i + 1,
                     line_end=i + 1,
                     column_start=match.start(),
                     column_end=match.end(),
                     snippet_masked=_make_masked_snippet(line),
-                    is_blocking=self.is_blocking,
+                    is_blocking=blocking,
                     finding_type=self.finding_type,
                     description="GitHub personal access token detected",
                     category="token",
@@ -268,18 +244,27 @@ class AWSAccessKeyRule(Rule):
         findings: list[Finding] = []
         for i, line in enumerate(lines):
             for match in self._pattern.finditer(line):
+                token = match.group()
+                if is_low_entropy(token, prefix_len=4):
+                    severity = Severity.LOW
+                    confidence = Confidence.LOW
+                    blocking = False
+                else:
+                    severity = self.severity
+                    confidence = self.confidence
+                    blocking = self.is_blocking
                 findings.append(Finding(
                     rule_id=self.rule_id,
                     rule_name=self.rule_name,
-                    severity=self.severity,
-                    confidence=self.confidence,
+                    severity=severity,
+                    confidence=confidence,
                     file_path=file_path,
                     line_start=i + 1,
                     line_end=i + 1,
                     column_start=match.start(),
                     column_end=match.end(),
                     snippet_masked=_make_masked_snippet(line),
-                    is_blocking=self.is_blocking,
+                    is_blocking=blocking,
                     finding_type=self.finding_type,
                     description="AWS access key ID detected",
                     category="token",
@@ -310,8 +295,10 @@ class AWSSecretKeyRule(Rule):
     finding_type = FindingType.CONTENT
 
     # Key-only pattern — value is parsed by the unified parse_assignment_value().
+    # \b word boundaries prevent matching "PASSWORD" inside env var values
+    # like ${DB_PASSWORD:-default} where _ is a word character (no \b).
     _key_pattern = re.compile(
-        r"(?i)(aws_secret_access_key|secret_access_key|aws_secret)"
+        r"(?i)\b(aws_secret_access_key|secret_access_key|aws_secret)\b"
     )
 
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
@@ -321,26 +308,35 @@ class AWSSecretKeyRule(Rule):
                 result = parse_assignment_value(line, match.end())
                 if result is None:
                     continue
-                value_start, value_end, value = result
+                value_start, value_end, value, is_quoted = result
                 if not value:
                     continue
                 # Must be a 40-char base64-like string
                 if not re.fullmatch(r"[A-Za-z0-9/+]{40}", value):
                     continue
-                if _is_env_reference(value) or _is_placeholder(value):
+                if is_env_reference(value, is_quoted) or _is_placeholder(value):
                     continue
+                # Low-entropy placeholder downgrade (e.g., all same char)
+                if is_low_entropy(value, prefix_len=0):
+                    severity = Severity.LOW
+                    confidence = Confidence.LOW
+                    blocking = False
+                else:
+                    severity = self.severity
+                    confidence = self.confidence
+                    blocking = self.is_blocking
                 findings.append(Finding(
                     rule_id=self.rule_id,
                     rule_name=self.rule_name,
-                    severity=self.severity,
-                    confidence=self.confidence,
+                    severity=severity,
+                    confidence=confidence,
                     file_path=file_path,
                     line_start=i + 1,
                     line_end=i + 1,
                     column_start=value_start,
                     column_end=value_end,
                     snippet_masked=_make_masked_snippet(line),
-                    is_blocking=self.is_blocking,
+                    is_blocking=blocking,
                     finding_type=self.finding_type,
                     description="AWS secret access key detected",
                     category="token",
@@ -371,18 +367,27 @@ class GoogleAPIKeyRule(Rule):
         findings: list[Finding] = []
         for i, line in enumerate(lines):
             for match in self._pattern.finditer(line):
+                token = match.group()
+                if is_low_entropy(token, prefix_len=4):
+                    severity = Severity.LOW
+                    confidence = Confidence.LOW
+                    blocking = False
+                else:
+                    severity = self.severity
+                    confidence = self.confidence
+                    blocking = self.is_blocking
                 findings.append(Finding(
                     rule_id=self.rule_id,
                     rule_name=self.rule_name,
-                    severity=self.severity,
-                    confidence=self.confidence,
+                    severity=severity,
+                    confidence=confidence,
                     file_path=file_path,
                     line_start=i + 1,
                     line_end=i + 1,
                     column_start=match.start(),
                     column_end=match.end(),
                     snippet_masked=_make_masked_snippet(line),
-                    is_blocking=self.is_blocking,
+                    is_blocking=blocking,
                     finding_type=self.finding_type,
                     description="Google API key detected",
                     category="token",
@@ -512,7 +517,9 @@ class PasswordAssignmentRule(Rule):
     finding_type = FindingType.CONTENT
 
     # Key-only pattern — value is parsed by the unified parse_assignment_value().
-    _key_pattern = re.compile(r"(?i)(password|passwd|pwd)")
+    # \b word boundaries prevent matching "PASSWORD" inside env var values
+    # like ${DB_PASSWORD:-default} where _ is a word character (no \b).
+    _key_pattern = re.compile(r"(?i)\b(password|passwd|pwd)\b")
 
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
         findings: list[Finding] = []
@@ -521,12 +528,12 @@ class PasswordAssignmentRule(Rule):
                 result = parse_assignment_value(line, match.end())
                 if result is None:
                     continue
-                value_start, value_end, value = result
+                value_start, value_end, value, is_quoted = result
                 if not value:
                     continue
-                if _is_env_reference(value):
+                if is_env_reference(value, is_quoted):
                     continue
-                if _is_already_masked(value):
+                if is_already_masked(value):
                     continue
 
                 # Determine severity/confidence based on placeholder check
@@ -586,8 +593,9 @@ class GenericTokenAssignmentRule(Rule):
     finding_type = FindingType.CONTENT
 
     # Key-only pattern — value is parsed by the unified parse_assignment_value().
+    # \b word boundaries prevent matching key names inside env var values.
     _key_pattern = re.compile(
-        r"(?i)(secret|api_key|apikey|token|access_token)"
+        r"(?i)\b(secret|api_key|apikey|token|access_token)\b"
     )
 
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
@@ -597,12 +605,12 @@ class GenericTokenAssignmentRule(Rule):
                 result = parse_assignment_value(line, match.end())
                 if result is None:
                     continue
-                value_start, value_end, value = result
+                value_start, value_end, value, is_quoted = result
                 if not value:
                     continue
-                if _is_env_reference(value):
+                if is_env_reference(value, is_quoted):
                     continue
-                if _is_already_masked(value):
+                if is_already_masked(value):
                     continue
 
                 if _is_placeholder(value):
@@ -674,8 +682,8 @@ class ConnectionStringRule(Rule):
         for i, line in enumerate(lines):
             for match in self._pattern.finditer(line):
                 password = match.group(3)
-                # Skip if the password is a placeholder or env reference
-                if _is_env_reference(password) or _is_placeholder(password):
+                # Skip if the password is a placeholder, env reference, or already masked
+                if is_env_reference(password) or _is_placeholder(password) or is_already_masked(password):
                     continue
 
                 findings.append(Finding(
@@ -832,14 +840,14 @@ class ProductionEnvWithSecretRule(Rule):
             result = parse_assignment_value(line, key_end_in_orig)
             if result is None:
                 continue
-            value_start, value_end, value = result
+            value_start, value_end, value, is_quoted = result
 
             # Skip env references, placeholders, masked values, and likely non-secrets
-            if _is_env_reference(value):
+            if is_env_reference(value, is_quoted):
                 continue
             if _is_placeholder(value):
                 continue
-            if _is_already_masked(value):
+            if is_already_masked(value):
                 continue
             if _is_likely_non_secret(value):
                 continue
