@@ -57,9 +57,20 @@ REASON_OUTSIDE_ROOT = "outside_root"
 REASON_TOO_LARGE = "too_large"
 REASON_BINARY = "binary"
 
-# Example/template env files — these are documentation, not real config.
-# Content rules are NOT run on them; only file-type rules (e.g. R010 ScanNotice).
-EXAMPLE_ENV_FILES: frozenset[str] = frozenset({".env.example", ".env.sample"})
+# Example/template env files — documentation, not real config.
+# High-confidence format rules still scan them; generic heuristic rules
+# (R006-R008) are skipped to avoid noise from placeholder values.
+EXAMPLE_ENV_FILES: frozenset[str] = frozenset({".env.example", ".env.sample", ".env.template"})
+
+# Rule IDs that are high-confidence (explicit format / private key).
+# These run on ALL files, including template env files.
+HIGH_CONFIDENCE_RULE_IDS: frozenset[str] = frozenset({
+    "R001_GITHUB_TOKEN",
+    "R002_AWS_ACCESS_KEY",
+    "R003_AWS_SECRET_KEY",
+    "R004_GOOGLE_API_KEY",
+    "R005_PRIVATE_KEY",
+})
 
 # Fixed error messages — safe to return, contain no sensitive data.
 _SAFE_ERROR_MESSAGES: dict[str, str] = {
@@ -67,6 +78,38 @@ _SAFE_ERROR_MESSAGES: dict[str, str] = {
     REASON_READ_ERROR: "Unable to read file content",
     REASON_OUTSIDE_ROOT: "File resolved outside scan root",
 }
+
+
+# ---------------------------------------------------------------------------
+# --- Path containment validation (testable internal function) ---
+# ---------------------------------------------------------------------------
+
+def _is_path_inside_root(
+    file_path: str, root_resolved: Path,
+) -> tuple[bool, str | None]:
+    """Check if a file path resolves inside the scan root.
+
+    Uses Path.resolve() + relative_to() — NOT os.path.relpath.
+    This catches symlink-based escapes that relpath alone cannot detect.
+
+    Args:
+        file_path:     Absolute or relative file path (string).
+        root_resolved: The resolved scan root directory.
+
+    Returns:
+        (is_inside, posix_relative_path):
+        - If inside:  (True,  "relative/path/to/file")
+        - If outside: (False, None)
+        - If unresolvable (OSError): (False, None)
+    """
+    try:
+        file_resolved = Path(file_path).resolve()
+        rel_to_root = file_resolved.relative_to(root_resolved)
+        return True, rel_to_root.as_posix()
+    except ValueError:
+        return False, None
+    except OSError:
+        return False, None
 
 
 # ---------------------------------------------------------------------------
@@ -223,18 +266,15 @@ def scan_directory(
             # --- Path containment validation ---
             # Resolve the file path and verify it is inside root_resolved.
             # This catches edge cases where relpath alone is insufficient.
-            try:
-                file_resolved = Path(full_path).resolve()
-                rel_to_root = file_resolved.relative_to(root_resolved)
-                posix_path = rel_to_root.as_posix()
-            except ValueError:
-                # File resolved outside the scan root
+            is_inside, posix_path = _is_path_inside_root(full_path, root_resolved)
+            if not is_inside:
                 all_skipped.append(SkippedFile(
                     file_path="<outside_root>",
                     reason=REASON_OUTSIDE_ROOT,
                 ))
                 continue
-            except OSError:
+
+            if posix_path is None:
                 all_skipped.append(SkippedFile(
                     file_path="<unresolvable>",
                     reason=REASON_STAT_ERROR,
@@ -293,16 +333,19 @@ def scan_directory(
             total_lines_scanned += len(lines)
 
             # --- Run rules ---
-            # Example env files (.env.example, .env.sample) are documentation.
-            # Only file-type rules run on them; content rules are skipped so
-            # placeholder values in templates never become security findings.
+            # Template env files (.env.example, .env.sample, .env.template):
+            # - File-type rules always run (R010 generates ScanNotice).
+            # - High-confidence content rules (R001-R005) still scan to catch
+            #   real tokens/keys accidentally committed to template files.
+            # - Generic heuristic rules (R006-R008) are skipped to avoid
+            #   noise from placeholder values.
             basename = posix_path.split("/")[-1]
             is_example_env = basename in EXAMPLE_ENV_FILES
 
             file_findings: list[Finding] = []
             for rule in rules:
                 if rule.finding_type == FindingType.CONTENT:
-                    if is_example_env:
+                    if is_example_env and rule.rule_id not in HIGH_CONFIDENCE_RULE_IDS:
                         continue
                     file_findings.extend(rule.scan_content(posix_path, lines))
                 elif rule.finding_type == FindingType.FILE:

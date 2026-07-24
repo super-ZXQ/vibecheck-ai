@@ -340,7 +340,12 @@ class TestRuleAttributes:
         assert len(blocking_findings) == 0
 
     def test_env_example_not_in_security_findings(self, tmp_path):
-        """Test 13: .env.example does not enter security findings (it's a notice)."""
+        """Test 13: .env.example with only placeholder values does not produce findings.
+
+        Template env files still generate a ScanNotice, but placeholder values
+        like your_api_key_here do not match any high-confidence format rule
+        (R001-R005), so no security Finding is produced.
+        """
         (tmp_path / ".env.example").write_text(
             "API_KEY=your_api_key_here\n"
             "DB_PASSWORD=your_password_here\n",
@@ -559,3 +564,190 @@ class TestGitAndSymlinkHandling:
         # Real files should be scanned (findings from real_config.py and real_dir/secret.py)
         assert "real_config.py" in all_paths
         assert "real_dir/secret.py" in all_paths
+
+
+# ============================================================================
+# --- Env template high-confidence scanning tests (tests 21-23) ---
+# ============================================================================
+
+class TestEnvTemplateHighConfidenceScan:
+    """Verify high-confidence rules still scan template env files."""
+
+    def test_env_example_placeholders_only_no_finding(self, tmp_path):
+        """Test 21: .env.example with only placeholders has ScanNotice, no Finding."""
+        (tmp_path / ".env.example").write_text(
+            "API_KEY=your_api_key_here\n"
+            "DB_PASSWORD=your_password_here\n",
+            encoding="utf-8",
+        )
+
+        result = scan_directory(tmp_path)
+
+        # ScanNotice present
+        notices = [n for n in result.notices if ".env.example" in (n.file_path or "")]
+        assert len(notices) >= 1
+
+        # No security findings
+        assert len(result.findings) == 0
+
+    def test_env_example_with_github_token_produces_finding(self, tmp_path):
+        """Test 22: .env.example with real GitHub token produces R001 Finding.
+
+        High-confidence format rules (R001-R005) must still scan template
+        files to catch real secrets accidentally committed to templates.
+        """
+        (tmp_path / ".env.example").write_text(
+            f'GITHUB_TOKEN="{SYNTH_GITHUB_TOKEN}"\n',
+            encoding="utf-8",
+        )
+
+        result = scan_directory(tmp_path)
+
+        # ScanNotice still present
+        notices = [n for n in result.notices if ".env.example" in (n.file_path or "")]
+        assert len(notices) >= 1
+
+        # R001 finding produced
+        r001 = [f for f in result.findings if f.rule_id == "R001_GITHUB_TOKEN"]
+        assert len(r001) == 1
+        assert r001[0].is_blocking is True
+        assert str(r001[0].confidence) == "high" or r001[0].confidence.value == "high"
+        # Original token must not appear in snippet
+        assert SYNTH_GITHUB_TOKEN not in r001[0].snippet_masked
+
+    def test_env_example_with_private_key_produces_finding(self, tmp_path):
+        """Test 23: .env.example with private key marker produces R005 Finding."""
+        (tmp_path / ".env.example").write_text(
+            "-----BEGIN RSA PRIVATE KEY-----\n"
+            "MIIEowIBAAKCAQEA" + "D" * 400 + "\n"
+            "-----END RSA PRIVATE KEY-----\n",
+            encoding="utf-8",
+        )
+
+        result = scan_directory(tmp_path)
+
+        # ScanNotice still present
+        notices = [n for n in result.notices if ".env.example" in (n.file_path or "")]
+        assert len(notices) >= 1
+
+        # R005 finding produced
+        r005 = [f for f in result.findings if f.rule_id == "R005_PRIVATE_KEY"]
+        assert len(r005) == 1
+        assert r005[0].is_blocking is True
+        assert r005[0].snippet_masked == "<PRIVATE_KEY_REDACTED>"
+
+
+# ============================================================================
+# --- R011 tightened production env tests (tests 24-25) ---
+# ============================================================================
+
+class TestR011TightenedRules:
+    """Verify R011 only blocks on sensitive variable names with real secrets."""
+
+    def test_production_env_non_sensitive_config_not_blocking(self, tmp_path):
+        """Test 24: Non-sensitive config values do not trigger blocking.
+
+        APP_ENV, LOG_LEVEL, REGION, FEATURE_FLAG, API_HOST are common
+        non-sensitive production config values. R011 must not block them.
+        """
+        (tmp_path / ".env.production").write_text(
+            "APP_ENV=production\n"
+            "LOG_LEVEL=info\n"
+            "REGION=us-east-1\n"
+            "FEATURE_FLAG=enabled\n"
+            "API_HOST=api.internal\n",
+            encoding="utf-8",
+        )
+
+        result = scan_directory(tmp_path)
+
+        # No blocking findings should be produced
+        blocking_findings = [f for f in result.findings if f.is_blocking]
+        assert len(blocking_findings) == 0
+
+        # Specifically, no R011 findings at all
+        r011 = [f for f in result.findings if f.rule_id == "R011_PRODUCTION_ENV_WITH_SECRET"]
+        assert len(r011) == 0
+
+    def test_production_env_sensitive_names_blocking(self, tmp_path):
+        """Test 25: Sensitive variable names with real values trigger blocking.
+
+        JWT_SECRET and CLIENT_SECRET with non-placeholder, non-env-reference
+        values should produce R011 blocking findings.
+        """
+        (tmp_path / ".env.production").write_text(
+            "JWT_SECRET=runtime_constructed_jwt_value_abc123\n"
+            "CLIENT_SECRET=runtime_constructed_client_secret_xyz789\n",
+            encoding="utf-8",
+        )
+
+        result = scan_directory(tmp_path)
+
+        # R011 should produce blocking findings
+        r011 = [f for f in result.findings if f.rule_id == "R011_PRODUCTION_ENV_WITH_SECRET"]
+        assert len(r011) == 2
+        for f in r011:
+            assert f.is_blocking is True
+
+        # Verify both sensitive variable names are covered
+        descriptions = [f.description for f in r011]
+        assert any("JWT_SECRET" in d for d in descriptions)
+        assert any("CLIENT_SECRET" in d for d in descriptions)
+
+
+# ============================================================================
+# --- Path containment function tests (tests 26-27) ---
+# ============================================================================
+
+class TestPathContainmentFunction:
+    """Directly test the _is_path_inside_root function."""
+
+    def test_path_inside_root_returns_true(self, tmp_path):
+        """Test 26: File inside scan root returns (True, posix_path)."""
+        from app.scanner.sensitive import _is_path_inside_root
+
+        # Create a file inside tmp_path
+        inner_file = tmp_path / "src" / "config.py"
+        inner_file.parent.mkdir(parents=True)
+        inner_file.write_text("print('hello')\n", encoding="utf-8")
+
+        root_resolved = tmp_path.resolve()
+        is_inside, posix_path = _is_path_inside_root(str(inner_file), root_resolved)
+
+        assert is_inside is True
+        assert posix_path is not None
+        assert "\\" not in posix_path  # POSIX format
+        assert posix_path == "src/config.py"
+
+    @pytest.mark.skipif(sys.platform == 'win32', reason='Symlinks require admin on Windows; must run on Linux')
+    def test_path_outside_root_returns_false(self, tmp_path):
+        """Test 27: File resolving outside scan root returns (False, None).
+
+        A symlink is created inside the scan root pointing to a file outside.
+        The resolved path falls outside root_resolved, so the function
+        must return (False, None).
+        """
+        from app.scanner.sensitive import _is_path_inside_root
+
+        # Create a file OUTSIDE the scan root
+        outside_dir = tmp_path.parent / "outside_test_dir_0127"
+        outside_dir.mkdir(exist_ok=True)
+        outside_file = outside_dir / "outside_config.py"
+        outside_file.write_text("print('outside')\n", encoding="utf-8")
+
+        try:
+            # Create a symlink inside the scan root pointing outside
+            symlink_inside = tmp_path / "link_to_outside.py"
+            os.symlink(str(outside_file), str(symlink_inside))
+
+            root_resolved = tmp_path.resolve()
+            is_inside, posix_path = _is_path_inside_root(str(symlink_inside), root_resolved)
+
+            # The symlink resolves outside the root
+            assert is_inside is False
+            assert posix_path is None
+        finally:
+            if outside_file.exists():
+                outside_file.unlink()
+            if outside_dir.exists():
+                outside_dir.rmdir()

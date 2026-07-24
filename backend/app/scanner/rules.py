@@ -128,7 +128,44 @@ def _is_likely_non_secret(value: str) -> bool:
     # File paths
     if value.startswith(("/", "./", "../")):
         return True
+    # Common non-sensitive config values (environment names, log levels, etc.)
+    _COMMON_CONFIG_VALUES: frozenset[str] = frozenset({
+        "production", "staging", "development", "dev", "prod", "test",
+        "info", "debug", "warning", "error", "warn", "trace",
+        "us-east-1", "us-east-2", "us-west-1", "us-west-2",
+        "eu-west-1", "eu-central-1", "ap-northeast-1", "ap-southeast-1",
+        "localhost", "127.0.0.1", "0.0.0.0",
+        "api", "web", "worker", "scheduler", "celery",
+        "json", "yaml", "xml", "text", "html",
+        "redis", "postgres", "mysql", "mongodb", "sqlite",
+    })
+    if lower in _COMMON_CONFIG_VALUES:
+        return True
+    # Dotted identifiers like api.internal, db.production (hostnames)
+    if re.match(r"^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$", lower) and "@" not in value:
+        return True
     return False
+
+
+# Sensitive variable name keywords for R011.
+# The variable NAME (not value) must contain one of these substrings
+# for R011 to flag it as a potential hardcoded secret.
+_SENSITIVE_NAME_KEYWORDS: tuple[str, ...] = (
+    "password", "passwd", "pwd",
+    "secret", "token", "api_key", "apikey",
+    "access_key", "private_key", "client_secret", "jwt_secret",
+)
+
+
+def _has_sensitive_name(key: str) -> bool:
+    """Check if a variable name has sensitive semantics.
+
+    R011 only flags variables whose name suggests a secret — e.g.
+    password, passwd, pwd, secret, token, api_key, access_key,
+    private_key, client_secret, jwt_secret.
+    """
+    lower = key.lower()
+    return any(kw in lower for kw in _SENSITIVE_NAME_KEYWORDS)
 
 
 def _make_masked_snippet(line_text: str, max_length: int = 200) -> str:
@@ -642,7 +679,7 @@ class EnvExampleFileRule(Rule):
 
     def check_file(self, file_path: str, file_size: int) -> Finding | ScanNotice | None:
         basename = file_path.split("/")[-1]
-        if basename in (".env.example", ".env.sample"):
+        if basename in (".env.example", ".env.sample", ".env.template"):
             return ScanNotice(
                 rule_id=self.rule_id,
                 message=f"Environment example file found: {basename}",
@@ -659,10 +696,14 @@ class ProductionEnvWithSecretRule(Rule):
     """Detect hardcoded secrets in production environment files.
 
     Scans .env.production, .env.prod, .env.staging for KEY=VALUE patterns
-    where VALUE is not an env reference, not a placeholder, and not obviously
-    non-secret.
+    where ALL of the following are true:
+    1. The file is a production environment config file.
+    2. The variable NAME has sensitive semantics (password, secret, token,
+       api_key, access_key, private_key, client_secret, jwt_secret, etc.).
+    3. The VALUE is not a placeholder, env reference, masked content,
+       boolean, pure number, or common non-sensitive config value.
 
-    Dedup: If the same file already has findings from specific rules
+    Dedup: If the same file already has findings from specific format rules
     (R001-R008), this rule's findings are suppressed by the scanner's
     deduplication logic (see sensitive.py).
     """
@@ -695,6 +736,11 @@ class ProductionEnvWithSecretRule(Rule):
             key = match.group(1)
             value = match.group(2).strip().strip("'\"")
 
+            # --- Requirement 1: variable name must have sensitive semantics ---
+            if not _has_sensitive_name(key):
+                continue
+
+            # --- Requirement 2: value must not be excluded ---
             # Skip env references, placeholders, masked values, and likely non-secrets
             if _is_env_reference(value):
                 continue
