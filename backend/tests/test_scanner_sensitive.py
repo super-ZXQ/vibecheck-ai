@@ -12,6 +12,7 @@ Test count: 9
 """
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -168,18 +169,20 @@ class TestScanDirectory:
         r001 = [f for f in result.findings if f.rule_id == "R001_GITHUB_TOKEN"]
         assert len(r001) == 0
 
+    @pytest.mark.skipif(sys.platform == 'win32', reason='Symlinks require admin on Windows')
     def test_scan_directory_skips_symlinks(self, tmp_path):
-        """Symlink files are skipped during scanning."""
+        """Symlink files and directories are skipped during scanning.
+
+        This test runs on Linux/macOS where symlinks can be created without
+        admin privileges. On Windows it is skipped.
+        """
         # Create a real file with a token
         real_file = tmp_path / "real_config.py"
         real_file.write_text(f'token="{SYNTH_GITHUB_TOKEN}"\n', encoding="utf-8")
 
         # Create a symlink to it
         symlink_file = tmp_path / "link_config.py"
-        try:
-            os.symlink(str(real_file), str(symlink_file))
-        except OSError:
-            pytest.skip("Cannot create symlinks on this platform")
+        os.symlink(str(real_file), str(symlink_file))
 
         # Create a symlink directory
         real_dir = tmp_path / "real_dir"
@@ -188,17 +191,12 @@ class TestScanDirectory:
             f'key="{SYNTH_GITHUB_TOKEN}"\n', encoding="utf-8",
         )
         symlink_dir = tmp_path / "link_dir"
-        try:
-            os.symlink(str(real_dir), str(symlink_dir))
-        except OSError:
-            pytest.skip("Cannot create symlinks on this platform")
+        os.symlink(str(real_dir), str(symlink_dir))
 
         result = scan_directory(tmp_path)
 
         # Only real_config.py and real_dir/secret.py should be scanned
         # (symlink_file and symlink_dir should be skipped)
-        scanned_paths = set()
-        # Check findings come only from real files
         all_finding_paths = {f.file_path for f in result.findings}
         assert "link_config.py" not in all_finding_paths
         # link_dir contents should not appear

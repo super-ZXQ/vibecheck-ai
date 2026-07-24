@@ -1,14 +1,19 @@
 """Scanner core -- secure directory traversal, rule execution, and deduplication.
 
 Security guarantees:
-- Path traversal: calculates rel_path BEFORE use, skips symlink files,
-  removes symlink directories from os.walk dirs list, all returned paths
-  use POSIX format (forward slashes).
+- Path containment: every file is resolved and verified to be inside
+  scan_root via Path.resolve() + relative_to(). Files that resolve outside
+  the root are skipped as "outside_root". This prevents symlink-based escapes
+  that os.path.relpath alone cannot detect.
+- Symlink files and symlink directories are always skipped.
+- All returned paths use POSIX format (forward slashes).
 - Never executes code from the scanned repository.
 - File content is read as UTF-8; non-UTF-8 files are skipped as "binary".
 - Files larger than scan_max_file_size are skipped as "too_large".
-- Files with binary extensions are skipped as "binary".
-- Only the first max_line_read lines of each file are scanned.
+- Files are scanned in FULL -- no line limit, so secrets in later lines
+  are never missed.
+- All error messages are fixed reason codes -- no str(exception),
+  repr(exception), absolute paths, or file content in any output.
 
 Deduplication (per file):
 1. Content findings on the same line with overlapping column ranges:
@@ -40,6 +45,28 @@ from app.scanner.default_rules import (
     RULE_PRIORITY_MAP,
     SPECIFIC_RULE_IDS,
 )
+
+
+# ---------------------------------------------------------------------------
+# --- Fixed reason codes (never expose exception text or paths) ---
+# ---------------------------------------------------------------------------
+
+REASON_STAT_ERROR = "stat_error"
+REASON_READ_ERROR = "read_error"
+REASON_OUTSIDE_ROOT = "outside_root"
+REASON_TOO_LARGE = "too_large"
+REASON_BINARY = "binary"
+
+# Example/template env files — these are documentation, not real config.
+# Content rules are NOT run on them; only file-type rules (e.g. R010 ScanNotice).
+EXAMPLE_ENV_FILES: frozenset[str] = frozenset({".env.example", ".env.sample"})
+
+# Fixed error messages — safe to return, contain no sensitive data.
+_SAFE_ERROR_MESSAGES: dict[str, str] = {
+    REASON_STAT_ERROR: "Unable to read file metadata",
+    REASON_READ_ERROR: "Unable to read file content",
+    REASON_OUTSIDE_ROOT: "File resolved outside scan root",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -152,12 +179,15 @@ def scan_directory(
         ValueError: If root_dir does not exist or is not a directory.
     """
     if not root_dir.exists():
-        raise ValueError(f"Directory does not exist: {root_dir}")
+        raise ValueError("Scan root directory does not exist")
     if not root_dir.is_dir():
-        raise ValueError(f"Path is not a directory: {root_dir}")
+        raise ValueError("Scan root path is not a directory")
 
     if rules is None:
         rules = DEFAULT_RULES
+
+    # Resolve the root once — all files must be inside this resolved path.
+    root_resolved = root_dir.resolve()
 
     all_findings: list[Finding] = []
     all_notices: list[ScanNotice] = []
@@ -171,6 +201,7 @@ def scan_directory(
 
     for dirpath, dirnames, filenames in os.walk(str(root_dir)):
         # --- Remove ignored directories (in-place) ---
+        # This includes .git — Git history is NOT scanned.
         dirnames[:] = [
             d for d in dirnames
             if d not in ignore_dirs
@@ -189,10 +220,26 @@ def scan_directory(
             if os.path.islink(full_path):
                 continue
 
-            # --- Calculate rel_path BEFORE using it ---
-            rel_path = os.path.relpath(full_path, str(root_dir))
-            # Convert to POSIX format (forward slashes)
-            posix_path = Path(rel_path).as_posix()
+            # --- Path containment validation ---
+            # Resolve the file path and verify it is inside root_resolved.
+            # This catches edge cases where relpath alone is insufficient.
+            try:
+                file_resolved = Path(full_path).resolve()
+                rel_to_root = file_resolved.relative_to(root_resolved)
+                posix_path = rel_to_root.as_posix()
+            except ValueError:
+                # File resolved outside the scan root
+                all_skipped.append(SkippedFile(
+                    file_path="<outside_root>",
+                    reason=REASON_OUTSIDE_ROOT,
+                ))
+                continue
+            except OSError:
+                all_skipped.append(SkippedFile(
+                    file_path="<unresolvable>",
+                    reason=REASON_STAT_ERROR,
+                ))
+                continue
 
             # --- Check file size ---
             try:
@@ -200,15 +247,15 @@ def scan_directory(
             except OSError:
                 all_errors.append(ScanError(
                     file_path=posix_path,
-                    error_type="stat_error",
-                    error_message="Unable to read file metadata",
+                    error_type=REASON_STAT_ERROR,
+                    error_message=_SAFE_ERROR_MESSAGES[REASON_STAT_ERROR],
                 ))
                 continue
 
             if file_size > settings.scan_max_file_size:
                 all_skipped.append(SkippedFile(
                     file_path=posix_path,
-                    reason="too_large",
+                    reason=REASON_TOO_LARGE,
                 ))
                 continue
 
@@ -217,7 +264,7 @@ def scan_directory(
             if ext in binary_exts:
                 all_skipped.append(SkippedFile(
                     file_path=posix_path,
-                    reason="binary",
+                    reason=REASON_BINARY,
                 ))
                 continue
 
@@ -228,30 +275,35 @@ def scan_directory(
             except UnicodeDecodeError:
                 all_skipped.append(SkippedFile(
                     file_path=posix_path,
-                    reason="binary",
+                    reason=REASON_BINARY,
                 ))
                 continue
-            except OSError as e:
+            except OSError:
                 all_errors.append(ScanError(
                     file_path=posix_path,
-                    error_type="read_error",
-                    error_message=f"Unable to read file: {type(e).__name__}",
+                    error_type=REASON_READ_ERROR,
+                    error_message=_SAFE_ERROR_MESSAGES[REASON_READ_ERROR],
                 ))
                 continue
 
             lines = content.splitlines()
 
-            # --- Limit lines read ---
-            if len(lines) > settings.max_line_read:
-                lines = lines[:settings.max_line_read]
-
+            # --- No line limit: scan full content ---
             total_files_scanned += 1
             total_lines_scanned += len(lines)
 
             # --- Run rules ---
+            # Example env files (.env.example, .env.sample) are documentation.
+            # Only file-type rules run on them; content rules are skipped so
+            # placeholder values in templates never become security findings.
+            basename = posix_path.split("/")[-1]
+            is_example_env = basename in EXAMPLE_ENV_FILES
+
             file_findings: list[Finding] = []
             for rule in rules:
                 if rule.finding_type == FindingType.CONTENT:
+                    if is_example_env:
+                        continue
                     file_findings.extend(rule.scan_content(posix_path, lines))
                 elif rule.finding_type == FindingType.FILE:
                     result = rule.check_file(posix_path, file_size)

@@ -25,7 +25,8 @@ class Settings(BaseSettings):
     # --- Scan limits ---
     scan_timeout: int = 120  # seconds
     scan_concurrency: int = 1  # single worker, low concurrency
-    max_line_read: int = 5000  # only read first N lines per file
+    # No line limit: files under scan_max_file_size are scanned in full.
+    # Removing max_line_read prevents missing secrets in later lines.
     scan_max_file_size: int = 1024 * 1024  # 1 MB — skip files larger than this
     scan_ignore_dirs: list[str] = [
         "node_modules", ".next", "dist", "build", "coverage",

@@ -74,6 +74,18 @@ def _is_placeholder(value: str) -> bool:
     return value.lower() in PLACEHOLDER_VALUES
 
 
+# Indicators that a value has already been masked/redacted.
+# Used to skip already-desensitized values in documentation or examples.
+_MASKED_INDICATORS: frozenset[str] = frozenset({
+    "<REDACTED>", "<PRIVATE_KEY_REDACTED>", "***",
+})
+
+
+def _is_already_masked(value: str) -> bool:
+    """Check if a value appears to be already masked/redacted."""
+    return any(indicator in value for indicator in _MASKED_INDICATORS)
+
+
 def _is_env_reference(value: str) -> bool:
     """Check if a value is an environment variable reference, not a hardcoded secret.
 
@@ -122,12 +134,13 @@ def _is_likely_non_secret(value: str) -> bool:
 def _make_masked_snippet(line_text: str, max_length: int = 200) -> str:
     """Create a masked snippet from a line of text.
 
-    The original line is masked using mask_snippet before being stored.
-    Very long lines are truncated before masking.
+    SECURITY: The full original line is masked FIRST, then the masked text
+    is truncated. This ensures secrets spanning the truncation boundary
+    cannot survive as partial fragments in the output.
     The original snippet NEVER enters the Finding.
     """
-    truncated = line_text[:max_length] if len(line_text) > max_length else line_text
-    return mask_snippet(truncated)
+    masked = mask_snippet(line_text)
+    return masked[:max_length] if len(masked) > max_length else masked
 
 
 # ---------------------------------------------------------------------------
@@ -395,13 +408,16 @@ class PasswordAssignmentRule(Rule):
     - Env var references are skipped.
     - Placeholder values (changeme, foobar, etc.) are downgraded to
       low severity / low confidence / non-blocking.
+
+    NOTE: This is a generic heuristic — non-blocking. Only explicit-format
+    tokens (R001-R005) and complete private keys are blocking.
     """
 
     rule_id = "R006_PASSWORD_ASSIGNMENT"
     rule_name = "Password Assignment"
     severity = Severity.HIGH
     confidence = Confidence.MEDIUM
-    is_blocking = True
+    is_blocking = False
     finding_type = FindingType.CONTENT
 
     _pattern = re.compile(
@@ -414,6 +430,8 @@ class PasswordAssignmentRule(Rule):
             for match in self._pattern.finditer(line):
                 value = match.group(2)
                 if _is_env_reference(value):
+                    continue
+                if _is_already_masked(value):
                     continue
 
                 # Determine severity/confidence based on placeholder check
@@ -456,13 +474,16 @@ class GenericTokenAssignmentRule(Rule):
     - Placeholder values are downgraded to low/low/non-blocking.
     - Explicit-format tokens (ghp_, AKIA, AIza) are NOT affected by downgrade
       because they are caught by their specific rules with higher priority.
+
+    NOTE: This is a generic heuristic — non-blocking. Only explicit-format
+    tokens (R001-R005) and complete private keys are blocking.
     """
 
     rule_id = "R007_GENERIC_TOKEN_ASSIGNMENT"
     rule_name = "Generic Token Assignment"
     severity = Severity.HIGH
     confidence = Confidence.MEDIUM
-    is_blocking = True
+    is_blocking = False
     finding_type = FindingType.CONTENT
 
     _pattern = re.compile(
@@ -476,6 +497,8 @@ class GenericTokenAssignmentRule(Rule):
             for match in self._pattern.finditer(line):
                 value = match.group(2)
                 if _is_env_reference(value):
+                    continue
+                if _is_already_masked(value):
                     continue
 
                 if _is_placeholder(value):
@@ -513,13 +536,16 @@ class ConnectionStringRule(Rule):
     """Detect connection strings with embedded passwords.
 
     Pattern: scheme://user:password@host
+
+    NOTE: Medium confidence, non-blocking. This is a heuristic detection;
+    a future strict high-confidence mode may be added separately.
     """
 
     rule_id = "R008_CONNECTION_STRING"
     rule_name = "Connection String"
     severity = Severity.HIGH
     confidence = Confidence.MEDIUM
-    is_blocking = True
+    is_blocking = False
     finding_type = FindingType.CONTENT
 
     _pattern = re.compile(
@@ -669,10 +695,12 @@ class ProductionEnvWithSecretRule(Rule):
             key = match.group(1)
             value = match.group(2).strip().strip("'\"")
 
-            # Skip env references, placeholders, and likely non-secrets
+            # Skip env references, placeholders, masked values, and likely non-secrets
             if _is_env_reference(value):
                 continue
             if _is_placeholder(value):
+                continue
+            if _is_already_masked(value):
                 continue
             if _is_likely_non_secret(value):
                 continue

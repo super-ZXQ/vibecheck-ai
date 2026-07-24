@@ -187,7 +187,7 @@ class TestPasswordAssignmentRule:
     """Tests for R006 PasswordAssignmentRule."""
 
     def test_password_assignment_detected(self):
-        """Hardcoded password assignment is detected as high/blocking."""
+        """Hardcoded password assignment is detected as high, non-blocking."""
         rule = PasswordAssignmentRule()
         lines = [f'password = "{SYNTH_PASSWORD}"']
         findings = rule.scan_content("config.py", lines)
@@ -196,7 +196,7 @@ class TestPasswordAssignmentRule:
         f = findings[0]
         assert f.rule_id == "R006_PASSWORD_ASSIGNMENT"
         assert f.severity == Severity.HIGH
-        assert f.is_blocking is True
+        assert f.is_blocking is False
         assert SYNTH_PASSWORD not in f.snippet_masked
 
     def test_password_placeholder_downgrade(self):
@@ -223,7 +223,7 @@ class TestGenericTokenAssignmentRule:
     """Tests for R007 GenericTokenAssignmentRule."""
 
     def test_generic_token_assignment_detected(self):
-        """Generic secret assignment is detected."""
+        """Generic secret assignment is detected, non-blocking."""
         rule = GenericTokenAssignmentRule()
         lines = ['secret = "my_api_secret_value"']
         findings = rule.scan_content("config.py", lines)
@@ -231,7 +231,7 @@ class TestGenericTokenAssignmentRule:
         assert len(findings) == 1
         f = findings[0]
         assert f.rule_id == "R007_GENERIC_TOKEN_ASSIGNMENT"
-        assert f.is_blocking is True
+        assert f.is_blocking is False
         assert "my_api_secret_value" not in f.snippet_masked
 
 
@@ -243,7 +243,7 @@ class TestConnectionStringRule:
     """Tests for R008 ConnectionStringRule."""
 
     def test_connection_string_detected(self):
-        """Connection string with embedded password is detected."""
+        """Connection string with embedded password is detected, non-blocking."""
         rule = ConnectionStringRule()
         conn = "postgres://admin:s3cr3tpw@db.example.com:5432/mydb"
         lines = [f'DATABASE_URL = "{conn}"']
@@ -252,7 +252,7 @@ class TestConnectionStringRule:
         assert len(findings) == 1
         f = findings[0]
         assert f.rule_id == "R008_CONNECTION_STRING"
-        assert f.is_blocking is True
+        assert f.is_blocking is False
         # Password must not appear in snippet
         assert "s3cr3tpw" not in f.snippet_masked
 
