@@ -226,7 +226,7 @@ async def download_tarball(repo_url: str) -> DownloadResult:
     """
     repo_info = parse_repo_url(repo_url)
 
-    tarball_url = f"https://github.com/{repo_info.owner}/{repo_info.repo}/tarball"
+    tarball_url = f"https://api.github.com/repos/{repo_info.owner}/{repo_info.repo}/tarball"
     headers = _build_initial_headers()
     timeout = httpx.Timeout(settings.download_timeout, connect=10.0)
 
@@ -279,7 +279,7 @@ async def download_tarball(repo_url: str) -> DownloadResult:
                         current_headers = _strip_auth_headers(current_headers)
 
                     current_url = redirect_url
-                    response.close()
+                    await response.aclose()
                     continue
 
                 # Check HTTP status codes
