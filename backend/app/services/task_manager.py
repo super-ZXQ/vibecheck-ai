@@ -1,0 +1,314 @@
+"""Task manager — CRUD operations for the tasks table.
+
+SQLite is the SINGLE source of truth for task status.
+No task state is held in memory beyond transient references.
+
+Security:
+- error_message is always desensitized before storing.
+- No downloaded files, code snippets, or sensitive content are stored.
+- Only summary metadata (file_count, total_size, top_level_dir) is persisted.
+"""
+
+import uuid
+from dataclasses import dataclass
+from typing import Optional
+
+from app.core.config import settings
+from app.core.error_codes import get_error_message
+from app.db.database import _get_connection, now_iso, init_db
+
+
+# --- Task status / stage constants ---
+
+STATUS_PENDING = "pending"
+STATUS_RUNNING = "running"
+STATUS_COMPLETED = "completed"
+STATUS_FAILED = "failed"
+
+STAGE_QUEUED = "queued"
+STAGE_DOWNLOADING = "downloading"
+STAGE_EXTRACTING = "extracting"
+STAGE_FINISHED = "finished"
+
+
+@dataclass
+class TaskSummary:
+    """Summary of a completed task — no sensitive content."""
+    file_count: int
+    total_size: int
+    top_level_dir: str
+
+
+@dataclass
+class TaskRecord:
+    """Full task record from the database."""
+    id: str
+    repo_url: str
+    owner: str
+    repo_name: str
+    status: str
+    stage: str
+    progress: int
+    error_code: Optional[str]
+    error_message: Optional[str]
+    file_count: Optional[int]
+    total_size: Optional[int]
+    top_level_dir: Optional[str]
+    created_at: str
+    updated_at: str
+    completed_at: Optional[str]
+
+    @classmethod
+    def from_row(cls, row) -> "TaskRecord":
+        return cls(
+            id=row["id"],
+            repo_url=row["repo_url"],
+            owner=row["owner"],
+            repo_name=row["repo_name"],
+            status=row["status"],
+            stage=row["stage"],
+            progress=row["progress"],
+            error_code=row["error_code"],
+            error_message=row["error_message"],
+            file_count=row["file_count"],
+            total_size=row["total_size"],
+            top_level_dir=row["top_level_dir"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            completed_at=row["completed_at"],
+        )
+
+    def to_response(self) -> dict:
+        """Convert to API response dict (no sensitive fields)."""
+        resp = {
+            "task_id": self.id,
+            "status": self.status,
+            "stage": self.stage,
+            "progress": self.progress,
+            "error_code": self.error_code,
+            "error_message": self.error_message,
+        }
+        if self.status == STATUS_COMPLETED:
+            resp["report_url"] = None  # Not implemented in P0-3
+            resp["file_count"] = self.file_count
+            resp["total_size"] = self.total_size
+            resp["top_level_dir"] = self.top_level_dir
+        return resp
+
+
+# --- Create ---
+
+def create_task(repo_url: str, owner: str, repo_name: str) -> TaskRecord:
+    """Create a new pending task in the database.
+
+    Returns the created TaskRecord.
+    """
+    init_db()
+    task_id = str(uuid.uuid4())
+    now = now_iso()
+
+    conn = _get_connection()
+    try:
+        conn.execute(
+            """INSERT INTO tasks
+               (id, repo_url, owner, repo_name, status, stage, progress,
+                error_code, error_message, file_count, total_size, top_level_dir,
+                created_at, updated_at, completed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, NULL)""",
+            (task_id, repo_url, owner, repo_name,
+             STATUS_PENDING, STAGE_QUEUED, 0, now, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return get_task(task_id)
+
+
+# --- Read ---
+
+def get_task(task_id: str) -> Optional[TaskRecord]:
+    """Get a task by ID. Returns None if not found."""
+    init_db()
+    conn = _get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return TaskRecord.from_row(row)
+    finally:
+        conn.close()
+
+
+def get_running_task() -> Optional[TaskRecord]:
+    """Get the currently running task, if any."""
+    init_db()
+    conn = _get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE status = ? ORDER BY created_at ASC LIMIT 1",
+            (STATUS_RUNNING,),
+        ).fetchone()
+        if row is None:
+            return None
+        return TaskRecord.from_row(row)
+    finally:
+        conn.close()
+
+
+def get_pending_count() -> int:
+    """Count of pending tasks in the queue."""
+    init_db()
+    conn = _get_connection()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM tasks WHERE status = ?",
+            (STATUS_PENDING,),
+        ).fetchone()
+        return row["cnt"]
+    finally:
+        conn.close()
+
+
+def get_oldest_pending() -> Optional[TaskRecord]:
+    """Get the oldest pending task, if any."""
+    init_db()
+    conn = _get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE status = ? ORDER BY created_at ASC LIMIT 1",
+            (STATUS_PENDING,),
+        ).fetchone()
+        if row is None:
+            return None
+        return TaskRecord.from_row(row)
+    finally:
+        conn.close()
+
+
+# --- Update ---
+
+def update_task_status(
+    task_id: str,
+    status: str,
+    stage: Optional[str] = None,
+    progress: Optional[int] = None,
+) -> None:
+    """Update a task's status, stage, and/or progress."""
+    init_db()
+    now = now_iso()
+    conn = _get_connection()
+    try:
+        if stage is not None and progress is not None:
+            conn.execute(
+                "UPDATE tasks SET status = ?, stage = ?, progress = ?, updated_at = ? WHERE id = ?",
+                (status, stage, progress, now, task_id),
+            )
+        elif stage is not None:
+            conn.execute(
+                "UPDATE tasks SET status = ?, stage = ?, updated_at = ? WHERE id = ?",
+                (status, stage, now, task_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                (status, now, task_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def mark_running(task_id: str, stage: str, progress: int) -> None:
+    """Mark a task as running with the given stage and progress."""
+    update_task_status(task_id, STATUS_RUNNING, stage, progress)
+
+
+def mark_completed(
+    task_id: str,
+    file_count: int,
+    total_size: int,
+    top_level_dir: str,
+) -> None:
+    """Mark a task as completed with summary metadata."""
+    init_db()
+    now = now_iso()
+    conn = _get_connection()
+    try:
+        conn.execute(
+            """UPDATE tasks
+               SET status = ?, stage = ?, progress = 100,
+                   file_count = ?, total_size = ?, top_level_dir = ?,
+                   updated_at = ?, completed_at = ?
+               WHERE id = ?""",
+            (STATUS_COMPLETED, STAGE_FINISHED, file_count, total_size,
+             top_level_dir, now, now, task_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def mark_failed(task_id: str, error_code: str, error_message: Optional[str] = None) -> None:
+    """Mark a task as failed with an error code and desensitized message.
+
+    The error_message is always sanitized via get_error_message() to ensure
+    no sensitive content is stored.
+    """
+    init_db()
+    now = now_iso()
+    safe_message = error_message or get_error_message(error_code)
+    conn = _get_connection()
+    try:
+        conn.execute(
+            """UPDATE tasks
+               SET status = ?, stage = ?, error_code = ?, error_message = ?,
+                   updated_at = ?, completed_at = ?
+               WHERE id = ?""",
+            (STATUS_FAILED, STAGE_FINISHED, error_code, safe_message,
+             now, now, task_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# --- Service restart hook ---
+
+def mark_stale_tasks_as_failed() -> int:
+    """Mark all running and pending tasks as failed on service restart.
+
+    - Running tasks → failed with SERVICE_RESTARTED
+    - Pending tasks → failed with SERVICE_RESTARTED (avoid permanent waiters)
+
+    Returns the number of tasks marked as failed.
+    """
+    init_db()
+    from app.core.error_codes import SERVICE_RESTARTED, get_error_message
+    now = now_iso()
+    safe_message = get_error_message(SERVICE_RESTARTED)
+    count = 0
+
+    conn = _get_connection()
+    try:
+        cursor = conn.execute(
+            """UPDATE tasks
+               SET status = ?, stage = ?, error_code = ?, error_message = ?,
+                   updated_at = ?, completed_at = ?
+               WHERE status IN (?, ?)""",
+            (STATUS_FAILED, STAGE_FINISHED, SERVICE_RESTARTED, safe_message,
+             now, now, STATUS_RUNNING, STATUS_PENDING),
+        )
+        count = cursor.rowcount
+        conn.commit()
+    finally:
+        conn.close()
+
+    return count
+
+
+def is_queue_full() -> bool:
+    """Check if the pending queue is full."""
+    return get_pending_count() >= settings.max_pending_tasks

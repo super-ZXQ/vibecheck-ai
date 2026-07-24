@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     # --- Database ---
     database_url: str = "sqlite:///./vibecheck.db"
 
+    # --- Task queue ---
+    max_pending_tasks: int = 5  # max pending tasks in queue
+    max_running_tasks: int = 1  # only 1 task runs at a time (MVP)
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 

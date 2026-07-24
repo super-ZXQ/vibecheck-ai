@@ -61,6 +61,9 @@ class MockResponse:
     def close(self):
         self._closed = True
 
+    async def aclose(self):
+        self._closed = True
+
 
 class MockClient:
     """Simulates httpx.AsyncClient for testing."""
