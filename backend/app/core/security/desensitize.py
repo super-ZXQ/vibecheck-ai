@@ -16,6 +16,12 @@ Design principles:
 - parse_assignment_value: unified assignment value parser shared by ALL rules
   and mask_snippet. Supports quoted JSON/TOML keys, quoted values with
   escapes, and unquoted values with escapes (does NOT stop at #).
+- iter_assignments(line): unified entry point that identifies ALL key=value
+  assignments in a line by first recognizing complete keys (NOT by searching
+  for sensitive substrings). After parsing a value, the next search starts
+  from value_end, so already-parsed value text is never re-scanned.
+- classify_key(key): classifies a key into a sensitivity category using
+  segment-based matching. Shared between rules and mask_snippet.
 - Original snippets NEVER enter Finding, logs, exceptions, or test output.
 
 Security guarantees:
@@ -29,6 +35,7 @@ Security guarantees:
 
 import re
 from dataclasses import dataclass
+from typing import Iterator
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +52,30 @@ SECRET = "secret"
 TOKEN = "token"
 CONNECTION_STRING = "connection_string"
 GENERIC = "generic"
+
+
+# ---------------------------------------------------------------------------
+# --- Key classification categories ---
+# ---------------------------------------------------------------------------
+
+CATEGORY_AWS_SECRET = "aws_secret"
+CATEGORY_PASSWORD = "password"
+CATEGORY_SECRET = "secret"
+
+
+@dataclass(frozen=True)
+class Assignment:
+    """A parsed key=value assignment from a line of text.
+
+    Produced by iter_assignments(). Shared between all rules and
+    mask_snippet — no rule may duplicate assignment parsing logic.
+    """
+    key_raw: str           # original key text as it appeared (no quotes)
+    key_normalized: str    # uppercase, separators normalized to _
+    value_start: int       # 0-based start of value content (after opening quote)
+    value_end: int         # 0-based end of value content (before closing quote)
+    value: str             # parsed value content (escapes processed)
+    is_quoted: bool        # whether the value was quoted
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +252,132 @@ def _mask_connection_string(value: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# --- Key normalization and classification (shared by rules + mask_snippet) ---
+# ---------------------------------------------------------------------------
+
+# Regex for splitting camelCase boundaries.
+# Matches: uppercase run before Upper-lower (HTTPResponse -> HTTP, Response),
+#          optional-uppercase + lowercase run (apiKey -> api, Key),
+#          pure uppercase run (API).
+_CAMEL_SPLIT = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+")
+
+# Regex for matching unquoted identifier keys.
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+# Single-keyword sets for each category (uppercase segments).
+_PASSWORD_KEYWORDS: frozenset[str] = frozenset({"PASSWORD", "PASSWD", "PWD"})
+_SECRET_KEYWORDS: frozenset[str] = frozenset({"SECRET", "TOKEN", "APIKEY"})
+
+# Consecutive-pair keywords for the secret category.
+_SECRET_PAIR_KEYWORDS: frozenset[tuple[str, str]] = frozenset({
+    ("API", "KEY"),
+    ("ACCESS", "KEY"),
+    ("PRIVATE", "KEY"),
+    ("CLIENT", "SECRET"),
+    ("JWT", "SECRET"),
+    ("ACCESS", "TOKEN"),
+    ("GITHUB", "TOKEN"),
+})
+
+
+def _normalize_key_segments(key: str) -> list[str]:
+    """Split a key into normalized uppercase segments.
+
+    Splits by underscore, hyphen, dot, and camelCase boundaries.
+    Returns a list of non-empty uppercase segments.
+
+    Examples:
+        DB_PASSWORD       -> ["DB", "PASSWORD"]
+        OPENAI_API_KEY    -> ["OPENAI", "API", "KEY"]
+        apiKey            -> ["API", "KEY"]
+        db.password       -> ["DB", "PASSWORD"]
+        SECRETARY_EMAIL   -> ["SECRETARY", "EMAIL"]
+    """
+    # Replace hyphens and dots with underscores for uniform splitting
+    normalized = key.replace("-", "_").replace(".", "_")
+    parts = normalized.split("_")
+
+    segments: list[str] = []
+    for part in parts:
+        if not part:
+            continue
+        camel_parts = _CAMEL_SPLIT.findall(part)
+        segments.extend(camel_parts)
+
+    return [s.upper() for s in segments if s]
+
+
+def _normalize_key(key: str) -> str:
+    """Normalize a key to uppercase with underscore separators."""
+    return "_".join(_normalize_key_segments(key))
+
+
+def _is_aws_secret_key(segments: list[str]) -> bool:
+    """Check if segments match AWS secret key patterns.
+
+    Matches:
+    - AWS_SECRET, AWS_SECRET_ACCESS_KEY  (has AWS + SECRET)
+    - SECRET_ACCESS_KEY                  (has SECRET + ACCESS + KEY)
+    """
+    seg_set = set(segments)
+    if "AWS" in seg_set and "SECRET" in seg_set:
+        return True
+    if "SECRET" in seg_set and "ACCESS" in seg_set and "KEY" in seg_set:
+        return True
+    return False
+
+
+def classify_key(key: str) -> str | None:
+    """Classify a key into a sensitivity category using segment matching.
+
+    Splits the key by underscore, hyphen, dot, and camelCase boundaries
+    into normalized uppercase segments, then checks against sensitive
+    keyword patterns.
+
+    Priority: aws_secret > password > secret.
+
+    Returns one of CATEGORY_AWS_SECRET, CATEGORY_PASSWORD, CATEGORY_SECRET,
+    or None if the key is not sensitive.
+
+    Matches (R006 / password):
+        PASSWORD, DB_PASSWORD, DATABASE_PASSWORD, MYSQL_PWD, ADMIN_PASSWD
+
+    Matches (R007 / secret):
+        SECRET, JWT_SECRET, CLIENT_SECRET, TOKEN, ACCESS_TOKEN,
+        GITHUB_TOKEN, API_KEY, MY_API_KEY, OPENAI_API_KEY
+
+    Matches (R003 / aws_secret):
+        AWS_SECRET_ACCESS_KEY, SECRET_ACCESS_KEY, AWS_SECRET
+
+    Does NOT match (returns None):
+        SECRETARY_EMAIL, TOKENIZER_MODEL, PASSWORDLESS_MODE,
+        API_KEYBOARD_LAYOUT, ACCESS_TOKENIZER
+    """
+    segments = _normalize_key_segments(key)
+    if not segments:
+        return None
+
+    # AWS secret (highest priority)
+    if _is_aws_secret_key(segments):
+        return CATEGORY_AWS_SECRET
+
+    # Password
+    if any(s in _PASSWORD_KEYWORDS for s in segments):
+        return CATEGORY_PASSWORD
+
+    # Secret / token (single segment)
+    if any(s in _SECRET_KEYWORDS for s in segments):
+        return CATEGORY_SECRET
+
+    # Secret / token (consecutive pair)
+    for i in range(len(segments) - 1):
+        if (segments[i], segments[i + 1]) in _SECRET_PAIR_KEYWORDS:
+            return CATEGORY_SECRET
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # --- Unified assignment value parser ---
 # ---------------------------------------------------------------------------
 
@@ -334,6 +491,110 @@ def parse_assignment_value(
 
 
 # ---------------------------------------------------------------------------
+# --- Unified assignment iterator (shared by ALL rules and mask_snippet) ---
+# ---------------------------------------------------------------------------
+
+def iter_assignments(line: str) -> Iterator[Assignment]:
+    """Identify ALL key=value assignments in a line.
+
+    This is the unified entry point that identifies assignments by first
+    recognizing COMPLETE keys (NOT by searching for sensitive substrings).
+    After parsing a value, the next search starts from after the value,
+    so already-parsed value text is never re-scanned.
+
+    Supported formats:
+    - password = "value"           (simple unquoted key)
+    - DB_PASSWORD = "value"        (uppercase compound key)
+    - const OPENAI_API_KEY = "v"   (prefix keyword like const/let/export)
+    - "api_key": "value"           (JSON double-quoted key)
+    - 'jwt_secret' = 'value'       (TOML single-quoted key)
+    - password="a" token="b"       (multiple assignments same line)
+
+    Guarantees:
+    1. Identifies the complete key first — never searches for sensitive
+       substrings in the line.
+    2. After parsing a value, the next search starts from value_end (or
+       value_end + 1 for quoted values to skip the closing quote).
+    3. Already-parsed value text is NEVER re-scanned.
+    4. ${DB_PASSWORD:-default} inside a value is NOT treated as a second
+       assignment key.
+
+    Yields:
+        Assignment objects (see Assignment dataclass).
+    """
+    i = 0
+    n = len(line)
+
+    while i < n:
+        # Skip whitespace
+        while i < n and line[i].isspace():
+            i += 1
+        if i >= n:
+            break
+
+        # --- Try to match a key at position i ---
+        key_raw: str | None = None
+        key_end = i
+
+        if line[i] == '"' or line[i] == "'":
+            # Quoted key (JSON/TOML style)
+            quote_char = line[i]
+            j = i + 1
+            key_chars: list[str] = []
+            while j < n:
+                if line[j] == "\\" and j + 1 < n:
+                    key_chars.append(line[j + 1])
+                    j += 2
+                elif line[j] == quote_char:
+                    key_raw = "".join(key_chars)
+                    j += 1  # consume closing quote
+                    break
+                else:
+                    key_chars.append(line[j])
+                    j += 1
+            if key_raw is None:
+                # Unterminated quote — advance past opening quote
+                i += 1
+                continue
+            key_end = j  # position AFTER closing quote
+        else:
+            # Unquoted identifier
+            m = _IDENTIFIER.match(line, i)
+            if m:
+                key_raw = m.group()
+                key_end = m.end()
+            else:
+                # Not a key start — advance one character
+                i += 1
+                continue
+
+        # --- Try to find assignment operator and value ---
+        result = parse_assignment_value(line, key_end)
+        if result is not None:
+            value_start, value_end, value, is_quoted = result
+            yield Assignment(
+                key_raw=key_raw,
+                key_normalized=_normalize_key(key_raw),
+                value_start=value_start,
+                value_end=value_end,
+                value=value,
+                is_quoted=is_quoted,
+            )
+            # Advance past the value.
+            # For quoted values, value_end is at the closing quote position;
+            # we need +1 to skip past it.
+            # For unquoted values, value_end is already at the next
+            # whitespace or end-of-line.
+            if is_quoted:
+                i = value_end + 1
+            else:
+                i = value_end
+        else:
+            # No assignment found after this key — advance past the key
+            i = key_end
+
+
+# ---------------------------------------------------------------------------
 # --- mask_snippet: multi-secret line masking ---
 # ---------------------------------------------------------------------------
 
@@ -354,15 +615,6 @@ _SNIPPET_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://[^:/@\s]+:[^@\s]+@\S+)"), CONNECTION_STRING),
 ]
 
-# Key-only pattern for assignment-style secrets.
-# Matches the KEY NAME only — value is parsed by parse_assignment_value().
-# \b word boundaries prevent matching key names inside env var values
-# like ${DB_PASSWORD:-default} where _ is a word character (no \b).
-_ASSIGNMENT_KEY_PATTERN = re.compile(
-    r"(?i)\b(aws_secret_access_key|secret_access_key|aws_secret"
-    r"|password|passwd|pwd|secret|api_key|apikey|token|access_token)\b"
-)
-
 
 def mask_snippet(line_text: str) -> str:
     """Mask ALL secrets in a line of text.
@@ -371,6 +623,11 @@ def mask_snippet(line_text: str) -> str:
     unless it is an EXACT canonical masked value (is_already_masked) or an
     unquoted environment variable reference (is_env_reference). Quoted values
     are NEVER treated as env references — they are literal strings.
+
+    Uses iter_assignments() to identify ALL key=value assignments by
+    recognizing complete keys first (NOT by searching for sensitive
+    substrings). classify_key() determines which keys are sensitive.
+    Already-parsed value text is never re-scanned.
 
     Idempotent: already-masked values are skipped, so re-processing never
     exposes additional characters.
@@ -398,22 +655,24 @@ def mask_snippet(line_text: str) -> str:
                 masked_value=masked,
             ))
 
-    # 2. Collect assignment-style secret ranges (value portion only)
-    for match in _ASSIGNMENT_KEY_PATTERN.finditer(line_text):
-        result = parse_assignment_value(line_text, match.end())
-        if result is None:
+    # 2. Collect assignment-style secret ranges using iter_assignments
+    for assignment in iter_assignments(line_text):
+        # Only mask if the key is classified as sensitive
+        if classify_key(assignment.key_raw) is None:
             continue
-        value_start, value_end, value, is_quoted = result
+        value = assignment.value
+        if not value:
+            continue
         # Skip env var references (only unquoted ones)
-        if is_env_reference(value, is_quoted):
+        if is_env_reference(value, assignment.is_quoted):
             continue
         # Skip already-masked values (strict complete-value check)
         if is_already_masked(value):
             continue
         masked = mask_secret(value, GENERIC)
         ranges.append(_SecretRange(
-            start=value_start,
-            end=value_end,
+            start=assignment.value_start,
+            end=assignment.value_end,
             secret_type=GENERIC,
             masked_value=masked,
         ))

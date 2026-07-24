@@ -502,3 +502,217 @@ class TestStrictEnvReference:
         for line in lines:
             findings = rule.scan_content("config.py", [line])
             assert len(findings) == 0, f"False positive on: {line}"
+
+
+# ============================================================================
+# --- Compound key regression tests (15 scenarios) ---
+# ============================================================================
+
+class TestCompoundKeyRegression:
+    """Regression tests for compound sensitive variable name detection.
+
+    These tests verify that the unified assignment parser (iter_assignments)
+    and segment-based key classification (classify_key) correctly identify
+    compound sensitive variable names like DB_PASSWORD, OPENAI_API_KEY,
+    JWT_SECRET, etc., while NOT matching non-sensitive names like
+    SECRETARY_EMAIL, TOKENIZER_MODEL, PASSWORDLESS_MODE.
+    """
+
+    # --- Test 1: DB_PASSWORD -> R006 ---
+    def test_01_db_password_produces_r006(self):
+        """DB_PASSWORD hardcoded produces R006."""
+        rule = PasswordAssignmentRule()
+        lines = ['DB_PASSWORD = "s3cur3DbP@ss"']
+        findings = rule.scan_content("config.py", lines)
+        assert len(findings) == 1
+        assert findings[0].rule_id == "R006_PASSWORD_ASSIGNMENT"
+        assert "s3cur3DbP@ss" not in findings[0].snippet_masked
+
+    # --- Test 2: DATABASE_PASSWORD -> R006 ---
+    def test_02_database_password_produces_r006(self):
+        """DATABASE_PASSWORD hardcoded produces R006."""
+        rule = PasswordAssignmentRule()
+        lines = ['DATABASE_PASSWORD = "myDbP@ss123"']
+        findings = rule.scan_content("config.py", lines)
+        assert len(findings) == 1
+        assert findings[0].rule_id == "R006_PASSWORD_ASSIGNMENT"
+        assert "myDbP@ss123" not in findings[0].snippet_masked
+
+    # --- Test 3: OPENAI_API_KEY -> R007 ---
+    def test_03_openai_api_key_produces_r007(self):
+        """OPENAI_API_KEY hardcoded produces R007."""
+        rule = GenericTokenAssignmentRule()
+        lines = ['OPENAI_API_KEY = "sk-proj-abc123def456"']
+        findings = rule.scan_content("config.py", lines)
+        assert len(findings) == 1
+        assert findings[0].rule_id == "R007_GENERIC_TOKEN_ASSIGNMENT"
+        assert "sk-proj-abc123def456" not in findings[0].snippet_masked
+
+    # --- Test 4: MY_API_KEY -> R007 ---
+    def test_04_my_api_key_produces_r007(self):
+        """MY_API_KEY hardcoded produces R007."""
+        rule = GenericTokenAssignmentRule()
+        lines = ['MY_API_KEY = "key_12345abcdef"']
+        findings = rule.scan_content("config.py", lines)
+        assert len(findings) == 1
+        assert findings[0].rule_id == "R007_GENERIC_TOKEN_ASSIGNMENT"
+        assert "key_12345abcdef" not in findings[0].snippet_masked
+
+    # --- Test 5: JWT_SECRET -> R007 (normal file) or R011 (production env) ---
+    def test_05a_jwt_secret_produces_r007(self):
+        """JWT_SECRET hardcoded in normal file produces R007."""
+        rule = GenericTokenAssignmentRule()
+        lines = ['JWT_SECRET = "myJwtS3cr3tVal"']
+        findings = rule.scan_content("config.py", lines)
+        assert len(findings) == 1
+        assert findings[0].rule_id == "R007_GENERIC_TOKEN_ASSIGNMENT"
+        assert "myJwtS3cr3tVal" not in findings[0].snippet_masked
+
+    def test_05b_jwt_secret_in_production_produces_r011(self):
+        """JWT_SECRET hardcoded in .env.production produces R011 (blocking)."""
+        rule = ProductionEnvWithSecretRule()
+        lines = ['JWT_SECRET = "myJwtS3cr3tVal"']
+        findings = rule.scan_content(".env.production", lines)
+        assert len(findings) == 1
+        assert findings[0].rule_id == "R011_PRODUCTION_ENV_WITH_SECRET"
+        assert findings[0].is_blocking is True
+        assert "myJwtS3cr3tVal" not in findings[0].snippet_masked
+
+    # --- Test 6: GITHUB_TOKEN non-format value -> R007 (not R001) ---
+    def test_06_github_token_non_format_produces_r007(self):
+        """GITHUB_TOKEN with non-ghp_ value produces R007, not R001."""
+        r007 = GenericTokenAssignmentRule()
+        lines = ['GITHUB_TOKEN = "some_plain_text_value"']
+        r007_findings = r007.scan_content("config.py", lines)
+        assert len(r007_findings) == 1
+        assert r007_findings[0].rule_id == "R007_GENERIC_TOKEN_ASSIGNMENT"
+        # R001 must NOT catch it (no ghp_ format)
+        r001 = GitHubTokenRule()
+        assert len(r001.scan_content("config.py", lines)) == 0
+        assert "some_plain_text_value" not in r007_findings[0].snippet_masked
+
+    # --- Test 7: AWS_SECRET_ACCESS_KEY strict format -> R003 ---
+    def test_07_aws_secret_access_key_strict_format_produces_r003(self):
+        """AWS_SECRET_ACCESS_KEY with 40-char base64 produces R003 (blocking)."""
+        rule = AWSSecretKeyRule()
+        lines = [f'AWS_SECRET_ACCESS_KEY = {SYNTH_AWS_SECRET}']
+        findings = rule.scan_content("config.py", lines)
+        assert len(findings) == 1
+        assert findings[0].rule_id == "R003_AWS_SECRET_KEY"
+        assert findings[0].is_blocking is True
+        assert SYNTH_AWS_SECRET not in findings[0].snippet_masked
+
+    # --- Test 8: PASSWORDLESS_MODE -> no finding ---
+    def test_08_passwordless_mode_no_finding(self):
+        """PASSWORDLESS_MODE does not produce any finding."""
+        for rule_class in [PasswordAssignmentRule, GenericTokenAssignmentRule, AWSSecretKeyRule]:
+            rule = rule_class()
+            lines = ['PASSWORDLESS_MODE = "true"']
+            findings = rule.scan_content("config.py", lines)
+            assert len(findings) == 0, f"{rule_class.__name__} false positive on PASSWORDLESS_MODE"
+
+    # --- Test 9: TOKENIZER_MODEL -> no finding ---
+    def test_09_tokenizer_model_no_finding(self):
+        """TOKENIZER_MODEL does not produce any finding."""
+        for rule_class in [PasswordAssignmentRule, GenericTokenAssignmentRule, AWSSecretKeyRule]:
+            rule = rule_class()
+            lines = ['TOKENIZER_MODEL = "gpt-4"']
+            findings = rule.scan_content("config.py", lines)
+            assert len(findings) == 0, f"{rule_class.__name__} false positive on TOKENIZER_MODEL"
+
+    # --- Test 10: SECRETARY_EMAIL -> no finding ---
+    def test_10_secretary_email_no_finding(self):
+        """SECRETARY_EMAIL does not produce any finding."""
+        for rule_class in [PasswordAssignmentRule, GenericTokenAssignmentRule, AWSSecretKeyRule]:
+            rule = rule_class()
+            lines = ['SECRETARY_EMAIL = "admin@example.com"']
+            findings = rule.scan_content("config.py", lines)
+            assert len(findings) == 0, f"{rule_class.__name__} false positive on SECRETARY_EMAIL"
+
+    # --- Test 11: password=${DB_PASSWORD:-default} -> no false positive ---
+    def test_11_password_env_ref_default_no_false_positive(self):
+        """password=${DB_PASSWORD:-default} does not produce R006 (env ref)."""
+        rule = PasswordAssignmentRule()
+        lines = ['password = ${DB_PASSWORD:-default}']
+        findings = rule.scan_content("config.py", lines)
+        assert len(findings) == 0
+
+    # --- Test 12: unrelated=${DB_PASSWORD:-default} -> no false key in value ---
+    def test_12_unrelated_env_ref_no_false_key(self):
+        """unrelated=${DB_PASSWORD:-default} -- DB_PASSWORD inside value is NOT a second key."""
+        # If iter_assignments incorrectly parsed DB_PASSWORD as a key inside the value,
+        # R006 would fire. It must NOT.
+        rule = PasswordAssignmentRule()
+        lines = ['unrelated = ${DB_PASSWORD:-default}']
+        findings = rule.scan_content("config.py", lines)
+        assert len(findings) == 0
+
+    # --- Test 13: same line password="a" token="b" -> both parsed ---
+    def test_13_same_line_two_assignments_both_detected(self):
+        """password="hunter2pass" token="tokensecret99" -- both assignments detected."""
+        r006 = PasswordAssignmentRule()
+        r007 = GenericTokenAssignmentRule()
+        lines = ['password="hunter2pass" token="tokensecret99"']
+        r006_findings = r006.scan_content("config.py", lines)
+        r007_findings = r007.scan_content("config.py", lines)
+        assert len(r006_findings) == 1
+        assert r006_findings[0].rule_id == "R006_PASSWORD_ASSIGNMENT"
+        assert "hunter2pass" not in r006_findings[0].snippet_masked
+        assert len(r007_findings) == 1
+        assert r007_findings[0].rule_id == "R007_GENERIC_TOKEN_ASSIGNMENT"
+        assert "tokensecret99" not in r007_findings[0].snippet_masked
+
+    # --- Test 14: JSON/TOML quoted compound keys recognized ---
+    def test_14a_json_quoted_compound_key_db_password(self):
+        """"db_password": "secret123val" produces R006."""
+        rule = PasswordAssignmentRule()
+        line = '"db_password": "secret123val"'
+        lines = [line]
+        findings = rule.scan_content("config.json", lines)
+        assert len(findings) == 1
+        assert findings[0].rule_id == "R006_PASSWORD_ASSIGNMENT"
+        assert "secret123val" not in findings[0].snippet_masked
+
+    def test_14b_toml_quoted_compound_key_openai_api_key(self):
+        """'openai_api_key' = 'mykeyvalue123' produces R007."""
+        rule = GenericTokenAssignmentRule()
+        line = "'openai_api_key' = 'mykeyvalue123'"
+        lines = [line]
+        findings = rule.scan_content("config.toml", lines)
+        assert len(findings) == 1
+        assert findings[0].rule_id == "R007_GENERIC_TOKEN_ASSIGNMENT"
+        assert "mykeyvalue123" not in findings[0].snippet_masked
+
+    # --- Test 15: snippet full-chain leak prevention still passes ---
+    def test_15_compound_key_snippet_no_leak(self):
+        """Compound key values are fully masked in snippet -- no leak."""
+        from app.core.security.desensitize import mask_snippet
+        line = f'DB_PASSWORD = "{SYNTH_PASSWORD}"'
+        result = mask_snippet(line)
+        assert SYNTH_PASSWORD not in result
+        assert "<REDACTED>" in result
+
+    def test_15b_openai_api_key_snippet_no_leak(self):
+        """OPENAI_API_KEY value is fully masked in snippet -- no leak."""
+        from app.core.security.desensitize import mask_snippet
+        line = 'OPENAI_API_KEY = "sk-proj-mykey123abc"'
+        result = mask_snippet(line)
+        assert "sk-proj-mykey123abc" not in result
+        assert "<REDACTED>" in result
+
+    # --- Additional non-sensitive compound name tests ---
+    def test_api_keyboard_layout_no_finding(self):
+        """API_KEYBOARD_LAYOUT does not produce any finding."""
+        for rule_class in [PasswordAssignmentRule, GenericTokenAssignmentRule, AWSSecretKeyRule]:
+            rule = rule_class()
+            lines = ['API_KEYBOARD_LAYOUT = "qwerty"']
+            findings = rule.scan_content("config.py", lines)
+            assert len(findings) == 0, f"{rule_class.__name__} false positive on API_KEYBOARD_LAYOUT"
+
+    def test_access_tokenizer_no_finding(self):
+        """ACCESS_TOKENIZER does not produce any finding."""
+        for rule_class in [PasswordAssignmentRule, GenericTokenAssignmentRule, AWSSecretKeyRule]:
+            rule = rule_class()
+            lines = ['ACCESS_TOKENIZER = "bert-base"']
+            findings = rule.scan_content("config.py", lines)
+            assert len(findings) == 0, f"{rule_class.__name__} false positive on ACCESS_TOKENIZER"

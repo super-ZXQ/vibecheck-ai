@@ -30,13 +30,17 @@ import re
 from typing import Optional
 
 from app.core.security.desensitize import (
+    CATEGORY_AWS_SECRET,
+    CATEGORY_PASSWORD,
+    CATEGORY_SECRET,
     GENERIC,
+    classify_key,
     is_already_masked,
     is_env_reference,
     is_low_entropy,
+    iter_assignments,
     mask_secret,
     mask_snippet,
-    parse_assignment_value,
 )
 from app.scanner.base import (
     Confidence,
@@ -112,51 +116,6 @@ def _is_likely_non_secret(value: str) -> bool:
     # Dotted identifiers like api.internal, db.production (hostnames)
     if re.match(r"^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$", lower) and "@" not in value:
         return True
-    return False
-
-
-# Sensitive variable name keywords for R011.
-# Uses SEGMENT-based matching: the variable name is split by underscore
-# and each segment (or consecutive pair) is checked against these sets.
-# This prevents false positives like SECRETARY_EMAIL, TOKENIZER_MODEL,
-# PASSWORDLESS_MODE where a sensitive keyword appears as a substring
-# but is NOT a distinct segment.
-_SENSITIVE_SINGLE_KEYWORDS: frozenset[str] = frozenset({
-    "password", "passwd", "pwd", "secret", "token", "apikey",
-})
-
-_SENSITIVE_PAIR_KEYWORDS: frozenset[tuple[str, str]] = frozenset({
-    ("api", "key"),
-    ("access", "key"),
-    ("private", "key"),
-    ("client", "secret"),
-    ("jwt", "secret"),
-})
-
-
-def _has_sensitive_name(key: str) -> bool:
-    """Check if a variable name has sensitive semantics using segment matching.
-
-    Splits the key by underscore and checks if any single segment matches
-    a sensitive keyword, or if any consecutive pair of segments matches
-    a two-word sensitive keyword.
-
-    This avoids false positives from substrings:
-    - SECRETARY_EMAIL  -> segments [secretary, email] -> no match
-    - TOKENIZER_MODEL  -> segments [tokenizer, model] -> no match
-    - PASSWORDLESS_MODE -> segments [passwordless, mode] -> no match
-    """
-    segments = [s for s in key.lower().split("_") if s]
-
-    for seg in segments:
-        if seg in _SENSITIVE_SINGLE_KEYWORDS:
-            return True
-
-    for i in range(len(segments) - 1):
-        pair = (segments[i], segments[i + 1])
-        if pair in _SENSITIVE_PAIR_KEYWORDS:
-            return True
-
     return False
 
 
@@ -282,8 +241,9 @@ class AWSAccessKeyRule(Rule):
 class AWSSecretKeyRule(Rule):
     """Detect AWS secret access keys: 40-char base64 in aws_secret context.
 
-    Only matches when preceded by aws_secret, secret_access_key, or
-    aws_secret_access_key assignment. This prevents false positives from
+    Only matches when the key is classified as aws_secret by classify_key()
+    (AWS_SECRET_ACCESS_KEY, SECRET_ACCESS_KEY, AWS_SECRET) AND the value
+    is a 40-char base64-like string. This prevents false positives from
     random 40-character base64 strings (hashes, commit IDs, etc.).
     """
 
@@ -294,27 +254,21 @@ class AWSSecretKeyRule(Rule):
     is_blocking = True
     finding_type = FindingType.CONTENT
 
-    # Key-only pattern — value is parsed by the unified parse_assignment_value().
-    # \b word boundaries prevent matching "PASSWORD" inside env var values
-    # like ${DB_PASSWORD:-default} where _ is a word character (no \b).
-    _key_pattern = re.compile(
-        r"(?i)\b(aws_secret_access_key|secret_access_key|aws_secret)\b"
-    )
-
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
         findings: list[Finding] = []
         for i, line in enumerate(lines):
-            for match in self._key_pattern.finditer(line):
-                result = parse_assignment_value(line, match.end())
-                if result is None:
+            for assignment in iter_assignments(line):
+                if classify_key(assignment.key_raw) != CATEGORY_AWS_SECRET:
                     continue
-                value_start, value_end, value, is_quoted = result
+                value = assignment.value
                 if not value:
                     continue
                 # Must be a 40-char base64-like string
                 if not re.fullmatch(r"[A-Za-z0-9/+]{40}", value):
                     continue
-                if is_env_reference(value, is_quoted) or _is_placeholder(value):
+                if is_env_reference(value, assignment.is_quoted):
+                    continue
+                if _is_placeholder(value):
                     continue
                 # Low-entropy placeholder downgrade (e.g., all same char)
                 if is_low_entropy(value, prefix_len=0):
@@ -333,8 +287,8 @@ class AWSSecretKeyRule(Rule):
                     file_path=file_path,
                     line_start=i + 1,
                     line_end=i + 1,
-                    column_start=value_start,
-                    column_end=value_end,
+                    column_start=assignment.value_start,
+                    column_end=assignment.value_end,
                     snippet_masked=_make_masked_snippet(line),
                     is_blocking=blocking,
                     finding_type=self.finding_type,
@@ -498,7 +452,11 @@ class PrivateKeyRule(Rule):
 # ---------------------------------------------------------------------------
 
 class PasswordAssignmentRule(Rule):
-    """Detect password assignments: password=, passwd=, pwd=.
+    """Detect password assignments using unified assignment parsing.
+
+    Uses iter_assignments() to find ALL key=value assignments, then
+    classify_key() to filter for password-category keys (PASSWORD,
+    DB_PASSWORD, DATABASE_PASSWORD, MYSQL_PWD, ADMIN_PASSWD, etc.).
 
     False positive control:
     - Env var references are skipped.
@@ -516,22 +474,16 @@ class PasswordAssignmentRule(Rule):
     is_blocking = False
     finding_type = FindingType.CONTENT
 
-    # Key-only pattern — value is parsed by the unified parse_assignment_value().
-    # \b word boundaries prevent matching "PASSWORD" inside env var values
-    # like ${DB_PASSWORD:-default} where _ is a word character (no \b).
-    _key_pattern = re.compile(r"(?i)\b(password|passwd|pwd)\b")
-
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
         findings: list[Finding] = []
         for i, line in enumerate(lines):
-            for match in self._key_pattern.finditer(line):
-                result = parse_assignment_value(line, match.end())
-                if result is None:
+            for assignment in iter_assignments(line):
+                if classify_key(assignment.key_raw) != CATEGORY_PASSWORD:
                     continue
-                value_start, value_end, value, is_quoted = result
+                value = assignment.value
                 if not value:
                     continue
-                if is_env_reference(value, is_quoted):
+                if is_env_reference(value, assignment.is_quoted):
                     continue
                 if is_already_masked(value):
                     continue
@@ -554,8 +506,8 @@ class PasswordAssignmentRule(Rule):
                     file_path=file_path,
                     line_start=i + 1,
                     line_end=i + 1,
-                    column_start=value_start,
-                    column_end=value_end,
+                    column_start=assignment.value_start,
+                    column_end=assignment.value_end,
                     snippet_masked=_make_masked_snippet(line),
                     is_blocking=blocking,
                     finding_type=self.finding_type,
@@ -573,7 +525,12 @@ class PasswordAssignmentRule(Rule):
 # ---------------------------------------------------------------------------
 
 class GenericTokenAssignmentRule(Rule):
-    """Detect generic token/secret assignments: secret=, api_key=, token=.
+    """Detect generic token/secret assignments using unified assignment parsing.
+
+    Uses iter_assignments() to find ALL key=value assignments, then
+    classify_key() to filter for secret-category keys (SECRET, JWT_SECRET,
+    CLIENT_SECRET, TOKEN, ACCESS_TOKEN, GITHUB_TOKEN, API_KEY,
+    MY_API_KEY, OPENAI_API_KEY, etc.).
 
     False positive control:
     - Env var references are skipped.
@@ -592,23 +549,16 @@ class GenericTokenAssignmentRule(Rule):
     is_blocking = False
     finding_type = FindingType.CONTENT
 
-    # Key-only pattern — value is parsed by the unified parse_assignment_value().
-    # \b word boundaries prevent matching key names inside env var values.
-    _key_pattern = re.compile(
-        r"(?i)\b(secret|api_key|apikey|token|access_token)\b"
-    )
-
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
         findings: list[Finding] = []
         for i, line in enumerate(lines):
-            for match in self._key_pattern.finditer(line):
-                result = parse_assignment_value(line, match.end())
-                if result is None:
+            for assignment in iter_assignments(line):
+                if classify_key(assignment.key_raw) != CATEGORY_SECRET:
                     continue
-                value_start, value_end, value, is_quoted = result
+                value = assignment.value
                 if not value:
                     continue
-                if is_env_reference(value, is_quoted):
+                if is_env_reference(value, assignment.is_quoted):
                     continue
                 if is_already_masked(value):
                     continue
@@ -630,8 +580,8 @@ class GenericTokenAssignmentRule(Rule):
                     file_path=file_path,
                     line_start=i + 1,
                     line_end=i + 1,
-                    column_start=value_start,
-                    column_end=value_end,
+                    column_start=assignment.value_start,
+                    column_end=assignment.value_end,
                     snippet_masked=_make_masked_snippet(line),
                     is_blocking=blocking,
                     finding_type=self.finding_type,
@@ -790,10 +740,14 @@ class ProductionEnvWithSecretRule(Rule):
     Scans .env.production, .env.prod, .env.staging for KEY=VALUE patterns
     where ALL of the following are true:
     1. The file is a production environment config file.
-    2. The variable NAME has sensitive semantics (password, secret, token,
-       api_key, access_key, private_key, client_secret, jwt_secret, etc.).
+    2. The variable NAME has sensitive semantics (classify_key returns
+       non-None — covers password, secret, token, api_key, access_key,
+       private_key, client_secret, jwt_secret, etc.).
     3. The VALUE is not a placeholder, env reference, masked content,
        boolean, pure number, or common non-sensitive config value.
+
+    Uses iter_assignments() for unified assignment parsing and
+    classify_key() for sensitive key detection.
 
     Dedup: R011 is only suppressed on the SAME LINE where it column-overlaps
     with a higher-priority specific format rule (R001-R005). R011 on a
@@ -809,8 +763,6 @@ class ProductionEnvWithSecretRule(Rule):
     finding_type = FindingType.CONTENT
 
     _env_filenames = frozenset({".env.production", ".env.prod", ".env.staging"})
-    # Key-only pattern — value is parsed by the unified parse_assignment_value().
-    _kv_pattern = re.compile(r"^([A-Z_][A-Z0-9_]*)\s*=\s*(.+)$")
 
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
         basename = file_path.split("/")[-1]
@@ -823,52 +775,44 @@ class ProductionEnvWithSecretRule(Rule):
             if not line_stripped or line_stripped.startswith("#"):
                 continue
 
-            match = self._kv_pattern.match(line_stripped)
-            if not match:
-                continue
+            for assignment in iter_assignments(line):
+                key = assignment.key_raw
 
-            key = match.group(1)
+                # --- Requirement 1: variable name must have sensitive semantics ---
+                if classify_key(key) is None:
+                    continue
 
-            # --- Requirement 1: variable name must have sensitive semantics ---
-            if not _has_sensitive_name(key):
-                continue
+                value = assignment.value
+                if not value:
+                    continue
 
-            # --- Requirement 2: value must not be excluded ---
-            # Use the unified parser to extract the value from the ORIGINAL line
-            # (not the stripped version) for accurate column positions.
-            key_end_in_orig = line.find(key) + len(key)
-            result = parse_assignment_value(line, key_end_in_orig)
-            if result is None:
-                continue
-            value_start, value_end, value, is_quoted = result
+                # --- Requirement 2: value must not be excluded ---
+                if is_env_reference(value, assignment.is_quoted):
+                    continue
+                if _is_placeholder(value):
+                    continue
+                if is_already_masked(value):
+                    continue
+                if _is_likely_non_secret(value):
+                    continue
 
-            # Skip env references, placeholders, masked values, and likely non-secrets
-            if is_env_reference(value, is_quoted):
-                continue
-            if _is_placeholder(value):
-                continue
-            if is_already_masked(value):
-                continue
-            if _is_likely_non_secret(value):
-                continue
-
-            findings.append(Finding(
-                rule_id=self.rule_id,
-                rule_name=self.rule_name,
-                severity=self.severity,
-                confidence=self.confidence,
-                file_path=file_path,
-                line_start=i + 1,
-                line_end=i + 1,
-                column_start=value_start,
-                column_end=value_end,
-                snippet_masked=_make_masked_snippet(line),
-                is_blocking=self.is_blocking,
-                finding_type=self.finding_type,
-                description=f"Production environment file contains potential secret: {key}=<REDACTED>",
-                category="production_env",
-                secret_type="production_secret",
-                message=f"Production env file contains potential secret in {key}",
-                repair_template_key="use_env_var_production",
-            ))
+                findings.append(Finding(
+                    rule_id=self.rule_id,
+                    rule_name=self.rule_name,
+                    severity=self.severity,
+                    confidence=self.confidence,
+                    file_path=file_path,
+                    line_start=i + 1,
+                    line_end=i + 1,
+                    column_start=assignment.value_start,
+                    column_end=assignment.value_end,
+                    snippet_masked=_make_masked_snippet(line),
+                    is_blocking=self.is_blocking,
+                    finding_type=self.finding_type,
+                    description=f"Production environment file contains potential secret: {key}=<REDACTED>",
+                    category="production_env",
+                    secret_type="production_secret",
+                    message=f"Production env file contains potential secret in {key}",
+                    repair_template_key="use_env_var_production",
+                ))
         return findings

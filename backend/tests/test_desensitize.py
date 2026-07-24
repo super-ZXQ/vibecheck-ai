@@ -14,15 +14,20 @@ import pytest
 from app.core.security.desensitize import (
     AWS_ACCESS_KEY,
     AWS_SECRET_KEY,
+    CATEGORY_AWS_SECRET,
+    CATEGORY_PASSWORD,
+    CATEGORY_SECRET,
     CONNECTION_STRING,
     GENERIC,
     GITHUB_TOKEN,
     GOOGLE_API_KEY,
     PASSWORD,
     PRIVATE_KEY,
+    classify_key,
     is_already_masked,
     is_env_reference,
     is_low_entropy,
+    iter_assignments,
     mask_secret,
     mask_snippet,
     parse_assignment_value,
@@ -355,3 +360,184 @@ class TestMaskSnippetEscapePrevention:
         assert SYNTH_GITHUB_TOKEN not in result
         assert "os.supersecret" not in result
         assert "supersecret" not in result
+
+
+# ============================================================================
+# --- Compound key classification tests (classify_key) ---
+# ============================================================================
+
+class TestCompoundKeyClassification:
+    """Verify classify_key correctly identifies compound sensitive keys
+    and rejects non-sensitive compound names using segment matching."""
+
+    # --- Password category (R006) ---
+    def test_password_classified(self):
+        assert classify_key("password") == CATEGORY_PASSWORD
+
+    def test_db_password_classified(self):
+        assert classify_key("DB_PASSWORD") == CATEGORY_PASSWORD
+
+    def test_database_password_classified(self):
+        assert classify_key("DATABASE_PASSWORD") == CATEGORY_PASSWORD
+
+    def test_mysql_pwd_classified(self):
+        assert classify_key("MYSQL_PWD") == CATEGORY_PASSWORD
+
+    def test_admin_passwd_classified(self):
+        assert classify_key("ADMIN_PASSWD") == CATEGORY_PASSWORD
+
+    def test_camelcase_dbPassword_classified(self):
+        """camelCase dbPassword splits to [DB, PASSWORD] -> password."""
+        assert classify_key("dbPassword") == CATEGORY_PASSWORD
+
+    def test_dotted_db_password_classified(self):
+        """db.password splits to [DB, PASSWORD] -> password."""
+        assert classify_key("db.password") == CATEGORY_PASSWORD
+
+    # --- Secret category (R007) ---
+    def test_secret_classified(self):
+        assert classify_key("secret") == CATEGORY_SECRET
+
+    def test_jwt_secret_classified(self):
+        assert classify_key("JWT_SECRET") == CATEGORY_SECRET
+
+    def test_client_secret_classified(self):
+        assert classify_key("CLIENT_SECRET") == CATEGORY_SECRET
+
+    def test_token_classified(self):
+        assert classify_key("token") == CATEGORY_SECRET
+
+    def test_access_token_classified(self):
+        assert classify_key("ACCESS_TOKEN") == CATEGORY_SECRET
+
+    def test_github_token_classified(self):
+        assert classify_key("GITHUB_TOKEN") == CATEGORY_SECRET
+
+    def test_api_key_classified(self):
+        assert classify_key("api_key") == CATEGORY_SECRET
+
+    def test_my_api_key_classified(self):
+        assert classify_key("MY_API_KEY") == CATEGORY_SECRET
+
+    def test_openai_api_key_classified(self):
+        assert classify_key("OPENAI_API_KEY") == CATEGORY_SECRET
+
+    def test_camelcase_apiKey_classified(self):
+        """camelCase apiKey splits to [API, KEY] -> secret via pair."""
+        assert classify_key("apiKey") == CATEGORY_SECRET
+
+    # --- AWS secret category (R003) ---
+    def test_aws_secret_access_key_classified(self):
+        assert classify_key("AWS_SECRET_ACCESS_KEY") == CATEGORY_AWS_SECRET
+
+    def test_secret_access_key_classified(self):
+        assert classify_key("SECRET_ACCESS_KEY") == CATEGORY_AWS_SECRET
+
+    def test_aws_secret_classified(self):
+        assert classify_key("AWS_SECRET") == CATEGORY_AWS_SECRET
+
+    # --- Non-sensitive compound names (must return None) ---
+    def test_secretary_email_not_classified(self):
+        assert classify_key("SECRETARY_EMAIL") is None
+
+    def test_tokenizer_model_not_classified(self):
+        assert classify_key("TOKENIZER_MODEL") is None
+
+    def test_passwordless_mode_not_classified(self):
+        assert classify_key("PASSWORDLESS_MODE") is None
+
+    def test_api_keyboard_layout_not_classified(self):
+        assert classify_key("API_KEYBOARD_LAYOUT") is None
+
+    def test_access_tokenizer_not_classified(self):
+        assert classify_key("ACCESS_TOKENIZER") is None
+
+
+# ============================================================================
+# --- iter_assignments compound key tests ---
+# ============================================================================
+
+class TestIterAssignmentsCompound:
+    """Verify iter_assignments correctly parses compound keys and edge cases."""
+
+    def test_simple_unquoted_key(self):
+        """password = "value" yields one assignment."""
+        line = 'password = "value"'
+        assignments = list(iter_assignments(line))
+        assert len(assignments) == 1
+        assert assignments[0].key_raw == "password"
+        assert assignments[0].value == "value"
+        assert assignments[0].is_quoted is True
+
+    def test_compound_uppercase_key(self):
+        """DB_PASSWORD = "value" yields one assignment."""
+        line = 'DB_PASSWORD = "value"'
+        assignments = list(iter_assignments(line))
+        assert len(assignments) == 1
+        assert assignments[0].key_raw == "DB_PASSWORD"
+        assert assignments[0].value == "value"
+
+    def test_const_prefix_keyword_skipped(self):
+        """const OPENAI_API_KEY = "v" -- const has no =, skipped; key is OPENAI_API_KEY."""
+        line = 'const OPENAI_API_KEY = "v"'
+        assignments = list(iter_assignments(line))
+        assert len(assignments) == 1
+        assert assignments[0].key_raw == "OPENAI_API_KEY"
+        assert assignments[0].value == "v"
+
+    def test_json_double_quoted_key(self):
+        """"api_key": "value" yields one assignment."""
+        line = '"api_key": "value"'
+        assignments = list(iter_assignments(line))
+        assert len(assignments) == 1
+        assert assignments[0].key_raw == "api_key"
+        assert assignments[0].value == "value"
+
+    def test_toml_single_quoted_key(self):
+        """'jwt_secret' = 'value' yields one assignment."""
+        line = "'jwt_secret' = 'value'"
+        assignments = list(iter_assignments(line))
+        assert len(assignments) == 1
+        assert assignments[0].key_raw == "jwt_secret"
+        assert assignments[0].value == "value"
+
+    def test_multiple_assignments_same_line(self):
+        """password="a" token="b" yields two assignments."""
+        line = 'password="a" token="b"'
+        assignments = list(iter_assignments(line))
+        assert len(assignments) == 2
+        assert assignments[0].key_raw == "password"
+        assert assignments[0].value == "a"
+        assert assignments[1].key_raw == "token"
+        assert assignments[1].value == "b"
+
+    def test_env_ref_in_value_not_re_scanned(self):
+        """unrelated=${DB_PASSWORD:-default} -- DB_PASSWORD inside value is NOT a second key."""
+        line = "unrelated=${DB_PASSWORD:-default}"
+        assignments = list(iter_assignments(line))
+        assert len(assignments) == 1
+        assert assignments[0].key_raw == "unrelated"
+        assert assignments[0].value == "${DB_PASSWORD:-default}"
+
+    def test_password_env_ref_single_assignment(self):
+        """password=${DB_PASSWORD:-default} -- only one assignment, no false key."""
+        line = "password=${DB_PASSWORD:-default}"
+        assignments = list(iter_assignments(line))
+        assert len(assignments) == 1
+        assert assignments[0].key_raw == "password"
+        assert assignments[0].value == "${DB_PASSWORD:-default}"
+
+    def test_quoted_value_content_not_re_scanned(self):
+        """Quoted value containing key-like text is NOT parsed as a second key."""
+        line = 'unrelated="password=evil"'
+        assignments = list(iter_assignments(line))
+        assert len(assignments) == 1
+        assert assignments[0].key_raw == "unrelated"
+        assert assignments[0].value == "password=evil"
+
+    def test_key_normalized_field(self):
+        """Assignment.key_normalized is uppercase with _ separators."""
+        line = 'dbPassword = "val"'
+        assignments = list(iter_assignments(line))
+        assert len(assignments) == 1
+        assert assignments[0].key_normalized == "DB_PASSWORD"
