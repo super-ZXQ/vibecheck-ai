@@ -54,4 +54,3 @@ temp/
 *.tar.gz
 *.zip
 repo_snapshots/
-*.patch
