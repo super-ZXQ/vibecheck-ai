@@ -757,19 +757,32 @@ class TestMaskSnippetConservativeEnvRef:
 
 
 # ============================================================================
-# --- Assignment repr protection tests (4 tests) ---
+# --- Assignment repr protection tests (5 tests) ---
 # ============================================================================
 
 class TestAssignmentReprProtection:
-    """Verify Assignment never exposes raw value in repr, logging, or exceptions."""
+    """Verify Assignment never exposes key_raw, key_normalized, or value.
+
+    Uses a runtime-constructed variable name containing a format-correct
+    synthetic GitHub token (PASSWORD_<token>) to simulate a malicious
+    repository embedding a token in a variable name. This tests that
+    repr, logging, exceptions, and asdict never leak the token through
+    the key itself.
+
+    SECURITY: Assignment is a NON-dataclass. dataclasses.asdict(assignment)
+    must raise TypeError, preventing accidental serialization of sensitive
+    fields.
+    """
 
     _SECRET_VALUE = "super_secret_value_12345"
+    # Malicious variable name: PASSWORD_ + format-correct synthetic token
+    _MALICIOUS_KEY = f"PASSWORD_{SYNTH_GITHUB_TOKEN}"
 
     def _make_assignment(self) -> "Assignment":
         from app.core.security.desensitize import Assignment
         return Assignment(
-            key_raw="password",
-            key_normalized="PASSWORD",
+            key_raw=self._MALICIOUS_KEY,
+            key_normalized=self._MALICIOUS_KEY.upper(),
             value_start=10,
             value_end=30,
             value=self._SECRET_VALUE,
@@ -777,44 +790,66 @@ class TestAssignmentReprProtection:
             operator="=",
         )
 
-    def test_repr_excludes_raw_value(self):
-        """repr(Assignment) must NOT contain the raw value."""
+    def test_repr_excludes_raw_value_and_keys(self):
+        """repr(Assignment) must NOT contain key_raw, key_normalized, or value.
+
+        Only value_start, value_end, is_quoted, and operator are shown.
+        """
         a = self._make_assignment()
         r = repr(a)
+        # value must not appear
         assert self._SECRET_VALUE not in r
-        assert "value=" not in r
-        # Safe fields should be present
-        assert "password" in r
-        assert "operator" in r
+        # key_raw must not appear (contains synthetic token)
+        assert self._MALICIOUS_KEY not in r
+        assert SYNTH_GITHUB_TOKEN not in r
+        # key_normalized must not appear
+        assert self._MALICIOUS_KEY.upper() not in r
+        # Only safe metadata fields should be present
+        assert "value_start=" in r
+        assert "value_end=" in r
+        assert "is_quoted=" in r
+        assert "operator=" in r
 
-    def test_logging_excludes_raw_value(self, caplog):
-        """logging output of Assignment must NOT contain the raw value."""
+    def test_logging_excludes_raw_value_and_keys(self, caplog):
+        """logging output of Assignment must NOT contain value or keys."""
         import logging
         a = self._make_assignment()
         logger = logging.getLogger("test_assignment")
         with caplog.at_level(logging.DEBUG, logger="test_assignment"):
             logger.info("Assignment: %r", a)
         assert self._SECRET_VALUE not in caplog.text
+        assert self._MALICIOUS_KEY not in caplog.text
+        assert SYNTH_GITHUB_TOKEN not in caplog.text
 
-    def test_exception_excludes_raw_value(self):
-        """Exception carrying Assignment must NOT contain the raw value in str."""
+    def test_exception_excludes_raw_value_and_keys(self):
+        """Exception carrying Assignment must NOT contain value or keys in str."""
         a = self._make_assignment()
         try:
             raise ValueError(f"Bad assignment: {a!r}")
         except ValueError as e:
             assert self._SECRET_VALUE not in str(e)
+            assert self._MALICIOUS_KEY not in str(e)
+            assert SYNTH_GITHUB_TOKEN not in str(e)
 
-    def test_asdict_excludes_raw_value(self):
-        """dataclasses.asdict still contains value — but repr does not.
+    def test_asdict_raises_type_error(self):
+        """dataclasses.asdict(assignment) raises TypeError (non-dataclass).
 
-        This test verifies that the repr protection works even though
-        asdict technically exposes the field. The key point is that
-        repr/logging/traceback never expose it.
+        Assignment is intentionally NOT a dataclass. This prevents accidental
+        leakage of key_raw, key_normalized, and value through dict
+        serialization. This test MUST actually call dataclasses.asdict.
         """
+        import dataclasses as _dc
         a = self._make_assignment()
-        r = repr(a)
-        # repr must be safe
-        assert self._SECRET_VALUE not in r
+        with pytest.raises(TypeError):
+            _dc.asdict(a)
+
+    def test_assignment_is_read_only(self):
+        """Assignment attributes cannot be modified after creation."""
+        a = self._make_assignment()
+        with pytest.raises(AttributeError):
+            a.value = "tampered"
+        with pytest.raises(AttributeError):
+            a.key_raw = "tampered"
 
 
 # ============================================================================
@@ -887,3 +922,61 @@ class TestUnquotedCompoundKeys:
     def test_dot_key_classified_as_secret(self):
         """openai.api.key is classified as CATEGORY_SECRET."""
         assert classify_key("openai.api.key") == CATEGORY_SECRET
+
+
+# ============================================================================
+# --- mask_untrusted_text tests (6 tests) ---
+# ============================================================================
+
+class TestMaskUntrustedText:
+    """Verify mask_untrusted_text sanitizes explicit-format secrets in paths.
+
+    File names and directory names are untrusted input — they may embed
+    format-correct secrets. mask_untrusted_text masks these without
+    relying on key=value semantics.
+    """
+
+    def test_plain_path_unchanged(self):
+        """Plain POSIX path without secrets is returned unchanged."""
+        from app.core.security.desensitize import mask_untrusted_text
+        result = mask_untrusted_text("src/config/settings.py")
+        assert result == "src/config/settings.py"
+
+    def test_filename_with_github_token_masked(self):
+        """Filename containing a synthetic GitHub token is masked."""
+        from app.core.security.desensitize import mask_untrusted_text
+        path = f"src/{SYNTH_GITHUB_TOKEN}.py"
+        result = mask_untrusted_text(path)
+        assert SYNTH_GITHUB_TOKEN not in result
+        # Masked version should contain the prefix and ... indicator
+        assert "ghp_" in result
+        assert "..." in result
+
+    def test_directory_with_aws_key_masked(self):
+        """Directory name containing a synthetic AWS access key is masked."""
+        from app.core.security.desensitize import mask_untrusted_text
+        path = f"configs/{SYNTH_AWS_KEY}/settings.py"
+        result = mask_untrusted_text(path)
+        assert SYNTH_AWS_KEY not in result
+        assert "AKIA" in result
+        assert "..." in result
+
+    def test_google_api_key_masked(self):
+        """Google API key in path is masked."""
+        from app.core.security.desensitize import mask_untrusted_text
+        path = f"keys/{SYNTH_GOOGLE_KEY}.json"
+        result = mask_untrusted_text(path)
+        assert SYNTH_GOOGLE_KEY not in result
+
+    def test_connection_string_masked(self):
+        """Connection string in path is masked."""
+        from app.core.security.desensitize import mask_untrusted_text
+        path = f"db/{SYNTH_CONN_STR}"
+        result = mask_untrusted_text(path)
+        assert "secretpass" not in result
+        assert "***" in result
+
+    def test_empty_string_unchanged(self):
+        """Empty string is returned as-is."""
+        from app.core.security.desensitize import mask_untrusted_text
+        assert mask_untrusted_text("") == ""

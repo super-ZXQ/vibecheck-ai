@@ -265,3 +265,108 @@ class TestScanDirectory:
                     f.column_start < r001_finding.column_end
                     and r001_finding.column_start < f.column_end
                 )
+
+
+# ============================================================================
+# --- Bytes-first binary detection tests (4 tests) ---
+# ============================================================================
+
+class TestBytesFirstBinaryDetection:
+    """Verify bytes-first binary detection: NUL bytes, UTF-8-SIG BOM,
+    CRLF line endings, and invalid UTF-8 handling.
+
+    The scanner reads files as bytes first, checks for NUL bytes and
+    binary indicators before decoding, uses utf-8-sig for BOM handling,
+    and skips invalid UTF-8 as binary.
+    """
+
+    def test_unknown_ext_with_nul_is_binary(self, tmp_path):
+        """Unknown extension file with NUL byte is judged as binary.
+
+        The file has a .xyz extension (not in binary_extensions list),
+        contains a NUL byte but the rest is valid UTF-8. The NUL byte
+        must cause it to be skipped as binary — not scanned.
+        """
+        # .xyz is NOT in scan_binary_extensions
+        content = b'password = "some_value"\x00\nmore text\n'
+        (tmp_path / "data.xyz").write_bytes(content)
+
+        result = scan_directory(tmp_path)
+
+        # File must be skipped as binary
+        skipped = [s for s in result.skipped_files if "data.xyz" in s.file_path]
+        assert len(skipped) == 1
+        assert skipped[0].reason == "binary"
+
+        # No findings should come from this file
+        assert result.total_files_scanned == 0
+
+    def test_utf8_sig_bom_secret_detected(self, tmp_path):
+        """UTF-8-SIG file (with BOM) detects secret on first line.
+
+        The utf-8-sig decoder strips the BOM, so line numbering starts
+        correctly at line 1 for the first content line.
+        """
+        # Write a file with UTF-8 BOM + secret on first line
+        bom = b'\xef\xbb\xbf'
+        content = bom + f'GITHUB_TOKEN = "{SYNTH_GITHUB_TOKEN}"\n'.encode("utf-8")
+        (tmp_path / "config.py").write_bytes(content)
+
+        result = scan_directory(tmp_path)
+
+        # Secret should be detected on line 1
+        r001 = [f for f in result.findings if f.rule_id == "R001_GITHUB_TOKEN"]
+        assert len(r001) == 1
+        assert r001[0].line_start == 1
+        # Original token must not appear in snippet
+        assert SYNTH_GITHUB_TOKEN not in r001[0].snippet_masked
+
+    def test_crlf_line_numbers_correct(self, tmp_path):
+        """CRLF file line numbers are correct.
+
+        splitlines() handles both \\n and \\r\\n, so line numbers
+        must be correct regardless of line ending style.
+        """
+        # Write a file with CRLF line endings
+        lines = [
+            '# comment line',
+            f'TOKEN = "{SYNTH_GITHUB_TOKEN}"',
+            '# another comment',
+        ]
+        content = '\r\n'.join(lines) + '\r\n'
+        (tmp_path / "config.py").write_bytes(content.encode("utf-8"))
+
+        result = scan_directory(tmp_path)
+
+        # Secret should be on line 2 (after comment on line 1)
+        r001 = [f for f in result.findings if f.rule_id == "R001_GITHUB_TOKEN"]
+        assert len(r001) == 1
+        assert r001[0].line_start == 2
+        assert SYNTH_GITHUB_TOKEN not in r001[0].snippet_masked
+
+    def test_invalid_utf8_skipped_as_binary(self, tmp_path):
+        """Invalid UTF-8 file (no NUL) is skipped as binary with safe error info.
+
+        The file contains bytes that cannot be decoded as UTF-8 but has
+        NO NUL byte — testing the UTF-8 decode failure path directly.
+        It must be skipped as binary — not produce an error with
+        raw bytes, str(exc), repr(exc), or absolute paths.
+        """
+        # Write bytes that are invalid UTF-8 (0xff 0xfe is not valid UTF-8)
+        # NO NUL byte — tests the UTF-8 decode failure path
+        content = b'\xff\xfe\xff some text that looks like text'
+        (tmp_path / "weird.dat").write_bytes(content)
+
+        result = scan_directory(tmp_path)
+
+        # File must be skipped as binary (invalid UTF-8 decode)
+        skipped = [s for s in result.skipped_files if "weird.dat" in s.file_path]
+        assert len(skipped) == 1
+        assert skipped[0].reason == "binary"
+
+        # No errors should be produced (binary skip, not read error)
+        errors = [e for e in result.scan_errors if "weird.dat" in e.file_path]
+        assert len(errors) == 0
+
+        # No findings
+        assert result.total_files_scanned == 0

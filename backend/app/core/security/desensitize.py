@@ -35,7 +35,7 @@ Security guarantees:
 """
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Iterator
 
 
@@ -64,39 +64,100 @@ CATEGORY_PASSWORD = "password"
 CATEGORY_SECRET = "secret"
 
 
-@dataclass(frozen=True)
 class Assignment:
     """A parsed key=value assignment from a line of text.
 
     Produced by iter_assignments(). Shared between all rules and
     mask_snippet — no rule may duplicate assignment parsing logic.
 
-    SECURITY: The ``value`` field holds the raw parsed value and must
-    NEVER appear in logs, exceptions, assertions, or any output. It is
-    excluded from repr via ``field(repr=False)`` and a custom ``__repr__``
-    that only shows the key, position, quote flag, and operator.
-    Assignment is an INTERNAL temporary parse object — it must NOT enter
-    API models, persistence objects, or LLM input.
+    SECURITY: This is a NON-dataclass internal read-only object.
+    - ``dataclasses.asdict(assignment)`` raises ``TypeError`` because
+      Assignment is not a dataclass. This prevents accidental leakage of
+      ``key_raw``, ``key_normalized``, and ``value`` through serialization.
+    - ``__repr__`` only shows position/quote/operator metadata — NEVER
+      ``key_raw``, ``key_normalized``, or ``value``.
+    - Logs, exceptions, and assertions must NEVER print the raw key or
+      value. A malicious repo can embed a format-correct token in a
+      variable name, so the key itself is treated as untrusted.
+    - Assignment is an INTERNAL temporary parse object — it must NOT
+      enter API models, persistence objects, or LLM input.
     """
-    key_raw: str           # original key text as it appeared (no quotes)
-    key_normalized: str    # uppercase, separators normalized to _
-    value_start: int       # 0-based start of value content (after opening quote)
-    value_end: int         # 0-based end of value content (before closing quote)
-    value: str = field(repr=False)  # parsed value content (escapes processed) — NEVER in repr
-    is_quoted: bool        # whether the value was quoted
-    operator: str          # assignment operator used: "=" or ":"
+
+    __slots__ = (
+        "_key_raw",
+        "_key_normalized",
+        "_value_start",
+        "_value_end",
+        "_value",
+        "_is_quoted",
+        "_operator",
+    )
+
+    def __init__(
+        self,
+        key_raw: str,
+        key_normalized: str,
+        value_start: int,
+        value_end: int,
+        value: str,
+        is_quoted: bool,
+        operator: str,
+    ) -> None:
+        # Use object.__setattr__ to bypass __setattr__ restriction during init.
+        object.__setattr__(self, "_key_raw", key_raw)
+        object.__setattr__(self, "_key_normalized", key_normalized)
+        object.__setattr__(self, "_value_start", value_start)
+        object.__setattr__(self, "_value_end", value_end)
+        object.__setattr__(self, "_value", value)
+        object.__setattr__(self, "_is_quoted", is_quoted)
+        object.__setattr__(self, "_operator", operator)
+
+    # --- Read-only properties (no setters) ---
+    @property
+    def key_raw(self) -> str:
+        return self._key_raw
+
+    @property
+    def key_normalized(self) -> str:
+        return self._key_normalized
+
+    @property
+    def value_start(self) -> int:
+        return self._value_start
+
+    @property
+    def value_end(self) -> int:
+        return self._value_end
+
+    @property
+    def value(self) -> str:
+        return self._value
+
+    @property
+    def is_quoted(self) -> bool:
+        return self._is_quoted
+
+    @property
+    def operator(self) -> str:
+        return self._operator
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("Assignment is read-only")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("Assignment is read-only")
 
     def __repr__(self) -> str:
-        """Safe repr that NEVER exposes the raw value.
+        """Safe repr that NEVER exposes key_raw, key_normalized, or value.
 
-        Only shows the key, position, quote flag, and operator.
-        Used by default repr(), logging, and traceback formatting.
+        Only shows position, quote flag, and operator — all of which are
+        safe metadata. This prevents leakage when a malicious repo embeds
+        a format-correct token in a variable name.
         """
         return (
-            f"Assignment(key_raw={self.key_raw!r}, "
-            f"key_normalized={self.key_normalized!r}, "
-            f"value_start={self.value_start}, value_end={self.value_end}, "
-            f"is_quoted={self.is_quoted}, operator={self.operator!r})"
+            f"Assignment(value_start={self._value_start}, "
+            f"value_end={self._value_end}, "
+            f"is_quoted={self._is_quoted}, operator={self._operator!r})"
         )
 
 
@@ -687,12 +748,96 @@ class _SecretRange:
 
 
 # Patterns for detecting prefix-based tokens within a line of text.
-_SNIPPET_PATTERNS: list[tuple[re.Pattern, str]] = [
+# These are the EXPLICIT-FORMAT patterns shared by mask_snippet and
+# mask_untrusted_text. They do NOT depend on key=value semantics.
+_EXPLICIT_FORMAT_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"(ghp_[A-Za-z0-9]{36})"), GITHUB_TOKEN),
     (re.compile(r"(AKIA[A-Z0-9]{16})"), AWS_ACCESS_KEY),
     (re.compile(r"(AIza[A-Za-z0-9_\-]{35})"), GOOGLE_API_KEY),
     (re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://[^:/@\s]+:[^@\s]+@\S+)"), CONNECTION_STRING),
 ]
+
+
+def _collect_explicit_format_ranges(text: str) -> list[_SecretRange]:
+    """Collect all explicit-format secret ranges in arbitrary text.
+
+    This is the SHARED range-collection logic used by both mask_snippet
+    and mask_untrusted_text. It scans for GitHub tokens, AWS access keys,
+    Google API keys, and connection strings — all of which have
+    unambiguous format patterns that do NOT depend on key=value semantics.
+
+    Args:
+        text: Arbitrary text (may be a file path, directory name, or any
+              user-controlled string).
+
+    Returns:
+        List of _SecretRange objects for detected explicit-format secrets.
+    """
+    ranges: list[_SecretRange] = []
+    for pattern, stype in _EXPLICIT_FORMAT_PATTERNS:
+        for match in pattern.finditer(text):
+            group = match.group(1)
+            masked = mask_secret(group, stype)
+            ranges.append(_SecretRange(
+                start=match.start(1),
+                end=match.end(1),
+                secret_type=stype,
+                masked_value=masked,
+            ))
+    return ranges
+
+
+def _apply_ranges(text: str, ranges: list[_SecretRange]) -> str:
+    """Sort, merge, and apply secret ranges to text (back-to-front replace)."""
+    if not ranges:
+        return text
+    ranges.sort(key=lambda r: (r.start, r.end))
+    merged: list[_SecretRange] = []
+    for r in ranges:
+        if merged and r.start < merged[-1].end:
+            if r.end > merged[-1].end:
+                merged[-1] = _SecretRange(
+                    start=merged[-1].start,
+                    end=r.end,
+                    secret_type=merged[-1].secret_type,
+                    masked_value=merged[-1].masked_value,
+                )
+        else:
+            merged.append(r)
+    result = text
+    for r in reversed(merged):
+        result = result[:r.start] + r.masked_value + result[r.end:]
+    return result
+
+
+def mask_untrusted_text(text: str) -> str:
+    """Mask explicit-format secrets in arbitrary user-controlled text.
+
+    This is the GENERAL-PURPOSE path/identifier sanitization function.
+    It masks GitHub tokens, AWS access keys, Google API keys, and
+    connection strings in ANY text — including file paths, directory
+    names, error messages, and other non-assignment contexts.
+
+    Unlike mask_snippet, this function does NOT use key=value semantics
+    or iter_assignments. It relies ONLY on explicit-format pattern
+    matching, which is safe because these formats (ghp_+36, AKIA+16,
+    AIza+35, scheme://user:pass@host) are unambiguous.
+
+    Used to sanitize file_path in Finding, ScanNotice, SkippedFile, and
+    ScanError — all of which may contain user-controlled path components
+    (filenames, directory names) that could embed format-correct secrets.
+
+    Args:
+        text: Arbitrary user-controlled text (e.g., a POSIX relative path).
+
+    Returns:
+        The text with all explicit-format secrets masked. Plain paths
+        without embedded secrets are returned unchanged.
+    """
+    if not text:
+        return text
+    ranges = _collect_explicit_format_ranges(text)
+    return _apply_ranges(text, ranges)
 
 
 def mask_snippet(line_text: str) -> str:
@@ -728,17 +873,8 @@ def mask_snippet(line_text: str) -> str:
 
     ranges: list[_SecretRange] = []
 
-    # 1. Collect prefix-based token ranges
-    for pattern, stype in _SNIPPET_PATTERNS:
-        for match in pattern.finditer(line_text):
-            group = match.group(1)
-            masked = mask_secret(group, stype)
-            ranges.append(_SecretRange(
-                start=match.start(1),
-                end=match.end(1),
-                secret_type=stype,
-                masked_value=masked,
-            ))
+    # 1. Collect explicit-format token ranges (shared logic)
+    ranges.extend(_collect_explicit_format_ranges(line_text))
 
     # 2. Collect assignment-style secret ranges using iter_assignments
     for assignment in iter_assignments(line_text):
@@ -764,29 +900,4 @@ def mask_snippet(line_text: str) -> str:
             masked_value=masked,
         ))
 
-    if not ranges:
-        return line_text
-
-    # 3. Sort ranges by start position
-    ranges.sort(key=lambda r: (r.start, r.end))
-
-    # 4. Merge overlapping ranges
-    merged: list[_SecretRange] = []
-    for r in ranges:
-        if merged and r.start < merged[-1].end:
-            if r.end > merged[-1].end:
-                merged[-1] = _SecretRange(
-                    start=merged[-1].start,
-                    end=r.end,
-                    secret_type=merged[-1].secret_type,
-                    masked_value=merged[-1].masked_value,
-                )
-        else:
-            merged.append(r)
-
-    # 5. Replace from back to front to preserve indices
-    result = line_text
-    for r in reversed(merged):
-        result = result[:r.start] + r.masked_value + result[r.end:]
-
-    return result
+    return _apply_ranges(line_text, ranges)

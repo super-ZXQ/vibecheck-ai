@@ -8,8 +8,13 @@ Security guarantees:
 - Symlink files and symlink directories are always skipped.
 - All returned paths use POSIX format (forward slashes).
 - Never executes code from the scanned repository.
-- File content is read as UTF-8; non-UTF-8 files are skipped as "binary".
+- File content is read as bytes first; NUL bytes and invalid UTF-8 cause
+  files to be skipped as "binary". UTF-8-SIG decoding handles BOM; CRLF
+  is handled by splitlines().
 - Files larger than scan_max_file_size are skipped as "too_large".
+- All result object paths (Finding, ScanNotice, SkippedFile, ScanError)
+  are sanitized via mask_untrusted_text to mask explicit-format secrets
+  that may be embedded in user-controlled filenames and directory names.
 - Files are scanned in FULL -- no line limit, so secrets in later lines
   are never missed.
 - All error messages are fixed reason codes -- no str(exception),
@@ -39,6 +44,7 @@ import os
 from pathlib import Path
 
 from app.core.config import settings
+from app.core.security.desensitize import mask_untrusted_text
 from app.scanner.base import (
     Finding,
     FindingType,
@@ -272,12 +278,19 @@ def scan_directory(
                 ))
                 continue
 
+            # --- Sanitize path for result objects ---
+            # File names and directory names are untrusted input — they may
+            # contain format-correct secrets (e.g., ghp_XXXX... .py).
+            # All result objects use the sanitized path. File system
+            # operations continue using the real full_path.
+            safe_path = mask_untrusted_text(posix_path)
+
             # --- Check file size ---
             try:
                 file_size = os.path.getsize(full_path)
             except OSError:
                 all_errors.append(ScanError(
-                    file_path=posix_path,
+                    file_path=safe_path,
                     error_type=REASON_STAT_ERROR,
                     error_message=_SAFE_ERROR_MESSAGES[REASON_STAT_ERROR],
                 ))
@@ -285,7 +298,7 @@ def scan_directory(
 
             if file_size > settings.scan_max_file_size:
                 all_skipped.append(SkippedFile(
-                    file_path=posix_path,
+                    file_path=safe_path,
                     reason=REASON_TOO_LARGE,
                 ))
                 continue
@@ -294,26 +307,38 @@ def scan_directory(
             ext = os.path.splitext(filename)[1].lower()
             if ext in binary_exts:
                 all_skipped.append(SkippedFile(
-                    file_path=posix_path,
+                    file_path=safe_path,
                     reason=REASON_BINARY,
                 ))
                 continue
 
-            # --- Read file content as UTF-8 ---
+            # --- Read file content as bytes (bytes-first binary detection) ---
             try:
-                with open(full_path, "r", encoding="utf-8", errors="strict") as f:
-                    content = f.read()
-            except UnicodeDecodeError:
+                with open(full_path, "rb") as f:
+                    raw_bytes = f.read()
+            except OSError:
+                all_errors.append(ScanError(
+                    file_path=safe_path,
+                    error_type=REASON_READ_ERROR,
+                    error_message=_SAFE_ERROR_MESSAGES[REASON_READ_ERROR],
+                ))
+                continue
+
+            # --- Check for NUL bytes (binary indicator) ---
+            if b"\x00" in raw_bytes:
                 all_skipped.append(SkippedFile(
-                    file_path=posix_path,
+                    file_path=safe_path,
                     reason=REASON_BINARY,
                 ))
                 continue
-            except OSError:
-                all_errors.append(ScanError(
-                    file_path=posix_path,
-                    error_type=REASON_READ_ERROR,
-                    error_message=_SAFE_ERROR_MESSAGES[REASON_READ_ERROR],
+
+            # --- Decode as UTF-8-SIG (handles BOM; CRLF via splitlines) ---
+            try:
+                content = raw_bytes.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                all_skipped.append(SkippedFile(
+                    file_path=safe_path,
+                    reason=REASON_BINARY,
                 ))
                 continue
 
@@ -330,7 +355,7 @@ def scan_directory(
             #   real tokens/keys accidentally committed to template files.
             # - Generic heuristic rules (R006-R008) are skipped to avoid
             #   noise from placeholder values.
-            basename = posix_path.split("/")[-1]
+            basename = safe_path.split("/")[-1]
             is_example_env = basename in EXAMPLE_ENV_FILES
 
             file_findings: list[Finding] = []
@@ -338,9 +363,9 @@ def scan_directory(
                 if rule.finding_type == FindingType.CONTENT:
                     if is_example_env and rule.rule_id not in HIGH_CONFIDENCE_RULE_IDS:
                         continue
-                    file_findings.extend(rule.scan_content(posix_path, lines))
+                    file_findings.extend(rule.scan_content(safe_path, lines))
                 elif rule.finding_type == FindingType.FILE:
-                    result = rule.check_file(posix_path, file_size)
+                    result = rule.check_file(safe_path, file_size)
                     if isinstance(result, Finding):
                         file_findings.append(result)
                     elif isinstance(result, ScanNotice):

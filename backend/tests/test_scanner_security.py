@@ -1581,3 +1581,130 @@ class TestR008WeakPasswordFallback:
         assert f.is_blocking is False
         # Password must not appear in snippet
         assert "secret" not in f.snippet_masked
+
+
+# ============================================================================
+# --- Path sanitization tests (6 tests) ---
+# ============================================================================
+
+class TestPathSanitization:
+    """Verify file_path in all result objects is sanitized via mask_untrusted_text.
+
+    File names and directory names are untrusted input — they may embed
+    format-correct secrets. All result objects (Finding, ScanNotice,
+    SkippedFile, ScanError) must use sanitized paths. Checks file_path,
+    repr, and dataclasses.asdict JSON for all result objects.
+    """
+
+    def test_filename_with_github_token_sanitized(self, tmp_path):
+        """Filename containing a synthetic GitHub token is sanitized in findings."""
+        filename = f"{SYNTH_GITHUB_TOKEN}.py"
+        (tmp_path / filename).write_text(
+            'password = "some_value"\n', encoding="utf-8",
+        )
+
+        result = scan_directory(tmp_path)
+
+        # Check ALL findings
+        for f in result.findings:
+            assert SYNTH_GITHUB_TOKEN not in f.file_path
+            assert SYNTH_GITHUB_TOKEN not in repr(f)
+            f_dict = dataclasses.asdict(f)
+            assert SYNTH_GITHUB_TOKEN not in json.dumps(f_dict, default=str)
+
+        # Check ALL skipped files
+        for s in result.skipped_files:
+            assert SYNTH_GITHUB_TOKEN not in s.file_path
+            assert SYNTH_GITHUB_TOKEN not in repr(s)
+            s_dict = dataclasses.asdict(s)
+            assert SYNTH_GITHUB_TOKEN not in json.dumps(s_dict, default=str)
+
+        # Check ALL errors
+        for e in result.scan_errors:
+            assert SYNTH_GITHUB_TOKEN not in e.file_path
+            assert SYNTH_GITHUB_TOKEN not in repr(e)
+            e_dict = dataclasses.asdict(e)
+            assert SYNTH_GITHUB_TOKEN not in json.dumps(e_dict, default=str)
+
+    def test_directory_with_aws_key_sanitized(self, tmp_path):
+        """Directory name containing a synthetic AWS key is sanitized."""
+        dir_name = SYNTH_AWS_KEY
+        secret_dir = tmp_path / dir_name
+        secret_dir.mkdir()
+        (secret_dir / "config.py").write_text(
+            'password = "some_value"\n', encoding="utf-8",
+        )
+
+        result = scan_directory(tmp_path)
+
+        for f in result.findings:
+            assert SYNTH_AWS_KEY not in f.file_path
+            assert SYNTH_AWS_KEY not in repr(f)
+            f_dict = dataclasses.asdict(f)
+            assert SYNTH_AWS_KEY not in json.dumps(f_dict, default=str)
+
+    def test_large_file_skip_path_sanitized(self, tmp_path, monkeypatch):
+        """Large file with token in filename — skipped path is sanitized."""
+        from app.core.config import settings
+        monkeypatch.setattr(settings, "scan_max_file_size", 50)
+
+        filename = f"{SYNTH_GITHUB_TOKEN}.txt"
+        (tmp_path / filename).write_text("x" * 100, encoding="utf-8")
+
+        result = scan_directory(tmp_path)
+
+        for s in result.skipped_files:
+            assert SYNTH_GITHUB_TOKEN not in s.file_path
+            assert SYNTH_GITHUB_TOKEN not in repr(s)
+            s_dict = dataclasses.asdict(s)
+            assert SYNTH_GITHUB_TOKEN not in json.dumps(s_dict, default=str)
+
+    def test_binary_file_skip_path_sanitized(self, tmp_path):
+        """Binary file with token in filename — skipped path is sanitized."""
+        filename = f"{SYNTH_GITHUB_TOKEN}.png"
+        (tmp_path / filename).write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
+
+        result = scan_directory(tmp_path)
+
+        for s in result.skipped_files:
+            assert SYNTH_GITHUB_TOKEN not in s.file_path
+            assert SYNTH_GITHUB_TOKEN not in repr(s)
+            s_dict = dataclasses.asdict(s)
+            assert SYNTH_GITHUB_TOKEN not in json.dumps(s_dict, default=str)
+
+    def test_read_error_path_sanitized(self, tmp_path, monkeypatch):
+        """Read error file with token in filename — error path is sanitized."""
+        filename = f"{SYNTH_GITHUB_TOKEN}.py"
+        (tmp_path / filename).write_text("print('hello')\n", encoding="utf-8")
+
+        original_open = builtins.open
+
+        def failing_open(file, *args, **kwargs):
+            if "rb" in str(args) and SYNTH_GITHUB_TOKEN in str(file):
+                raise OSError("Permission denied")
+            return original_open(file, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", failing_open)
+
+        result = scan_directory(tmp_path)
+
+        for e in result.scan_errors:
+            assert SYNTH_GITHUB_TOKEN not in e.file_path
+            assert SYNTH_GITHUB_TOKEN not in repr(e)
+            assert SYNTH_GITHUB_TOKEN not in e.error_message
+            e_dict = dataclasses.asdict(e)
+            assert SYNTH_GITHUB_TOKEN not in json.dumps(e_dict, default=str)
+
+    def test_plain_path_preserved(self, tmp_path):
+        """Plain file path (no secrets) is preserved as relative POSIX path."""
+        nested = tmp_path / "src" / "config"
+        nested.mkdir(parents=True)
+        (nested / "settings.py").write_text(
+            'password = "some_value"\n', encoding="utf-8",
+        )
+
+        result = scan_directory(tmp_path)
+
+        # The path should be preserved as-is (relative POSIX)
+        for f in result.findings:
+            assert f.file_path == "src/config/settings.py"
