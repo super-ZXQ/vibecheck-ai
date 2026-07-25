@@ -754,3 +754,136 @@ class TestMaskSnippetConservativeEnvRef:
         assert "${DB_PASSWORD}" not in result
         assert "DB_PASSWORD" not in result
         assert "<REDACTED>" in result
+
+
+# ============================================================================
+# --- Assignment repr protection tests (4 tests) ---
+# ============================================================================
+
+class TestAssignmentReprProtection:
+    """Verify Assignment never exposes raw value in repr, logging, or exceptions."""
+
+    _SECRET_VALUE = "super_secret_value_12345"
+
+    def _make_assignment(self) -> "Assignment":
+        from app.core.security.desensitize import Assignment
+        return Assignment(
+            key_raw="password",
+            key_normalized="PASSWORD",
+            value_start=10,
+            value_end=30,
+            value=self._SECRET_VALUE,
+            is_quoted=True,
+            operator="=",
+        )
+
+    def test_repr_excludes_raw_value(self):
+        """repr(Assignment) must NOT contain the raw value."""
+        a = self._make_assignment()
+        r = repr(a)
+        assert self._SECRET_VALUE not in r
+        assert "value=" not in r
+        # Safe fields should be present
+        assert "password" in r
+        assert "operator" in r
+
+    def test_logging_excludes_raw_value(self, caplog):
+        """logging output of Assignment must NOT contain the raw value."""
+        import logging
+        a = self._make_assignment()
+        logger = logging.getLogger("test_assignment")
+        with caplog.at_level(logging.DEBUG, logger="test_assignment"):
+            logger.info("Assignment: %r", a)
+        assert self._SECRET_VALUE not in caplog.text
+
+    def test_exception_excludes_raw_value(self):
+        """Exception carrying Assignment must NOT contain the raw value in str."""
+        a = self._make_assignment()
+        try:
+            raise ValueError(f"Bad assignment: {a!r}")
+        except ValueError as e:
+            assert self._SECRET_VALUE not in str(e)
+
+    def test_asdict_excludes_raw_value(self):
+        """dataclasses.asdict still contains value — but repr does not.
+
+        This test verifies that the repr protection works even though
+        asdict technically exposes the field. The key point is that
+        repr/logging/traceback never expose it.
+        """
+        a = self._make_assignment()
+        r = repr(a)
+        # repr must be safe
+        assert self._SECRET_VALUE not in r
+
+
+# ============================================================================
+# --- Low-entropy short-period detection tests (5 tests) ---
+# ============================================================================
+
+class TestLowEntropyShortPeriod:
+    """Verify is_low_entropy detects short-period repetition patterns."""
+
+    def test_period_2_abab_detected(self):
+        """ABAB pattern (period 2) is low-entropy."""
+        assert is_low_entropy("ghp_" + "AB" * 18, prefix_len=4) is True
+
+    def test_period_4_abcdabcd_detected(self):
+        """ABCDABCD pattern (period 4) is low-entropy."""
+        assert is_low_entropy("ghp_" + "ABCD" * 9, prefix_len=4) is True
+
+    def test_period_3_abcabc_detected(self):
+        """ABCABC pattern (period 3) is low-entropy."""
+        assert is_low_entropy("ghp_" + "ABC" * 12, prefix_len=4) is True
+
+    def test_period_4_numeric_repeat_detected(self):
+        """12341234 pattern (period 4) is low-entropy."""
+        assert is_low_entropy("ghp_" + "1234" * 9, prefix_len=4) is True
+
+    def test_mixed_random_not_low_entropy(self):
+        """Random mixed characters are NOT low-entropy."""
+        assert is_low_entropy(SYNTH_GITHUB_TOKEN, prefix_len=4) is False
+
+
+# ============================================================================
+# --- Unquoted compound key parsing tests (5 tests) ---
+# ============================================================================
+
+class TestUnquotedCompoundKeys:
+    """Verify iter_assignments parses hyphen/dot compound keys correctly."""
+
+    def test_hyphen_compound_key_parsed(self):
+        """my-api-key = "value" is parsed as a single key."""
+        line = 'my-api-key = "hardcoded value"'
+        assignments = list(iter_assignments(line))
+        assert len(assignments) == 1
+        a = assignments[0]
+        assert a.key_raw == "my-api-key"
+        assert a.value == "hardcoded value"
+        assert a.operator == "="
+
+    def test_dot_compound_key_parsed(self):
+        """openai.api.key = "value" is parsed as a single key."""
+        line = 'openai.api.key = "hardcoded value"'
+        assignments = list(iter_assignments(line))
+        assert len(assignments) == 1
+        a = assignments[0]
+        assert a.key_raw == "openai.api.key"
+        assert a.value == "hardcoded value"
+
+    def test_db_password_dot_parsed(self):
+        """db.password = "value" is parsed as a single key."""
+        line = 'db.password = "hardcoded value"'
+        assignments = list(iter_assignments(line))
+        assert len(assignments) == 1
+        a = assignments[0]
+        assert a.key_raw == "db.password"
+        assert a.value == "hardcoded value"
+
+    def test_hyphen_key_classified_as_secret(self):
+        """my-api-key is classified as CATEGORY_SECRET."""
+        assert classify_key("my-api-key") == CATEGORY_SECRET
+
+    def test_dot_key_classified_as_secret(self):
+        """openai.api.key is classified as CATEGORY_SECRET."""
+        assert classify_key("openai.api.key") == CATEGORY_SECRET

@@ -32,7 +32,7 @@ import sys
 
 import pytest
 
-from app.scanner.base import Severity
+from app.scanner.base import Confidence, Severity
 from app.scanner.rules import PrivateKeyRule
 from app.scanner.sensitive import scan_directory
 
@@ -692,10 +692,13 @@ class TestR011TightenedRules:
         for f in r011:
             assert f.is_blocking is True
 
-        # Verify both sensitive variable names are covered
-        descriptions = [f.description for f in r011]
-        assert any("JWT_SECRET" in d for d in descriptions)
-        assert any("CLIENT_SECRET" in d for d in descriptions)
+        # Verify descriptions use FIXED text — raw key names must NOT appear
+        for f in r011:
+            assert "JWT_SECRET" not in f.description
+            assert "CLIENT_SECRET" not in f.description
+            assert "JWT_SECRET" not in f.message
+            assert "CLIENT_SECRET" not in f.message
+            assert "hardcoded secret" in f.description
 
 
 # ============================================================================
@@ -1041,8 +1044,8 @@ class TestAdjacentPrivateKeys:
 class TestConnectionStringPasswordExtraction:
     """Tests for accurate connection string password extraction (R008)."""
 
-    def test_placeholder_password_no_finding(self, tmp_path):
-        """postgres://user:changeme@host/db does not produce a high-risk Finding."""
+    def test_placeholder_password_low_severity(self, tmp_path):
+        """postgres://user:changeme@host/db produces low/non-blocking R008."""
         (tmp_path / "config.py").write_text(
             'DATABASE_URL="postgres://admin:changeme@db.example.com:5432/mydb"\n',
             encoding="utf-8",
@@ -1050,9 +1053,15 @@ class TestConnectionStringPasswordExtraction:
 
         result = scan_directory(tmp_path)
 
-        # R008 should NOT fire (changeme is a placeholder)
+        # R008 SHOULD fire with low severity for placeholder passwords
         r008 = [f for f in result.findings if f.rule_id == "R008_CONNECTION_STRING"]
-        assert len(r008) == 0
+        assert len(r008) == 1
+        f = r008[0]
+        assert f.severity == Severity.LOW
+        assert f.confidence == Confidence.LOW
+        assert f.is_blocking is False
+        # Password must not appear in snippet
+        assert "changeme" not in f.snippet_masked
 
     def test_real_password_produces_r008(self, tmp_path):
         """postgres://user:real_password@host/db produces R008."""
@@ -1469,3 +1478,106 @@ class TestMaskingEscapeRegression:
         assert f.is_blocking is True
         assert f.severity == Severity.CRITICAL
         assert SYNTH_GITHUB_TOKEN not in f.snippet_masked
+
+
+# ============================================================================
+# --- R011 Finding field leakage tests (1 test) ---
+# ============================================================================
+
+class TestR011FindingFieldLeakage:
+    """Verify R011 Finding never leaks the raw key or token in any field.
+
+    Constructs a variable name that embeds a format-correct synthetic
+    GitHub token (PASSWORD_<token>), writes it to .env.production,
+    then checks ALL Finding fields (description, message, snippet_masked,
+    repr, asdict JSON) for the complete token.
+    """
+
+    def test_password_token_variable_no_leak(self, tmp_path):
+        """PASSWORD_<synthetic_token> in .env.production — no field leaks the token."""
+        # Construct variable name: PASSWORD_<synthetic GitHub token>
+        synth_var = f"PASSWORD_{SYNTH_GITHUB_TOKEN}"
+        (tmp_path / ".env.production").write_text(
+            f'{synth_var}=some_hardcoded_value\n',
+            encoding="utf-8",
+        )
+
+        result = scan_directory(tmp_path)
+
+        # Collect ALL findings (R011 and any others)
+        all_findings = list(result.findings)
+        assert len(all_findings) > 0
+
+        # Check every finding's fields
+        for f in all_findings:
+            # description must not contain the full token
+            assert SYNTH_GITHUB_TOKEN not in f.description, (
+                f"Token leaked in description: {f.rule_id}"
+            )
+            # message must not contain the full token
+            assert SYNTH_GITHUB_TOKEN not in f.message, (
+                f"Token leaked in message: {f.rule_id}"
+            )
+            # snippet_masked must not contain the full token
+            assert SYNTH_GITHUB_TOKEN not in f.snippet_masked, (
+                f"Token leaked in snippet_masked: {f.rule_id}"
+            )
+            # repr must not contain the full token
+            assert SYNTH_GITHUB_TOKEN not in repr(f), (
+                f"Token leaked in repr: {f.rule_id}"
+            )
+            # asdict JSON must not contain the full token
+            f_dict = dataclasses.asdict(f)
+            f_json = json.dumps(f_dict, default=str)
+            assert SYNTH_GITHUB_TOKEN not in f_json, (
+                f"Token leaked in asdict JSON: {f.rule_id}"
+            )
+
+
+# ============================================================================
+# --- R008 weak password fallback tests (2 tests) ---
+# ============================================================================
+
+class TestR008WeakPasswordFallback:
+    """Verify R008 generates low/non-blocking findings for weak passwords.
+
+    Weak passwords like foobar, secret, changeme in connection strings
+    must still produce R008 Findings (not disappear), but with
+    low severity / low confidence / non-blocking.
+    """
+
+    def test_foobar_password_low_severity(self, tmp_path):
+        """postgres://user:foobar@host/db produces low/non-blocking R008."""
+        (tmp_path / "config.py").write_text(
+            'DATABASE_URL="postgres://admin:foobar@db.example.com:5432/mydb"\n',
+            encoding="utf-8",
+        )
+
+        result = scan_directory(tmp_path)
+
+        r008 = [f for f in result.findings if f.rule_id == "R008_CONNECTION_STRING"]
+        assert len(r008) == 1
+        f = r008[0]
+        assert f.severity == Severity.LOW
+        assert f.confidence == Confidence.LOW
+        assert f.is_blocking is False
+        # Password must not appear in snippet
+        assert "foobar" not in f.snippet_masked
+
+    def test_secret_password_low_severity(self, tmp_path):
+        """postgres://user:secret@host/db produces low/non-blocking R008."""
+        (tmp_path / "config.py").write_text(
+            'DATABASE_URL="postgres://admin:secret@db.example.com:5432/mydb"\n',
+            encoding="utf-8",
+        )
+
+        result = scan_directory(tmp_path)
+
+        r008 = [f for f in result.findings if f.rule_id == "R008_CONNECTION_STRING"]
+        assert len(r008) == 1
+        f = r008[0]
+        assert f.severity == Severity.LOW
+        assert f.confidence == Confidence.LOW
+        assert f.is_blocking is False
+        # Password must not appear in snippet
+        assert "secret" not in f.snippet_masked

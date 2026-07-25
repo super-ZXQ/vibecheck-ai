@@ -12,7 +12,8 @@ Design principles:
   detection. Uses strict full-match patterns. Quoted values are NEVER
   treated as env references (they are literal strings).
 - is_low_entropy(value, prefix_len): detects obviously repetitive placeholder
-  bodies in explicit-format tokens.
+  bodies in explicit-format tokens, including all-same-character and
+  short-period repetition (period 2-4) patterns.
 - parse_assignment_value: unified assignment value parser shared by ALL rules
   and mask_snippet. Supports quoted JSON/TOML keys, quoted values with
   escapes, and unquoted values with escapes (does NOT stop at #).
@@ -34,7 +35,7 @@ Security guarantees:
 """
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterator
 
 
@@ -69,14 +70,34 @@ class Assignment:
 
     Produced by iter_assignments(). Shared between all rules and
     mask_snippet — no rule may duplicate assignment parsing logic.
+
+    SECURITY: The ``value`` field holds the raw parsed value and must
+    NEVER appear in logs, exceptions, assertions, or any output. It is
+    excluded from repr via ``field(repr=False)`` and a custom ``__repr__``
+    that only shows the key, position, quote flag, and operator.
+    Assignment is an INTERNAL temporary parse object — it must NOT enter
+    API models, persistence objects, or LLM input.
     """
     key_raw: str           # original key text as it appeared (no quotes)
     key_normalized: str    # uppercase, separators normalized to _
     value_start: int       # 0-based start of value content (after opening quote)
     value_end: int         # 0-based end of value content (before closing quote)
-    value: str             # parsed value content (escapes processed)
+    value: str = field(repr=False)  # parsed value content (escapes processed) — NEVER in repr
     is_quoted: bool        # whether the value was quoted
     operator: str          # assignment operator used: "=" or ":"
+
+    def __repr__(self) -> str:
+        """Safe repr that NEVER exposes the raw value.
+
+        Only shows the key, position, quote flag, and operator.
+        Used by default repr(), logging, and traceback formatting.
+        """
+        return (
+            f"Assignment(key_raw={self.key_raw!r}, "
+            f"key_normalized={self.key_normalized!r}, "
+            f"value_start={self.value_start}, value_end={self.value_end}, "
+            f"is_quoted={self.is_quoted}, operator={self.operator!r})"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -165,9 +186,15 @@ def is_env_reference(value: str, is_quoted: bool = False) -> bool:
 def is_low_entropy(value: str, prefix_len: int = 0) -> bool:
     """Check if the body (value minus prefix) is low-entropy.
 
-    Returns True if the body consists entirely of a single repeated
-    character. Used by explicit-format token rules (R001-R004) to
-    downgrade obvious placeholder values (e.g., ghp_AAAAAA...) to
+    Returns True if the body is obviously repetitive, including:
+    - All same character (period 1): AAAAAA...
+    - Short-period repetition (period 2-4): ABAB..., ABCDABCD..., 12341234...
+
+    The repeat unit is limited to 1-4 characters to prevent normal
+    mixed-character values from being mistakenly downgraded.
+
+    Used by explicit-format token rules (R001-R004) to downgrade obvious
+    placeholder values (e.g., ghp_AAAAAA..., ghp_ABABABAB...) to
     low severity / low confidence / non-blocking.
 
     Args:
@@ -177,7 +204,19 @@ def is_low_entropy(value: str, prefix_len: int = 0) -> bool:
     body = value[prefix_len:]
     if not body or len(body) < 4:
         return False
-    return len(set(body)) == 1
+    # Period 1: all same character
+    if len(set(body)) == 1:
+        return True
+    # Period 2-4: short-period repetition (unit length 2, 3, or 4)
+    for period in range(2, 5):
+        if len(body) % period != 0:
+            continue
+        if len(body) < period * 2:
+            continue
+        unit = body[:period]
+        if body == unit * (len(body) // period):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +302,10 @@ def _mask_connection_string(value: str) -> str:
 _CAMEL_SPLIT = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+")
 
 # Regex for matching unquoted identifier keys.
-_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# Supports letters, digits, underscores, hyphens, and dots to correctly
+# recognize compound keys like my-api-key, openai.api.key, db.password.
+# Must start with a letter or underscore.
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*")
 
 # Single-keyword sets for each category (uppercase segments).
 _PASSWORD_KEYWORDS: frozenset[str] = frozenset({"PASSWORD", "PASSWD", "PWD"})
@@ -656,10 +698,16 @@ _SNIPPET_PATTERNS: list[tuple[re.Pattern, str]] = [
 def mask_snippet(line_text: str) -> str:
     """Mask ALL secrets in a line of text.
 
-    Conservative masking strategy: any identified assignment value is masked
-    unless it is an EXACT canonical masked value (is_already_masked) or an
-    unquoted environment variable reference (is_env_reference). Quoted values
-    are NEVER treated as env references — they are literal strings.
+    Conservative masking strategy: any identified assignment value whose
+    key is classified as sensitive is masked. The ONLY values skipped are
+    EXACT canonical already-masked values (is_already_masked).
+
+    Environment variable references (e.g., ${DB_PASSWORD}) are masked
+    here too — mask_snippet is a DISPLAY SAFETY layer, not a rule layer.
+    Rules may skip env references to avoid generating Findings, but
+    mask_snippet must still mask them so no raw value appears in snippet
+    output. Quoted values are NEVER treated as env references — they are
+    literal strings and are always masked.
 
     Uses iter_assignments() to identify ALL key=value assignments by
     recognizing complete keys first (NOT by searching for sensitive

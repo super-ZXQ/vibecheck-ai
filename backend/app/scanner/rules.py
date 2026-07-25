@@ -361,10 +361,15 @@ class PrivateKeyRule(Rule):
 
     Covers: RSA, EC, OPENSSH, PKCS8 (PRIVATE KEY), DSA, PGP PRIVATE KEY BLOCK.
 
+    Uses a single-pass O(n) state machine — no nested loops. Walks through
+    all lines exactly once, tracking at most one pending BEGIN at a time.
+
     - If END is found: complete block, snippet = <PRIVATE_KEY_REDACTED>.
-    - If END is missing: still blocking, but description notes incomplete block.
+    - If END is missing: still blocking, description notes incomplete block.
       Does NOT pretend to have located the complete key body.
     - snippet_masked is ALWAYS <PRIVATE_KEY_REDACTED>, never the key content.
+    - Consecutive complete keys produce separate Findings.
+    - Many BEGINs without END do NOT cause quadratic scanning.
     """
 
     rule_id = "R005_PRIVATE_KEY"
@@ -385,65 +390,148 @@ class PrivateKeyRule(Rule):
     }
 
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
+        """Single-pass O(n) scan using a state machine.
+
+        Tracks at most one pending BEGIN at a time. When a new BEGIN is
+        found while another is pending, the old one is emitted as incomplete.
+        This ensures each line is visited exactly once — no nested loops.
+        """
         findings: list[Finding] = []
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            for begin_header, end_header in self._KEY_PAIRS.items():
-                begin_pos = line.find(begin_header)
-                if begin_pos == -1:
+        # pending holds info about an unclosed BEGIN: (header, end_header,
+        # begin_line_1based, col_start, col_end)
+        pending: tuple[str, str, int, int, int] | None = None
+
+        for i, line in enumerate(lines):
+            # --- If we have a pending BEGIN, check for matching END on this line ---
+            if pending is not None:
+                _, end_header, begin_line, col_s, col_e = pending
+                if end_header in line:
+                    # Found matching END — emit complete finding
+                    key_type = pending[0].strip("-").strip()
+                    findings.append(Finding(
+                        rule_id=self.rule_id,
+                        rule_name=self.rule_name,
+                        severity=self.severity,
+                        confidence=self.confidence,
+                        file_path=file_path,
+                        line_start=begin_line,
+                        line_end=i + 1,
+                        column_start=col_s,
+                        column_end=col_e,
+                        snippet_masked="<PRIVATE_KEY_REDACTED>",
+                        is_blocking=self.is_blocking,
+                        finding_type=self.finding_type,
+                        description=f"Private key block detected ({key_type})",
+                        category="private_key",
+                        secret_type="private_key",
+                        message="Private key block detected",
+                        repair_template_key="rotate_private_key",
+                    ))
+                    pending = None
                     continue
 
-                # Found a BEGIN header
-                begin_line = i + 1  # 1-based
-                begin_col_start = begin_pos
-                begin_col_end = begin_pos + len(begin_header)
+            # --- Check for any BEGIN header on this line ---
+            begin_header: str | None = None
+            begin_pos = -1
+            end_header_matched: str | None = None
+            for bh, eh in self._KEY_PAIRS.items():
+                pos = line.find(bh)
+                if pos != -1:
+                    begin_header = bh
+                    begin_pos = pos
+                    end_header_matched = eh
+                    break
 
-                # Search for the corresponding END header
-                end_line_num: Optional[int] = None
-                for j in range(i, len(lines)):
-                    if end_header in lines[j]:
-                        end_line_num = j + 1  # 1-based
-                        break
+            if begin_header is None:
+                continue
 
-                if end_line_num is not None:
-                    description = (
-                        f"Private key block detected ({begin_header.strip('-').strip()})"
-                    )
-                    line_end = end_line_num
-                    # Skip past the END line: set i to the 0-based index of
-                    # the END line (end_line_num - 1).  The i += 1 at the
-                    # bottom of the while loop will advance to the line
-                    # AFTER the END, correctly handling adjacent key blocks.
-                    i = end_line_num - 1
-                else:
-                    description = (
-                        f"Incomplete private key block -- BEGIN header found "
-                        f"without matching END ({begin_header.strip('-').strip()})"
-                    )
-                    line_end = begin_line
-
+            # Found a BEGIN — if we had a pending one, it's incomplete
+            if pending is not None:
+                old_header, _, old_line, old_cs, old_ce = pending
+                old_type = old_header.strip("-").strip()
                 findings.append(Finding(
                     rule_id=self.rule_id,
                     rule_name=self.rule_name,
                     severity=self.severity,
                     confidence=self.confidence,
                     file_path=file_path,
-                    line_start=begin_line,
-                    line_end=line_end,
-                    column_start=begin_col_start,
-                    column_end=begin_col_end,
+                    line_start=old_line,
+                    line_end=old_line,
+                    column_start=old_cs,
+                    column_end=old_ce,
                     snippet_masked="<PRIVATE_KEY_REDACTED>",
                     is_blocking=self.is_blocking,
                     finding_type=self.finding_type,
-                    description=description,
+                    description=(
+                        f"Incomplete private key block -- BEGIN header found "
+                        f"without matching END ({old_type})"
+                    ),
                     category="private_key",
                     secret_type="private_key",
                     message="Private key block detected",
                     repair_template_key="rotate_private_key",
                 ))
-                break  # Don't check other headers on the same line
-            i += 1
+                pending = None
+
+            # Check if END is on the same line (after BEGIN)
+            if end_header_matched is not None:
+                end_pos = line.find(end_header_matched, begin_pos + len(begin_header))
+                if end_pos != -1:
+                    # Complete on same line
+                    key_type = begin_header.strip("-").strip()
+                    findings.append(Finding(
+                        rule_id=self.rule_id,
+                        rule_name=self.rule_name,
+                        severity=self.severity,
+                        confidence=self.confidence,
+                        file_path=file_path,
+                        line_start=i + 1,
+                        line_end=i + 1,
+                        column_start=begin_pos,
+                        column_end=begin_pos + len(begin_header),
+                        snippet_masked="<PRIVATE_KEY_REDACTED>",
+                        is_blocking=self.is_blocking,
+                        finding_type=self.finding_type,
+                        description=f"Private key block detected ({key_type})",
+                        category="private_key",
+                        secret_type="private_key",
+                        message="Private key block detected",
+                        repair_template_key="rotate_private_key",
+                    ))
+                else:
+                    # Set as pending — END not found yet
+                    pending = (
+                        begin_header, end_header_matched,
+                        i + 1, begin_pos, begin_pos + len(begin_header),
+                    )
+
+        # --- End of file: emit incomplete finding for any unclosed BEGIN ---
+        if pending is not None:
+            old_header, _, old_line, old_cs, old_ce = pending
+            old_type = old_header.strip("-").strip()
+            findings.append(Finding(
+                rule_id=self.rule_id,
+                rule_name=self.rule_name,
+                severity=self.severity,
+                confidence=self.confidence,
+                file_path=file_path,
+                line_start=old_line,
+                line_end=old_line,
+                column_start=old_cs,
+                column_end=old_ce,
+                snippet_masked="<PRIVATE_KEY_REDACTED>",
+                is_blocking=self.is_blocking,
+                finding_type=self.finding_type,
+                description=(
+                    f"Incomplete private key block -- BEGIN header found "
+                    f"without matching END ({old_type})"
+                ),
+                category="private_key",
+                secret_type="private_key",
+                message="Private key block detected",
+                repair_template_key="rotate_private_key",
+            ))
+
         return findings
 
 
@@ -668,22 +756,38 @@ class ConnectionStringRule(Rule):
         for i, line in enumerate(lines):
             for match in self._pattern.finditer(line):
                 password = match.group(3)
-                # Skip if the password is a placeholder, env reference, or already masked
-                if is_env_reference(password) or _is_placeholder(password) or is_already_masked(password):
+
+                # 1. Skip environment variable references
+                if is_env_reference(password):
+                    continue
+                # 2. Skip already-masked values
+                if is_already_masked(password):
                     continue
 
+                # 3. Placeholder / weak passwords: generate low/low/non-blocking
+                if _is_placeholder(password):
+                    severity = Severity.LOW
+                    confidence = Confidence.LOW
+                    blocking = False
+                else:
+                    # 4. Other hardcoded passwords: medium confidence, non-blocking
+                    severity = self.severity
+                    confidence = self.confidence
+                    blocking = self.is_blocking
+
+                # 5. snippet always replaces password with ***
                 findings.append(Finding(
                     rule_id=self.rule_id,
                     rule_name=self.rule_name,
-                    severity=self.severity,
-                    confidence=self.confidence,
+                    severity=severity,
+                    confidence=confidence,
                     file_path=file_path,
                     line_start=i + 1,
                     line_end=i + 1,
                     column_start=match.start(3),
                     column_end=match.end(3),
                     snippet_masked=_make_masked_snippet(line),
-                    is_blocking=self.is_blocking,
+                    is_blocking=blocking,
                     finding_type=self.finding_type,
                     description="Connection string with embedded password detected",
                     category="connection_string",
@@ -812,10 +916,8 @@ class ProductionEnvWithSecretRule(Rule):
                 continue
 
             for assignment in iter_assignments(line):
-                key = assignment.key_raw
-
                 # --- Requirement 1: variable name must have sensitive semantics ---
-                if classify_key(key) is None:
+                if classify_key(assignment.key_raw) is None:
                     continue
 
                 value = assignment.value
@@ -845,10 +947,10 @@ class ProductionEnvWithSecretRule(Rule):
                     snippet_masked=_make_masked_snippet(line),
                     is_blocking=self.is_blocking,
                     finding_type=self.finding_type,
-                    description=f"Production environment file contains potential secret: {key}=<REDACTED>",
+                    description="Production environment file contains hardcoded secret",
                     category="production_env",
                     secret_type="production_secret",
-                    message=f"Production env file contains potential secret in {key}",
+                    message="Production environment file contains hardcoded secret",
                     repair_template_key="use_env_var_production",
                 ))
         return findings

@@ -858,3 +858,133 @@ class TestAWSFallbackAndNameTightening:
         lines = [f'SECRET_DATABASE_ACCESS_KEY = {SYNTH_AWS_SECRET}']
         findings = rule.scan_content("config.py", lines)
         assert len(findings) == 0
+
+
+# ============================================================================
+# --- Unquoted compound key rule tests (3 tests) ---
+# ============================================================================
+
+class TestUnquotedCompoundKeyRules:
+    """Verify rules correctly handle hyphen/dot compound keys."""
+
+    def test_hyphen_api_key_produces_r007(self):
+        """my-api-key = "value" produces R007."""
+        rule = GenericTokenAssignmentRule()
+        lines = ['my-api-key = "hardcoded_value_123"']
+        findings = rule.scan_content("config.py", lines)
+        assert len(findings) == 1
+        assert findings[0].rule_id == "R007_GENERIC_TOKEN_ASSIGNMENT"
+        assert "hardcoded_value_123" not in findings[0].snippet_masked
+
+    def test_dot_api_key_produces_r007(self):
+        """openai.api.key = "value" produces R007."""
+        rule = GenericTokenAssignmentRule()
+        lines = ['openai.api.key = "hardcoded_value_456"']
+        findings = rule.scan_content("config.py", lines)
+        assert len(findings) == 1
+        assert findings[0].rule_id == "R007_GENERIC_TOKEN_ASSIGNMENT"
+
+    def test_dot_password_produces_r006(self):
+        """db.password = "value" produces R006."""
+        rule = PasswordAssignmentRule()
+        lines = ['db.password = "hardcoded_password_789"']
+        findings = rule.scan_content("config.py", lines)
+        assert len(findings) == 1
+        assert findings[0].rule_id == "R006_PASSWORD_ASSIGNMENT"
+
+
+# ============================================================================
+# --- Private key linear complexity tests (4 tests) ---
+# ============================================================================
+
+class TestPrivateKeyLinearComplexity:
+    """Verify private key scanning is O(n) — no quadratic behavior."""
+
+    def test_two_consecutive_complete_keys(self):
+        """Two consecutive complete private keys produce two Findings."""
+        rule = PrivateKeyRule()
+        lines = [
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "MIIEowIBAAKCAQEA" + "D" * 400,
+            "-----END RSA PRIVATE KEY-----",
+            "-----BEGIN EC PRIVATE KEY-----",
+            "MHcCAQEE" + "E" * 100,
+            "-----END EC PRIVATE KEY-----",
+        ]
+        findings = rule.scan_content("id_rsa", lines)
+        assert len(findings) == 2
+        # Both should be complete (not incomplete)
+        for f in findings:
+            assert "Incomplete" not in f.description
+            assert f.is_blocking is True
+
+    def test_many_begins_without_end_linear(self):
+        """Many BEGINs without END do NOT cause quadratic scanning.
+
+        Uses a CountingStr wrapper to verify that str.contains (via 'in')
+        is called at most a constant multiple of the number of lines.
+        """
+        call_count = 0
+
+        class CountingStr:
+            """Wrapper that counts 'in' (contains) operations."""
+            def __init__(self, s):
+                self._s = s
+            def __contains__(self, item):
+                nonlocal call_count
+                call_count += 1
+                return item in self._s
+            def __getattr__(self, name):
+                return getattr(self._s, name)
+
+        rule = PrivateKeyRule()
+        n = 500
+        lines = ["-----BEGIN RSA PRIVATE KEY-----"] * n
+        # Wrap each line to count contains calls
+        wrapped = [CountingStr(l) for l in lines]
+        findings = rule.scan_content("test_keys", wrapped)
+
+        # Should produce n findings (all incomplete)
+        assert len(findings) == n
+        # All should be blocking
+        for f in findings:
+            assert f.is_blocking is True
+            assert f.snippet_masked == "<PRIVATE_KEY_REDACTED>"
+        # contains calls should be O(n), not O(n²)
+        # With nested loops it would be ~n²/2. With linear it should be ~2n.
+        assert call_count <= n * 10, (
+            f"Expected O(n) contains calls, got {call_count} for {n} lines"
+        )
+
+    def test_missing_end_still_blocking(self):
+        """BEGIN without END still produces a blocking Finding."""
+        rule = PrivateKeyRule()
+        lines = [
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "MIIEowIBAAKCAQEA" + "D" * 400,
+            "# no end marker here",
+        ]
+        findings = rule.scan_content("broken_key", lines)
+        assert len(findings) == 1
+        f = findings[0]
+        assert f.is_blocking is True
+        assert f.snippet_masked == "<PRIVATE_KEY_REDACTED>"
+        assert "Incomplete" in f.description
+
+    def test_complete_key_body_not_in_output(self):
+        """Private key body content NEVER appears in any Finding field."""
+        rule = PrivateKeyRule()
+        body_content = "MIIEowIBAAKCAQEA" + "D" * 400
+        lines = [
+            "-----BEGIN RSA PRIVATE KEY-----",
+            body_content,
+            "-----END RSA PRIVATE KEY-----",
+        ]
+        findings = rule.scan_content("id_rsa", lines)
+        assert len(findings) == 1
+        f = findings[0]
+        # Body must not appear in any field
+        assert body_content not in f.snippet_masked
+        assert body_content not in f.description
+        assert body_content not in f.message
+        assert body_content not in repr(f)
