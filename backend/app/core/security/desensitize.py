@@ -76,6 +76,7 @@ class Assignment:
     value_end: int         # 0-based end of value content (before closing quote)
     value: str             # parsed value content (escapes processed)
     is_quoted: bool        # whether the value was quoted
+    operator: str          # assignment operator used: "=" or ":"
 
 
 # ---------------------------------------------------------------------------
@@ -312,19 +313,15 @@ def _normalize_key(key: str) -> str:
     return "_".join(_normalize_key_segments(key))
 
 
-def _is_aws_secret_key(segments: list[str]) -> bool:
-    """Check if segments match AWS secret key patterns.
-
-    Matches:
-    - AWS_SECRET, AWS_SECRET_ACCESS_KEY  (has AWS + SECRET)
-    - SECRET_ACCESS_KEY                  (has SECRET + ACCESS + KEY)
-    """
-    seg_set = set(segments)
-    if "AWS" in seg_set and "SECRET" in seg_set:
-        return True
-    if "SECRET" in seg_set and "ACCESS" in seg_set and "KEY" in seg_set:
-        return True
-    return False
+# Exact normalized names for AWS secret keys (R003).
+# Only these complete names trigger CATEGORY_AWS_SECRET — NOT broad
+# segment-set matching, which caused false positives on names like
+# AWS_CLIENT_SECRET, MY_SECRET_ACCESS_KEY_BACKUP, etc.
+_AWS_SECRET_KEY_NAMES: frozenset[str] = frozenset({
+    "AWS_SECRET_ACCESS_KEY",
+    "SECRET_ACCESS_KEY",
+    "AWS_SECRET",
+})
 
 
 def classify_key(key: str) -> str | None:
@@ -346,19 +343,26 @@ def classify_key(key: str) -> str | None:
         SECRET, JWT_SECRET, CLIENT_SECRET, TOKEN, ACCESS_TOKEN,
         GITHUB_TOKEN, API_KEY, MY_API_KEY, OPENAI_API_KEY
 
-    Matches (R003 / aws_secret):
+    Matches (R003 / aws_secret — EXACT normalized name only):
         AWS_SECRET_ACCESS_KEY, SECRET_ACCESS_KEY, AWS_SECRET
 
     Does NOT match (returns None):
         SECRETARY_EMAIL, TOKENIZER_MODEL, PASSWORDLESS_MODE,
         API_KEYBOARD_LAYOUT, ACCESS_TOKENIZER
+
+    Does NOT produce CATEGORY_AWS_SECRET (but may produce CATEGORY_SECRET):
+        AWS_CLIENT_SECRET, MY_SECRET_ACCESS_KEY_BACKUP,
+        SECRET_DATABASE_ACCESS_KEY
     """
     segments = _normalize_key_segments(key)
     if not segments:
         return None
+    key_normalized = "_".join(segments)
 
-    # AWS secret (highest priority)
-    if _is_aws_secret_key(segments):
+    # AWS secret (highest priority) — exact normalized name match ONLY.
+    # No broad segment-set matching to avoid false positives on names
+    # like AWS_CLIENT_SECRET or SECRET_DATABASE_ACCESS_KEY.
+    if key_normalized in _AWS_SECRET_KEY_NAMES:
         return CATEGORY_AWS_SECRET
 
     # Password
@@ -382,17 +386,22 @@ def classify_key(key: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 def parse_assignment_value(
-    line: str, key_end: int,
-) -> tuple[int, int, str, bool] | None:
+    line: str, key_end: int, is_quoted_key: bool = False,
+) -> tuple[int, int, str, bool, str] | None:
     """Parse an assignment value starting after a key-name match.
 
     This is the SINGLE shared parser used by PasswordAssignmentRule,
     GenericTokenAssignmentRule, AWSSecretKeyRule, ProductionEnvWithSecretRule,
     and mask_snippet. No rule or function may duplicate this logic.
 
-    Starting from ``key_end``, finds the assignment operator (``=`` or
-    ``:``) -- skipping whitespace and optional closing quote of a quoted
-    key (JSON/TOML style: "key": value, 'key': value, "key" = value).
+    Starting from ``key_end``, finds the assignment operator — strictly
+    distinguishing real assignments from comparison/walrus/arrow operators:
+
+    - **Unquoted keys**: only single ``=`` is accepted. ``==``, ``=>``,
+      ``!=``, ``>=``, ``<=``, ``:=`` are ALL rejected.
+    - **Quoted keys** (JSON/TOML style): ``=`` or ``:`` is accepted.
+      ``:=`` is still rejected. Colon is NOT accepted for unquoted keys
+      (so ``password: str`` is not treated as an assignment).
 
     Then parses the value which may be:
 
@@ -402,26 +411,32 @@ def parse_assignment_value(
       Supports backslash escape characters in unquoted values.
 
     Args:
-        line:    The full line of text.
-        key_end: Position in ``line`` right after the key name.
+        line:          The full line of text.
+        key_end:       Position in ``line`` right after the key name.
+        is_quoted_key: Whether the key was quoted (JSON/TOML style).
+                       Only quoted keys may use ``:`` as operator.
 
     Returns:
-        ``(value_start, value_end, value_content, is_quoted)`` or ``None``.
+        ``(value_start, value_end, value_content, is_quoted, operator)``
+        or ``None``.
 
         - ``value_start``: 0-based start of value content (after opening quote)
         - ``value_end``:   0-based end of value content (before closing quote)
         - ``value_content``: the value with escape characters processed
           (quotes stripped)
         - ``is_quoted``: True if the value was quoted, False if unquoted
+        - ``operator``: the assignment operator (``"="`` or ``":"``)
 
         If no assignment operator or no value is found, returns ``None``.
     """
     i = key_end
 
-    # --- Find assignment operator (= or :) skipping whitespace ---
+    # --- Find assignment operator, strictly distinguishing from ==
+    # !=, >=, <=, :=, => ---
     # Also skip a closing quote if the key was quoted (JSON/TOML style:
     # "key": value, 'key' = value, "key" = "value").
     found_op = False
+    operator = ""
     while i < len(line):
         ch = line[i]
         if ch.isspace():
@@ -429,12 +444,30 @@ def parse_assignment_value(
         elif ch in ('"', "'"):
             # Skip closing quote of a quoted key (JSON/TOML)
             i += 1
-        elif ch in "=:":
+        elif ch == "=":
+            # Reject == and => (comparison / arrow)
+            if i + 1 < len(line) and line[i + 1] in "=>":
+                return None
             found_op = True
+            operator = "="
+            i += 1
+            break
+        elif ch == ":":
+            # Colon only allowed for quoted keys (JSON/TOML style).
+            # Unquoted "password: str" must NOT be treated as assignment.
+            if not is_quoted_key:
+                return None
+            # Reject := (walrus operator)
+            if i + 1 < len(line) and line[i + 1] == "=":
+                return None
+            found_op = True
+            operator = ":"
             i += 1
             break
         else:
-            # Non-space, non-quote, non-operator -- not an assignment
+            # Non-space, non-quote, non-operator -- not an assignment.
+            # This rejects != (starts with !), >= (starts with >),
+            # <= (starts with <), and any other non-operator prefix.
             return None
 
     if not found_op:
@@ -460,12 +493,12 @@ def parse_assignment_value(
                 j += 2
             elif line[j] == quote_char:
                 # Closing quote found
-                return (value_start, j, "".join(content_chars), True)
+                return (value_start, j, "".join(content_chars), True, operator)
             else:
                 content_chars.append(line[j])
                 j += 1
         # Unterminated quote -- take everything to end of line
-        return (value_start, len(line), "".join(content_chars), True)
+        return (value_start, len(line), "".join(content_chars), True, operator)
 
     # --- Unquoted value ---
     # Stops at whitespace ONLY. Does NOT stop at # — a # without preceding
@@ -487,7 +520,7 @@ def parse_assignment_value(
     value_content = "".join(content_chars)
     if not value_content:
         return None
-    return (value_start, value_end, value_content, False)
+    return (value_start, value_end, value_content, False, operator)
 
 
 # ---------------------------------------------------------------------------
@@ -535,6 +568,7 @@ def iter_assignments(line: str) -> Iterator[Assignment]:
         # --- Try to match a key at position i ---
         key_raw: str | None = None
         key_end = i
+        is_quoted_key = False
 
         if line[i] == '"' or line[i] == "'":
             # Quoted key (JSON/TOML style)
@@ -557,21 +591,23 @@ def iter_assignments(line: str) -> Iterator[Assignment]:
                 i += 1
                 continue
             key_end = j  # position AFTER closing quote
+            is_quoted_key = True
         else:
             # Unquoted identifier
             m = _IDENTIFIER.match(line, i)
             if m:
                 key_raw = m.group()
                 key_end = m.end()
+                is_quoted_key = False
             else:
                 # Not a key start — advance one character
                 i += 1
                 continue
 
         # --- Try to find assignment operator and value ---
-        result = parse_assignment_value(line, key_end)
+        result = parse_assignment_value(line, key_end, is_quoted_key=is_quoted_key)
         if result is not None:
-            value_start, value_end, value, is_quoted = result
+            value_start, value_end, value, is_quoted, operator = result
             yield Assignment(
                 key_raw=key_raw,
                 key_normalized=_normalize_key(key_raw),
@@ -579,6 +615,7 @@ def iter_assignments(line: str) -> Iterator[Assignment]:
                 value_end=value_end,
                 value=value,
                 is_quoted=is_quoted,
+                operator=operator,
             )
             # Advance past the value.
             # For quoted values, value_end is at the closing quote position;
@@ -663,10 +700,12 @@ def mask_snippet(line_text: str) -> str:
         value = assignment.value
         if not value:
             continue
-        # Skip env var references (only unquoted ones)
-        if is_env_reference(value, assignment.is_quoted):
-            continue
-        # Skip already-masked values (strict complete-value check)
+        # mask_snippet is a DISPLAY SAFETY layer — it masks ALL sensitive
+        # key assignments, including environment variable references.
+        # Rules may skip env references (no Finding generated), but
+        # mask_snippet must still mask them to prevent any raw value
+        # from appearing in snippet output.
+        # Only EXACT canonical already-masked values are skipped.
         if is_already_masked(value):
             continue
         masked = mask_secret(value, GENERIC)

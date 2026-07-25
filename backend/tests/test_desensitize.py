@@ -262,48 +262,53 @@ class TestParseAssignmentValue:
         line = "password=alpha#omega"
         result = parse_assignment_value(line, 8)
         assert result is not None
-        value_start, value_end, value, is_quoted = result
+        value_start, value_end, value, is_quoted, operator = result
         assert value == "alpha#omega"
         assert is_quoted is False
+        assert operator == "="
 
     def test_unquoted_value_with_hash_token(self):
         """Unquoted token value with # is NOT split."""
         line = "token=abc#def"
         result = parse_assignment_value(line, 5)
         assert result is not None
-        value_start, value_end, value, is_quoted = result
+        value_start, value_end, value, is_quoted, operator = result
         assert value == "abc#def"
         assert is_quoted is False
+        assert operator == "="
 
     def test_json_double_quoted_key(self):
-        """JSON-style "key": "value" is parsed correctly."""
+        """JSON-style "key": "value" is parsed correctly with colon operator."""
         line = '"password": "alpha beta gamma"'
-        # Key "password" starts at pos 1, ends at pos 9
-        result = parse_assignment_value(line, 9)
+        # Key "password" starts at pos 1, ends at pos 9 (closing quote)
+        result = parse_assignment_value(line, 9, is_quoted_key=True)
         assert result is not None
-        value_start, value_end, value, is_quoted = result
+        value_start, value_end, value, is_quoted, operator = result
         assert value == "alpha beta gamma"
         assert is_quoted is True
+        assert operator == ":"
 
     def test_toml_single_quoted_key(self):
-        """TOML-style 'key': 'value' is parsed correctly."""
+        """TOML-style 'key': 'value' is parsed correctly with colon operator."""
         line = "'token': 'abc def ghi'"
-        # Key 'token' starts at pos 1, ends at pos 6
-        result = parse_assignment_value(line, 6)
+        # Key 'token' starts at pos 1, ends at pos 6 (closing quote)
+        result = parse_assignment_value(line, 6, is_quoted_key=True)
         assert result is not None
-        value_start, value_end, value, is_quoted = result
+        value_start, value_end, value, is_quoted, operator = result
         assert value == "abc def ghi"
         assert is_quoted is True
+        assert operator == ":"
 
     def test_quoted_key_with_equals(self):
         """Quoted key with = operator: "api_key" = "some value"."""
         line = '"api_key" = "some value"'
-        # Key "api_key" starts at pos 1, ends at pos 8
-        result = parse_assignment_value(line, 8)
+        # Key "api_key" starts at pos 1, ends at pos 8 (closing quote)
+        result = parse_assignment_value(line, 8, is_quoted_key=True)
         assert result is not None
-        value_start, value_end, value, is_quoted = result
+        value_start, value_end, value, is_quoted, operator = result
         assert value == "some value"
         assert is_quoted is True
+        assert operator == "="
 
 
 # ============================================================================
@@ -541,3 +546,211 @@ class TestIterAssignmentsCompound:
         assignments = list(iter_assignments(line))
         assert len(assignments) == 1
         assert assignments[0].key_normalized == "DB_PASSWORD"
+
+
+# ============================================================================
+# --- Operator distinction tests (parse_assignment_value) ---
+# ============================================================================
+
+class TestOperatorDistinction:
+    """Verify parse_assignment_value strictly distinguishes assignment operators
+    from comparison, walrus, and arrow operators."""
+
+    def test_unquoted_single_equals_accepted(self):
+        """password = "value" -- single = is accepted for unquoted key."""
+        line = 'password = "hardcoded value"'
+        result = parse_assignment_value(line, 8, is_quoted_key=False)
+        assert result is not None
+        _, _, value, _, operator = result
+        assert value == "hardcoded value"
+        assert operator == "="
+
+    def test_unquoted_no_space_equals_accepted(self):
+        """password="value" -- single = without space is accepted."""
+        line = 'password="hardcoded value"'
+        result = parse_assignment_value(line, 8, is_quoted_key=False)
+        assert result is not None
+        _, _, value, _, operator = result
+        assert value == "hardcoded value"
+        assert operator == "="
+
+    def test_double_equals_rejected(self):
+        """password == "admin" -- == is rejected (comparison)."""
+        line = 'password == "admin"'
+        result = parse_assignment_value(line, 8, is_quoted_key=False)
+        assert result is None
+
+    def test_not_equal_rejected(self):
+        """password != "admin" -- != is rejected (starts with !)."""
+        line = 'password != "admin"'
+        result = parse_assignment_value(line, 8, is_quoted_key=False)
+        assert result is None
+
+    def test_greater_equal_rejected(self):
+        """password >= "admin" -- >= is rejected (starts with >)."""
+        line = 'password >= "admin"'
+        result = parse_assignment_value(line, 8, is_quoted_key=False)
+        assert result is None
+
+    def test_less_equal_rejected(self):
+        """password <= "admin" -- <= is rejected (starts with <)."""
+        line = 'password <= "admin"'
+        result = parse_assignment_value(line, 8, is_quoted_key=False)
+        assert result is None
+
+    def test_walrus_operator_rejected_unquoted(self):
+        """password := get_password() -- := rejected for unquoted key."""
+        line = 'password := get_password()'
+        result = parse_assignment_value(line, 8, is_quoted_key=False)
+        assert result is None
+
+    def test_walrus_operator_rejected_quoted(self):
+        """'password' := get_password() -- := rejected even for quoted key."""
+        line = "'password' := get_password()"
+        result = parse_assignment_value(line, 10, is_quoted_key=True)
+        assert result is None
+
+    def test_arrow_operator_rejected(self):
+        """password => "value" -- => is rejected (arrow)."""
+        line = 'password => "value"'
+        result = parse_assignment_value(line, 8, is_quoted_key=False)
+        assert result is None
+
+    def test_unquoted_colon_rejected(self):
+        """password: str -- colon rejected for unquoted key (type annotation)."""
+        line = 'password: str'
+        result = parse_assignment_value(line, 8, is_quoted_key=False)
+        assert result is None
+
+    def test_quoted_colon_accepted(self):
+        """'password': 'value' -- colon accepted for quoted key (TOML)."""
+        line = "'password': 'hardcoded value'"
+        result = parse_assignment_value(line, 10, is_quoted_key=True)
+        assert result is not None
+        _, _, value, _, operator = result
+        assert value == "hardcoded value"
+        assert operator == ":"
+
+    def test_quoted_double_colon_accepted(self):
+        """"password": "value" -- colon accepted for quoted key (JSON)."""
+        line = '"password": "hardcoded value"'
+        result = parse_assignment_value(line, 10, is_quoted_key=True)
+        assert result is not None
+        _, _, value, _, operator = result
+        assert value == "hardcoded value"
+        assert operator == ":"
+
+
+# ============================================================================
+# --- Operator distinction via iter_assignments (end-to-end) ---
+# ============================================================================
+
+class TestIterAssignmentsOperatorRejection:
+    """Verify iter_assignments does not yield assignments for non-assignment syntax."""
+
+    def test_password_colon_str_no_assignment(self):
+        """password: str produces NO assignment (type annotation)."""
+        assignments = list(iter_assignments("password: str"))
+        assert len(assignments) == 0
+
+    def test_token_colon_optional_no_assignment(self):
+        """token: Optional[str] produces NO assignment."""
+        assignments = list(iter_assignments("token: Optional[str]"))
+        assert len(assignments) == 0
+
+    def test_def_login_password_colon_str_no_assignment(self):
+        """def login(password: str): produces NO assignment."""
+        assignments = list(iter_assignments("def login(password: str):"))
+        assert len(assignments) == 0
+
+    def test_double_equals_no_assignment(self):
+        """password == "admin" produces NO assignment (comparison)."""
+        assignments = list(iter_assignments('password == "admin"'))
+        assert len(assignments) == 0
+
+    def test_walrus_no_assignment(self):
+        """password := get_password() produces NO assignment."""
+        assignments = list(iter_assignments("password := get_password()"))
+        assert len(assignments) == 0
+
+    def test_quoted_colon_produces_assignment(self):
+        """"password": "hardcoded value" produces one assignment."""
+        assignments = list(iter_assignments('"password": "hardcoded value"'))
+        assert len(assignments) == 1
+        assert assignments[0].key_raw == "password"
+        assert assignments[0].value == "hardcoded value"
+        assert assignments[0].operator == ":"
+
+    def test_quoted_single_colon_produces_assignment(self):
+        """'api_key': 'hardcoded value' produces one assignment."""
+        assignments = list(iter_assignments("'api_key': 'hardcoded value'"))
+        assert len(assignments) == 1
+        assert assignments[0].key_raw == "api_key"
+        assert assignments[0].value == "hardcoded value"
+        assert assignments[0].operator == ":"
+
+    def test_unquoted_equals_produces_assignment(self):
+        """password="hardcoded value" produces one assignment."""
+        assignments = list(iter_assignments('password="hardcoded value"'))
+        assert len(assignments) == 1
+        assert assignments[0].key_raw == "password"
+        assert assignments[0].value == "hardcoded value"
+        assert assignments[0].operator == "="
+
+
+# ============================================================================
+# --- AWS name tightening tests (classify_key) ---
+# ============================================================================
+
+class TestAWSNameTightening:
+    """Verify classify_key uses exact normalized names for AWS, not broad sets."""
+
+    def test_aws_client_secret_not_aws_category(self):
+        """AWS_CLIENT_SECRET is NOT CATEGORY_AWS_SECRET (may be SECRET)."""
+        assert classify_key("AWS_CLIENT_SECRET") != CATEGORY_AWS_SECRET
+
+    def test_my_secret_access_key_backup_not_aws_category(self):
+        """MY_SECRET_ACCESS_KEY_BACKUP is NOT CATEGORY_AWS_SECRET."""
+        assert classify_key("MY_SECRET_ACCESS_KEY_BACKUP") != CATEGORY_AWS_SECRET
+
+    def test_secret_database_access_key_not_aws_category(self):
+        """SECRET_DATABASE_ACCESS_KEY is NOT CATEGORY_AWS_SECRET."""
+        assert classify_key("SECRET_DATABASE_ACCESS_KEY") != CATEGORY_AWS_SECRET
+
+    def test_aws_secret_access_key_exact_match(self):
+        """AWS_SECRET_ACCESS_KEY IS CATEGORY_AWS_SECRET (exact match)."""
+        assert classify_key("AWS_SECRET_ACCESS_KEY") == CATEGORY_AWS_SECRET
+
+    def test_secret_access_key_exact_match(self):
+        """SECRET_ACCESS_KEY IS CATEGORY_AWS_SECRET (exact match)."""
+        assert classify_key("SECRET_ACCESS_KEY") == CATEGORY_AWS_SECRET
+
+    def test_aws_secret_exact_match(self):
+        """AWS_SECRET IS CATEGORY_AWS_SECRET (exact match)."""
+        assert classify_key("AWS_SECRET") == CATEGORY_AWS_SECRET
+
+
+# ============================================================================
+# --- mask_snippet conservative masking (env ref still masked) ---
+# ============================================================================
+
+class TestMaskSnippetConservativeEnvRef:
+    """Verify mask_snippet masks env references for sensitive keys (display safety)."""
+
+    def test_github_token_and_password_env_ref_both_masked(self):
+        """GITHUB_TOKEN='<token>' password=${DB_PASSWORD} -- both masked."""
+        line = f'GITHUB_TOKEN="{SYNTH_GITHUB_TOKEN}" password=${{DB_PASSWORD}}'
+        result = mask_snippet(line)
+        # Token must not appear
+        assert SYNTH_GITHUB_TOKEN not in result
+        # Env ref must also not appear (masked by display safety layer)
+        assert "${DB_PASSWORD}" not in result
+        assert "DB_PASSWORD" not in result
+
+    def test_password_env_ref_masked_in_snippet(self):
+        """password=${DB_PASSWORD} -- value masked even though it's an env ref."""
+        line = "password=${DB_PASSWORD}"
+        result = mask_snippet(line)
+        assert "${DB_PASSWORD}" not in result
+        assert "DB_PASSWORD" not in result
+        assert "<REDACTED>" in result

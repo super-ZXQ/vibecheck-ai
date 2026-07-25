@@ -716,3 +716,145 @@ class TestCompoundKeyRegression:
             lines = ['ACCESS_TOKENIZER = "bert-base"']
             findings = rule.scan_content("config.py", lines)
             assert len(findings) == 0, f"{rule_class.__name__} false positive on ACCESS_TOKENIZER"
+
+
+# ============================================================================
+# --- Operator distinction rule-level tests ---
+# ============================================================================
+
+class TestOperatorDistinctionRules:
+    """Verify rules do not produce findings for non-assignment syntax."""
+
+    def test_password_colon_str_no_finding(self):
+        """password: str does not produce R006 (type annotation, not assignment)."""
+        rule = PasswordAssignmentRule()
+        lines = ["password: str"]
+        findings = rule.scan_content("config.py", lines)
+        assert len(findings) == 0
+
+    def test_token_colon_optional_no_finding(self):
+        """token: Optional[str] does not produce R007."""
+        rule = GenericTokenAssignmentRule()
+        lines = ["token: Optional[str]"]
+        findings = rule.scan_content("config.py", lines)
+        assert len(findings) == 0
+
+    def test_def_login_password_colon_str_no_finding(self):
+        """def login(password: str): does not produce any finding."""
+        rule = PasswordAssignmentRule()
+        lines = ["def login(password: str):"]
+        findings = rule.scan_content("config.py", lines)
+        assert len(findings) == 0
+
+    def test_double_equals_no_finding(self):
+        """password == "admin" does not produce R006 (comparison)."""
+        rule = PasswordAssignmentRule()
+        lines = ['password == "admin"']
+        findings = rule.scan_content("config.py", lines)
+        assert len(findings) == 0
+
+    def test_walrus_operator_no_finding(self):
+        """password := get_password() does not produce R006 (walrus)."""
+        rule = PasswordAssignmentRule()
+        lines = ["password := get_password()"]
+        findings = rule.scan_content("config.py", lines)
+        assert len(findings) == 0
+
+    def test_quoted_colon_password_produces_r006(self):
+        """"password": "hardcoded value" produces R006 (JSON assignment)."""
+        rule = PasswordAssignmentRule()
+        lines = ['"password": "hardcoded value"']
+        findings = rule.scan_content("config.json", lines)
+        assert len(findings) == 1
+        assert findings[0].rule_id == "R006_PASSWORD_ASSIGNMENT"
+        assert "hardcoded value" not in findings[0].snippet_masked
+
+    def test_quoted_colon_api_key_produces_r007(self):
+        """'api_key': 'hardcoded value' produces R007 (TOML assignment)."""
+        rule = GenericTokenAssignmentRule()
+        lines = ["'api_key': 'hardcoded value'"]
+        findings = rule.scan_content("config.toml", lines)
+        assert len(findings) == 1
+        assert findings[0].rule_id == "R007_GENERIC_TOKEN_ASSIGNMENT"
+        assert "hardcoded value" not in findings[0].snippet_masked
+
+    def test_unquoted_equals_password_produces_r006(self):
+        """password="hardcoded value" produces R006 (normal assignment)."""
+        rule = PasswordAssignmentRule()
+        lines = ['password="hardcoded value"']
+        findings = rule.scan_content("config.py", lines)
+        assert len(findings) == 1
+        assert findings[0].rule_id == "R006_PASSWORD_ASSIGNMENT"
+        assert "hardcoded value" not in findings[0].snippet_masked
+
+
+# ============================================================================
+# --- AWS fallback and name tightening tests ---
+# ============================================================================
+
+class TestAWSFallbackAndNameTightening:
+    """Verify R003 strict format, R007 fallback, and AWS name tightening."""
+
+    def test_aws_secret_short_value_produces_r007(self):
+        """AWS_SECRET_ACCESS_KEY=short-hardcoded-secret produces R007 (not R003)."""
+        r003 = AWSSecretKeyRule()
+        r007 = GenericTokenAssignmentRule()
+        lines = ['AWS_SECRET_ACCESS_KEY = "short-hardcoded-secret"']
+
+        # R003 must NOT fire (value is not 40-char base64)
+        r003_findings = r003.scan_content("config.py", lines)
+        assert len(r003_findings) == 0
+
+        # R007 MUST fire (fallback for non-strict AWS secret value)
+        r007_findings = r007.scan_content("config.py", lines)
+        assert len(r007_findings) == 1
+        assert r007_findings[0].rule_id == "R007_GENERIC_TOKEN_ASSIGNMENT"
+        assert r007_findings[0].is_blocking is False
+        assert "short-hardcoded-secret" not in r007_findings[0].snippet_masked
+
+    def test_aws_secret_strict_format_only_r003(self):
+        """AWS_SECRET_ACCESS_KEY=<40-char> -- R003 fires, R007 skips."""
+        r003 = AWSSecretKeyRule()
+        r007 = GenericTokenAssignmentRule()
+        lines = [f'AWS_SECRET_ACCESS_KEY = {SYNTH_AWS_SECRET}']
+
+        # R003 MUST fire (strict format)
+        r003_findings = r003.scan_content("config.py", lines)
+        assert len(r003_findings) == 1
+        assert r003_findings[0].rule_id == "R003_AWS_SECRET_KEY"
+        assert r003_findings[0].is_blocking is True
+
+        # R007 must NOT fire (value meets R003 strict format, R007 skips)
+        r007_findings = r007.scan_content("config.py", lines)
+        assert len(r007_findings) == 0
+
+    def test_aws_secret_env_ref_no_hardcoded_finding(self):
+        """AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY} -- no hardcoded finding."""
+        r003 = AWSSecretKeyRule()
+        r007 = GenericTokenAssignmentRule()
+        lines = ["AWS_SECRET_ACCESS_KEY = ${AWS_SECRET_ACCESS_KEY}"]
+
+        # Neither R003 nor R007 should fire (env reference)
+        assert len(r003.scan_content("config.py", lines)) == 0
+        assert len(r007.scan_content("config.py", lines)) == 0
+
+    def test_aws_client_secret_no_r003(self):
+        """AWS_CLIENT_SECRET does NOT produce R003 (not exact AWS name)."""
+        rule = AWSSecretKeyRule()
+        lines = [f'AWS_CLIENT_SECRET = {SYNTH_AWS_SECRET}']
+        findings = rule.scan_content("config.py", lines)
+        assert len(findings) == 0
+
+    def test_my_secret_access_key_backup_no_r003(self):
+        """MY_SECRET_ACCESS_KEY_BACKUP does NOT produce R003."""
+        rule = AWSSecretKeyRule()
+        lines = [f'MY_SECRET_ACCESS_KEY_BACKUP = {SYNTH_AWS_SECRET}']
+        findings = rule.scan_content("config.py", lines)
+        assert len(findings) == 0
+
+    def test_secret_database_access_key_no_r003(self):
+        """SECRET_DATABASE_ACCESS_KEY does NOT produce R003."""
+        rule = AWSSecretKeyRule()
+        lines = [f'SECRET_DATABASE_ACCESS_KEY = {SYNTH_AWS_SECRET}']
+        findings = rule.scan_content("config.py", lines)
+        assert len(findings) == 0

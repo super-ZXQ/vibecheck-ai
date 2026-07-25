@@ -528,9 +528,19 @@ class GenericTokenAssignmentRule(Rule):
     """Detect generic token/secret assignments using unified assignment parsing.
 
     Uses iter_assignments() to find ALL key=value assignments, then
-    classify_key() to filter for secret-category keys (SECRET, JWT_SECRET,
-    CLIENT_SECRET, TOKEN, ACCESS_TOKEN, GITHUB_TOKEN, API_KEY,
-    MY_API_KEY, OPENAI_API_KEY, etc.).
+    classify_key() to filter for sensitive keys.
+
+    Handles TWO categories:
+    1. CATEGORY_SECRET — standard secret/token keys (SECRET, JWT_SECRET,
+       TOKEN, ACCESS_TOKEN, GITHUB_TOKEN, API_KEY, etc.)
+    2. CATEGORY_AWS_SECRET — AWS secret key names (AWS_SECRET_ACCESS_KEY,
+       SECRET_ACCESS_KEY, AWS_SECRET) when the value does NOT meet R003's
+       strict 40-char base64 format. This provides a non-blocking fallback
+       so short or non-standard AWS secret values are still detected.
+
+    When the value DOES meet R003's strict format, R007 skips it — R003
+    (higher priority, blocking) will catch it. The scanner's dedup logic
+    ensures no duplicate findings on the same line/column.
 
     False positive control:
     - Env var references are skipped.
@@ -549,12 +559,28 @@ class GenericTokenAssignmentRule(Rule):
     is_blocking = False
     finding_type = FindingType.CONTENT
 
+    # R003 strict format: 40-char base64-like string
+    _AWS_STRICT_FORMAT = re.compile(r"[A-Za-z0-9/+]{40}")
+
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
         findings: list[Finding] = []
         for i, line in enumerate(lines):
             for assignment in iter_assignments(line):
-                if classify_key(assignment.key_raw) != CATEGORY_SECRET:
+                category = classify_key(assignment.key_raw)
+
+                # Only handle SECRET and AWS_SECRET categories
+                if category == CATEGORY_SECRET:
+                    pass  # Standard secret processing below
+                elif category == CATEGORY_AWS_SECRET:
+                    # Skip if value meets R003 strict format — R003 will
+                    # catch it with higher priority and blocking status.
+                    if self._AWS_STRICT_FORMAT.fullmatch(assignment.value):
+                        continue
+                    # Otherwise, fall through to generate a non-blocking
+                    # generic finding (AWS secret with non-standard value).
+                else:
                     continue
+
                 value = assignment.value
                 if not value:
                     continue
@@ -572,6 +598,16 @@ class GenericTokenAssignmentRule(Rule):
                     confidence = self.confidence
                     blocking = self.is_blocking
 
+                # Use appropriate description based on category
+                if category == CATEGORY_AWS_SECRET:
+                    description = "AWS secret key with non-standard value detected"
+                    secret_type = "aws_secret_key_generic"
+                    repair_template_key = "rotate_aws_credentials"
+                else:
+                    description = "Hardcoded secret/token assignment detected"
+                    secret_type = "generic_token"
+                    repair_template_key = "use_env_var_secret"
+
                 findings.append(Finding(
                     rule_id=self.rule_id,
                     rule_name=self.rule_name,
@@ -585,11 +621,11 @@ class GenericTokenAssignmentRule(Rule):
                     snippet_masked=_make_masked_snippet(line),
                     is_blocking=blocking,
                     finding_type=self.finding_type,
-                    description="Hardcoded secret/token assignment detected",
+                    description=description,
                     category="secret",
-                    secret_type="generic_token",
-                    message="Hardcoded secret/token assignment detected",
-                    repair_template_key="use_env_var_secret",
+                    secret_type=secret_type,
+                    message=description,
+                    repair_template_key=repair_template_key,
                 ))
         return findings
 
