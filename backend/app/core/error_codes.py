@@ -29,6 +29,7 @@ QUEUE_FULL = "QUEUE_FULL"
 # --- Scan errors (P0-5) ---
 SCAN_INTERNAL_ERROR = "SCAN_INTERNAL_ERROR"
 SCAN_RESULT_PERSIST_FAILED = "SCAN_RESULT_PERSIST_FAILED"
+SCAN_RESULT_NOT_READY = "SCAN_RESULT_NOT_READY"
 
 # --- Service lifecycle ---
 SERVICE_RESTARTED = "SERVICE_RESTARTED"
@@ -52,6 +53,7 @@ _ERROR_MESSAGES = {
     QUEUE_FULL: "检测队列已满，请稍后重试。",
     SCAN_INTERNAL_ERROR: "扫描过程中发生内部错误，请稍后重试。",
     SCAN_RESULT_PERSIST_FAILED: "扫描结果保存失败，请稍后重试。",
+    SCAN_RESULT_NOT_READY: "扫描结果尚未生成，请稍后重试。",
     SERVICE_RESTARTED: "服务在任务执行期间重启，请重新提交检测。",
     INTERNAL_ERROR: "内部错误，请稍后重试。",
 }
