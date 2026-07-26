@@ -4,6 +4,7 @@ Sensitive values (GitHub Token, LLM API Key) are read from environment variables
 and NEVER hardcoded. This module is the single source of truth for all limits.
 """
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -25,7 +26,41 @@ class Settings(BaseSettings):
     # --- Scan limits ---
     scan_timeout: int = 120  # seconds
     scan_concurrency: int = 1  # single worker, low concurrency
-    max_line_read: int = 5000  # only read first N lines per file
+    # No line limit: files under scan_max_file_size are scanned in full.
+    # Removing max_line_read prevents missing secrets in later lines.
+    scan_max_file_size: int = 1024 * 1024  # 1 MB — skip files larger than this
+    # Safety bound: each rule may return at most this many Findings per
+    # file. Prevents result amplification from files containing thousands
+    # of format-correct tokens. When the limit is reached the rule stops
+    # building Findings but never returns raw secret content.
+    scan_max_findings_per_rule_per_file: int = 100
+
+    @field_validator("scan_max_findings_per_rule_per_file")
+    @classmethod
+    def enforce_min_findings_limit(cls, v: int) -> int:
+        """Ensure the per-rule finding limit is at least 1.
+
+        A limit of 0 would silently disable ALL detection for every rule,
+        which is never the intended configuration. Clamp to 1 so at least
+        one finding per rule per file is always retained.
+        """
+        return max(1, v)
+
+    scan_ignore_dirs: list[str] = [
+        "node_modules", ".next", "dist", "build", "coverage",
+        "__pycache__", ".git", "vendor", ".venv", "venv",
+        ".pytest_cache", ".mypy_cache", ".idea", ".vscode",
+    ]
+    scan_binary_extensions: list[str] = [
+        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp",
+        ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar",
+        ".exe", ".dll", ".so", ".dylib", ".o", ".a", ".lib",
+        ".pyc", ".pyo", ".class", ".jar", ".war",
+        ".pdf", ".doc", ".docx", ".xls", ".xlsx",
+        ".mp3", ".mp4", ".avi", ".mov", ".mkv", ".wav", ".flv",
+        ".ttf", ".otf", ".woff", ".woff2", ".eot",
+        ".sqlite", ".db", ".db3", ".s3db",
+    ]
 
     # --- LLM ---
     llm_timeout: int = 30  # seconds
