@@ -198,7 +198,12 @@ async def get_check_status(task_id: str):
             },
         )
 
-    return TaskStatusResponse(**task.to_response())
+    # to_response() calls get_scan_summary which does synchronous DB
+    # access. Wrap in asyncio.to_thread so the event loop is not blocked
+    # by SQLite reads (summary_json is lightweight, but the DB call
+    # itself should still not run in the event loop thread).
+    response_data = await asyncio.to_thread(task.to_response)
+    return TaskStatusResponse(**response_data)
 
 
 @router.get("/api/check/{task_id}/result")
@@ -251,8 +256,11 @@ async def get_check_result(task_id: str):
             },
         )
 
-    # Try to get the persisted scan result
-    result = get_scan_result(task_id)
+    # Try to get the persisted scan result.
+    # get_scan_result reads up to 8 MB of result_json and parses it.
+    # Run in a thread via asyncio.to_thread so the event loop stays
+    # responsive during the SQLite read and JSON parse.
+    result = await asyncio.to_thread(get_scan_result, task_id)
 
     # --- Case 3: completed, result exists ---
     if result is not None:

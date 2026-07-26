@@ -91,11 +91,15 @@ def init_db() -> None:
             # --- scan_results: one persisted snapshot per task (P0-5) ---
             # result_json contains ONLY desensitized public models from P0-4.
             # Never stores raw secrets, absolute paths, or internal objects.
+            # summary_json (P0-5 review): lightweight summary extracted from
+            # result_json, stored separately so status polling never needs to
+            # load or parse the full (up to 8 MB) result_json.
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS scan_results (
                     task_id TEXT PRIMARY KEY,
                     schema_version INTEGER NOT NULL,
                     result_json TEXT NOT NULL,
+                    summary_json TEXT NOT NULL,
                     total_findings INTEGER NOT NULL,
                     blocking_findings INTEGER NOT NULL,
                     total_notices INTEGER NOT NULL,
@@ -108,6 +112,19 @@ def init_db() -> None:
                     FOREIGN KEY (task_id) REFERENCES tasks(id)
                 )
             """)
+            # --- Migration: add summary_json column if missing ---
+            # Old databases created before this change don't have
+            # summary_json. We add it as nullable so old records keep
+            # working — get_scan_summary falls back to result_json for
+            # records with NULL summary_json. New records always set it.
+            columns = conn.execute(
+                "PRAGMA table_info(scan_results)"
+            ).fetchall()
+            column_names = [col["name"] for col in columns]
+            if "summary_json" not in column_names:
+                conn.execute(
+                    "ALTER TABLE scan_results ADD COLUMN summary_json TEXT"
+                )
             conn.commit()
             _initialized = True
         finally:

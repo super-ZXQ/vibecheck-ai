@@ -466,20 +466,26 @@ def save_scan_result(task_id: str, scan_result: ScanResult) -> None:
         )
 
     summary = result_dict["summary"]
+    summary_json = json.dumps(
+        summary,
+        ensure_ascii=False,
+        sort_keys=True,
+    )
 
     conn = _get_connection()
     try:
         conn.execute(
             """INSERT INTO scan_results
-               (task_id, schema_version, result_json,
+               (task_id, schema_version, result_json, summary_json,
                 total_findings, blocking_findings, total_notices,
                 total_skipped_files, total_scan_errors,
                 total_files_scanned, total_lines_scanned,
                 created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(task_id) DO UPDATE SET
                    schema_version=excluded.schema_version,
                    result_json=excluded.result_json,
+                   summary_json=excluded.summary_json,
                    total_findings=excluded.total_findings,
                    blocking_findings=excluded.blocking_findings,
                    total_notices=excluded.total_notices,
@@ -492,6 +498,7 @@ def save_scan_result(task_id: str, scan_result: ScanResult) -> None:
                 task_id,
                 SCHEMA_VERSION,
                 result_json,
+                summary_json,
                 summary["total_findings"],
                 summary["blocking_findings"],
                 summary["total_notices"],
@@ -542,8 +549,14 @@ def get_scan_summary(task_id: str) -> Optional[dict]:
     The returned dict includes both total_* (actual scan counts) and
     returned_* / *_truncated (persisted subset metadata).
 
-    Reads from result_json (not database columns) to ensure the full
-    summary structure — including truncation metadata — is returned.
+    Normal path reads ONLY summary_json — a lightweight column that
+    never exceeds a few hundred bytes. This avoids loading and parsing
+    the full result_json (up to 8 MB) on every status poll.
+
+    Fallback path: for old records created before the summary_json
+    column existed (summary_json is NULL or empty), falls back to
+    reading result_json. New records must NEVER enter this path —
+    save_scan_result always sets summary_json.
 
     Args:
         task_id: The task ID to look up.
@@ -559,6 +572,23 @@ def get_scan_summary(task_id: str) -> Optional[dict]:
     init_db()
     conn = _get_connection()
     try:
+        # Normal path: read only summary_json (lightweight).
+        row = conn.execute(
+            "SELECT summary_json FROM scan_results WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+
+        summary_json = row["summary_json"]
+        if summary_json:
+            # Normal path — summary_json exists and is valid.
+            return json.loads(summary_json)
+
+        # Fallback for old records (summary_json is NULL or empty).
+        # These are records created before the summary_json column
+        # was added. Only in this case do we read the full result_json.
+        # New records must NEVER enter this path.
         row = conn.execute(
             "SELECT result_json FROM scan_results WHERE task_id = ?",
             (task_id,),
