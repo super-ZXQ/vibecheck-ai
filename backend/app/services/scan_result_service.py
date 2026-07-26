@@ -287,8 +287,13 @@ def _truncate_findings(
     This ensures blocking findings are NEVER squeezed out by large
     numbers of low-severity findings.
 
+    Defensive: limit is clamped to max(1, int(limit)) to prevent
+    runtime monkeypatch or corrupted config from causing items[:-1]
+    (negative) or items[:0] (zero) behavior.
+
     Returns (truncated_list, was_truncated).
     """
+    limit = max(1, int(limit))
     if len(findings) <= limit:
         return list(findings), False
     indexed = list(enumerate(findings))
@@ -306,8 +311,13 @@ def _truncate_collection(
 ) -> tuple[list, bool]:
     """Truncate a collection to limit, preserving original order.
 
+    Defensive: limit is clamped to max(1, int(limit)) to prevent
+    runtime monkeypatch or corrupted config from causing items[:-1]
+    (negative) or items[:0] (zero) behavior.
+
     Returns (truncated_list, was_truncated).
     """
+    limit = max(1, int(limit))
     if len(items) <= limit:
         return list(items), False
     return list(items[:limit]), True

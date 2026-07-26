@@ -36,6 +36,7 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
 from app.core.error_codes import (
+    INTERNAL_ERROR,
     QUEUE_FULL,
     SCAN_RESULT_MISSING,
     SCAN_RESULT_NOT_READY,
@@ -210,15 +211,19 @@ async def get_check_status(task_id: str):
 async def get_check_result(task_id: str):
     """Get the full persisted scan result for a completed task.
 
-    Explicit branching by task status:
-    1. pending/running, no result → 409 SCAN_RESULT_NOT_READY
-    2. failed, no result → fixed safe empty response (200)
-    3. completed, result exists → full persisted result (200)
-    4. completed, result MISSING → 500 SCAN_RESULT_MISSING
+    Strict state-ordered branching:
+    1. task not found → 404
+    2. pending/running → 409 SCAN_RESULT_NOT_READY (does NOT read scan_results)
+    3. failed → fixed safe empty response (does NOT read scan_results,
+       even if a residual record exists from a partial pipeline)
+    4. completed → asyncio.to_thread(get_scan_result)
+       - result exists → 200 full result
+       - result missing → 500 SCAN_RESULT_MISSING
+    5. unknown status → 500 INTERNAL_ERROR (never returns success empty)
 
-    Case 4 covers legacy tasks (completed before P0-5) that have no
-    scan_results row. Such tasks must NOT return a success empty report
-    — they return a fixed error so the caller knows to re-submit.
+    The failed check MUST come before any scan_results read. This
+    prevents leaking residual findings from a partial pipeline where
+    save_scan_result succeeded but mark_completed threw an exception.
 
     Never re-scans from temp directory.
     Never returns raw exceptions or absolute paths.
@@ -246,7 +251,7 @@ async def get_check_result(task_id: str):
             },
         )
 
-    # --- Case 1: pending/running, no result yet ---
+    # --- Case 2: pending/running → 409 (does NOT read scan_results) ---
     if task.status in (STATUS_PENDING, STATUS_RUNNING):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -256,25 +261,19 @@ async def get_check_result(task_id: str):
             },
         )
 
-    # Try to get the persisted scan result.
-    # get_scan_result reads up to 8 MB of result_json and parses it.
-    # Run in a thread via asyncio.to_thread so the event loop stays
-    # responsive during the SQLite read and JSON parse.
-    result = await asyncio.to_thread(get_scan_result, task_id)
-
-    # --- Case 3: completed, result exists ---
-    if result is not None:
-        return result
-
-    # --- Case 2: failed, no result → fixed safe empty response ---
+    # --- Case 3: failed → fixed safe empty (does NOT read scan_results) ---
+    # Even if scan_results has a residual record (e.g. save_scan_result
+    # succeeded but mark_completed threw), must NOT return it.
     if task.status == STATUS_FAILED:
         return _SAFE_EMPTY_RESULT
 
-    # --- Case 4: completed but result is missing ---
-    # This is a legacy task (completed before P0-5) or a data integrity
-    # issue. Must NOT return a success empty report — return a fixed
-    # error so the caller knows the result is genuinely missing.
+    # --- Case 4: completed → read result via asyncio.to_thread ---
     if task.status == STATUS_COMPLETED:
+        result = await asyncio.to_thread(get_scan_result, task_id)
+        if result is not None:
+            return result
+        # Result missing — legacy task or data integrity issue.
+        # Must NOT return a success empty report.
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={
@@ -283,5 +282,12 @@ async def get_check_result(task_id: str):
             },
         )
 
-    # Defensive fallback — should never reach here
-    return _SAFE_EMPTY_RESULT
+    # --- Case 5: unknown status → internal error ---
+    # Must NOT return a success empty report.
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail={
+            "error_code": INTERNAL_ERROR,
+            "error_message": get_error_message(INTERNAL_ERROR),
+        },
+    )
