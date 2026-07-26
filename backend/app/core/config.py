@@ -51,6 +51,16 @@ class Settings(BaseSettings):
         "__pycache__", ".git", "vendor", ".venv", "venv",
         ".pytest_cache", ".mypy_cache", ".idea", ".vscode",
     ]
+
+    # --- Persisted result limits (P0-5) ---
+    # Task-level caps on what gets persisted, NOT on what gets scanned.
+    # P0-4 per-rule/per-file limits remain unchanged.
+    # These prevent unbounded result_json from consuming database space.
+    scan_max_persisted_findings_per_task: int = 1000
+    scan_max_persisted_notices_per_task: int = 500
+    scan_max_persisted_skipped_files_per_task: int = 2000
+    scan_max_persisted_scan_errors_per_task: int = 500
+    scan_max_result_json_bytes: int = 8 * 1024 * 1024  # 8 MB
     scan_binary_extensions: list[str] = [
         ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp",
         ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar",
