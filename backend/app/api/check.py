@@ -10,9 +10,14 @@ GET /api/check/{task_id}:
 - Returns current task status, stage, progress, and errors.
 - Completed tasks with a persisted result include scan_summary and
   report_url (P0-5).
+- Completed tasks with a persisted assessment include security_score,
+  security_verdict, and assessment_url (P0-6).
 - Completed tasks WITHOUT a persisted result (legacy) have
   scan_summary=None and report_url=None.
+- Completed tasks WITHOUT a persisted assessment (legacy P0-5) have
+  security_score=None, security_verdict=None, assessment_url=None.
 - Does NOT inline full findings — use the result endpoint for that.
+- Does NOT inline full assessment — use the assessment endpoint for that.
 - UUID format errors return 422.
 - Non-existent tasks return 404.
 - Frontend can poll every 2 seconds.
