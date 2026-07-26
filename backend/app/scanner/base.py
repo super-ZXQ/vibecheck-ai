@@ -17,6 +17,14 @@ Immutability:
 - All data models use @dataclass(frozen=True).
 - ScanResult collections (findings, notices, skipped_files, scan_errors) use
   tuple, not list, to prevent mutation of frozen dataclass internals.
+
+file_path safety:
+- Finding, ScanNotice, SkippedFile, ScanError all sanitize file_path in
+  __post_init__ via mask_untrusted_text. This provides a SELF-GUARANTEE:
+  even if a rule is called directly (not through scan_directory),
+  file_path can never contain a raw explicit-format secret.
+- scan_directory ALSO applies mask_untrusted_text as a first layer —
+  the __post_init__ is the second layer (defense in depth).
 """
 
 from __future__ import annotations
@@ -25,6 +33,8 @@ from abc import ABC
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
+
+from app.core.security.desensitize import mask_untrusted_text
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +112,16 @@ class Finding:
     message: str
     repair_template_key: str
 
+    def __post_init__(self) -> None:
+        """Sanitize file_path via mask_untrusted_text (self-guarantee).
+
+        Even if a rule is called directly with an unsanitized path
+        containing an embedded secret, the Finding itself ensures
+        file_path is safe. Uses object.__setattr__ because the
+        dataclass is frozen.
+        """
+        object.__setattr__(self, "file_path", mask_untrusted_text(self.file_path))
+
 
 @dataclass(frozen=True)
 class ScanNotice:
@@ -113,6 +133,16 @@ class ScanNotice:
     rule_id: str
     message: str
     file_path: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        """Sanitize file_path via mask_untrusted_text (self-guarantee).
+
+        Skips None file_path (notices may not have a path).
+        """
+        if self.file_path is not None:
+            object.__setattr__(
+                self, "file_path", mask_untrusted_text(self.file_path)
+            )
 
 
 @dataclass(frozen=True)
@@ -126,6 +156,10 @@ class SkippedFile:
     file_path: str
     reason: str
 
+    def __post_init__(self) -> None:
+        """Sanitize file_path via mask_untrusted_text (self-guarantee)."""
+        object.__setattr__(self, "file_path", mask_untrusted_text(self.file_path))
+
 
 @dataclass(frozen=True)
 class ScanError:
@@ -136,6 +170,10 @@ class ScanError:
     file_path: str
     error_type: str
     error_message: str
+
+    def __post_init__(self) -> None:
+        """Sanitize file_path via mask_untrusted_text (self-guarantee)."""
+        object.__setattr__(self, "file_path", mask_untrusted_text(self.file_path))
 
 
 @dataclass(frozen=True)

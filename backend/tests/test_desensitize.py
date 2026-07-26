@@ -117,23 +117,35 @@ class TestMaskSnippet:
     """Tests for mask_snippet function -- multi-secret line masking."""
 
     def test_mask_snippet_single_secret(self):
-        """Single GitHub token in a line is masked."""
+        """Single GitHub token in a line is masked.
+
+        With phased masking, GITHUB_TOKEN is classified as sensitive
+        (CATEGORY_SECRET), so Phase 1 masks the value with <REDACTED>.
+        The original token must not appear in the result.
+        """
         line = f'GITHUB_TOKEN = "{SYNTH_GITHUB_TOKEN}"'
         result = mask_snippet(line)
         # The original token must not appear
         assert SYNTH_GITHUB_TOKEN not in result
-        # The masked version should be present
-        assert f"ghp_...{SYNTH_GITHUB_TOKEN[-4:]}" in result
+        # The value is masked as <REDACTED> (sensitive assignment)
+        assert "<REDACTED>" in result
 
     def test_mask_snippet_multiple_secrets(self):
-        """Multiple different secrets in one line are all masked."""
+        """Multiple different secrets in one line are all masked.
+
+        With phased masking:
+        - 'token' is classified as sensitive → Phase 1 masks with <REDACTED>
+        - 'key' is NOT classified as sensitive → Phase 2 catches AKIA format
+          and masks with first4...last4 format
+        """
         line = f'token="{SYNTH_GITHUB_TOKEN}" key="{SYNTH_AWS_KEY}"'
         result = mask_snippet(line)
         # Neither original secret should appear
         assert SYNTH_GITHUB_TOKEN not in result
         assert SYNTH_AWS_KEY not in result
-        # Both masked versions should be present
-        assert f"ghp_...{SYNTH_GITHUB_TOKEN[-4:]}" in result
+        # Token value masked as <REDACTED> (sensitive assignment, Phase 1)
+        assert "<REDACTED>" in result
+        # AWS key masked with first4...last4 format (Phase 2 explicit format)
         assert f"AKIA...{SYNTH_AWS_KEY[-4:]}" in result
 
     def test_mask_snippet_idempotent(self):

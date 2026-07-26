@@ -1708,3 +1708,245 @@ class TestPathSanitization:
         # The path should be preserved as-is (relative POSIX)
         for f in result.findings:
             assert f.file_path == "src/config/settings.py"
+
+
+# ============================================================================
+# --- Overlapping masking range leakage tests (4 tests) ---
+# ============================================================================
+
+class TestOverlappingMaskingLeakage:
+    """Verify tokens embedded inside connection strings are fully masked.
+
+    The old _apply_ranges merged overlapping ranges by keeping the outer
+    connection string's masked_value, which only masked the password —
+    leaving tokens in username/host/path visible. The phased approach
+    (tokens first, then connection strings) fixes this.
+    """
+
+    def test_token_in_connection_string_username_masked(self):
+        """Token in connection string username is masked."""
+        from app.core.security.desensitize import mask_untrusted_text
+        conn = f"postgres://{SYNTH_GITHUB_TOKEN}:pass@host/db"
+        result = mask_untrusted_text(conn)
+        assert SYNTH_GITHUB_TOKEN not in result
+        assert "pass" not in result or "***" in result
+
+    def test_token_in_connection_string_snippet_masked(self, tmp_path):
+        """Token in connection string in a file is masked in snippet_masked."""
+        conn = f'DATABASE_URL="postgres://{SYNTH_GITHUB_TOKEN}:pass@host/db"'
+        (tmp_path / "config.py").write_text(conn + "\n", encoding="utf-8")
+
+        result = scan_directory(tmp_path)
+
+        r008 = [f for f in result.findings if f.rule_id == "R008_CONNECTION_STRING"]
+        assert len(r008) == 1
+        # Neither the token nor the password should appear in snippet
+        assert SYNTH_GITHUB_TOKEN not in r008[0].snippet_masked
+        assert "pass" not in r008[0].snippet_masked or "pass" not in r008[0].snippet_masked.replace("***", "")
+        # repr and JSON must also be safe
+        assert SYNTH_GITHUB_TOKEN not in repr(r008[0])
+        f_json = json.dumps(dataclasses.asdict(r008[0]), default=str)
+        assert SYNTH_GITHUB_TOKEN not in f_json
+
+    def test_token_in_connection_string_host_masked(self):
+        """Token in connection string host is masked."""
+        from app.core.security.desensitize import mask_untrusted_text
+        conn = f"postgres://user:pass@{SYNTH_AWS_KEY}/db"
+        result = mask_untrusted_text(conn)
+        assert SYNTH_AWS_KEY not in result
+
+    def test_token_in_connection_string_password_masked(self):
+        """Token in connection string password is masked."""
+        from app.core.security.desensitize import mask_untrusted_text
+        conn = f"postgres://user:{SYNTH_GITHUB_TOKEN}@host/db"
+        result = mask_untrusted_text(conn)
+        assert SYNTH_GITHUB_TOKEN not in result
+
+    def test_mask_snippet_token_in_conn_string(self):
+        """mask_snippet masks tokens inside connection strings."""
+        from app.core.security.desensitize import mask_snippet
+        line = f'DATABASE_URL="postgres://{SYNTH_GITHUB_TOKEN}:pass@host/db"'
+        result = mask_snippet(line)
+        assert SYNTH_GITHUB_TOKEN not in result
+        assert "pass" not in result or "***" in result
+
+    def test_aws_token_in_connection_string_masked(self):
+        """AWS token in connection string username is masked."""
+        from app.core.security.desensitize import mask_untrusted_text
+        conn = f"redis://{SYNTH_AWS_KEY}:secret@host:6379"
+        result = mask_untrusted_text(conn)
+        assert SYNTH_AWS_KEY not in result
+
+
+# ============================================================================
+# --- Result model file_path self-guarantee tests (5 tests) ---
+# ============================================================================
+
+class TestResultModelFilePathSelfGuarantee:
+    """Verify result models sanitize file_path in __post_init__.
+
+    Even when rules are called directly (not through scan_directory),
+    file_path must never contain a raw explicit-format secret.
+    """
+
+    def test_finding_direct_construction_sanitizes_path(self):
+        """Finding constructed directly sanitizes file_path."""
+        from app.scanner.base import Finding, FindingType, Severity, Confidence
+        f = Finding(
+            rule_id="R001_GITHUB_TOKEN",
+            rule_name="GitHub Token",
+            severity=Severity.CRITICAL,
+            confidence=Confidence.HIGH,
+            file_path=f"src/{SYNTH_GITHUB_TOKEN}.py",
+            line_start=1,
+            line_end=1,
+            column_start=0,
+            column_end=10,
+            snippet_masked="<REDACTED>",
+            is_blocking=True,
+            finding_type=FindingType.CONTENT,
+            description="test",
+            category="token",
+            secret_type="github_token",
+            message="test",
+            repair_template_key="rotate",
+        )
+        assert SYNTH_GITHUB_TOKEN not in f.file_path
+        assert SYNTH_GITHUB_TOKEN not in repr(f)
+        f_json = json.dumps(dataclasses.asdict(f), default=str)
+        assert SYNTH_GITHUB_TOKEN not in f_json
+
+    def test_scan_notice_direct_construction_sanitizes_path(self):
+        """ScanNotice constructed directly sanitizes file_path."""
+        from app.scanner.base import ScanNotice
+        n = ScanNotice(
+            rule_id="R010",
+            message="test",
+            file_path=f"dir/{SYNTH_AWS_KEY}/file",
+        )
+        assert SYNTH_AWS_KEY not in n.file_path
+        assert SYNTH_AWS_KEY not in repr(n)
+        n_json = json.dumps(dataclasses.asdict(n), default=str)
+        assert SYNTH_AWS_KEY not in n_json
+
+    def test_skipped_file_direct_construction_sanitizes_path(self):
+        """SkippedFile constructed directly sanitizes file_path."""
+        from app.scanner.base import SkippedFile
+        s = SkippedFile(
+            file_path=f"{SYNTH_GITHUB_TOKEN}.png",
+            reason="binary",
+        )
+        assert SYNTH_GITHUB_TOKEN not in s.file_path
+        assert SYNTH_GITHUB_TOKEN not in repr(s)
+        s_json = json.dumps(dataclasses.asdict(s), default=str)
+        assert SYNTH_GITHUB_TOKEN not in s_json
+
+    def test_scan_error_direct_construction_sanitizes_path(self):
+        """ScanError constructed directly sanitizes file_path."""
+        from app.scanner.base import ScanError
+        e = ScanError(
+            file_path=f"{SYNTH_AWS_KEY}.py",
+            error_type="read_error",
+            error_message="Unable to read file content",
+        )
+        assert SYNTH_AWS_KEY not in e.file_path
+        assert SYNTH_AWS_KEY not in repr(e)
+        e_json = json.dumps(dataclasses.asdict(e), default=str)
+        assert SYNTH_AWS_KEY not in e_json
+
+    def test_direct_rule_call_sanitizes_path(self):
+        """Directly calling GitHubTokenRule.scan_content sanitizes file_path."""
+        from app.scanner.rules import GitHubTokenRule
+        rule = GitHubTokenRule()
+        findings = rule.scan_content(
+            f"src/{SYNTH_GITHUB_TOKEN}.py",
+            [f'token = "{SYNTH_GITHUB_TOKEN}"'],
+        )
+        assert len(findings) >= 1
+        for f in findings:
+            assert SYNTH_GITHUB_TOKEN not in f.file_path
+            assert SYNTH_GITHUB_TOKEN not in repr(f)
+            f_json = json.dumps(dataclasses.asdict(f), default=str)
+            assert SYNTH_GITHUB_TOKEN not in f_json
+
+    def test_direct_env_example_rule_call_sanitizes_path(self):
+        """Directly calling EnvExampleFileRule.check_file sanitizes path."""
+        from app.scanner.rules import EnvExampleFileRule
+        from app.scanner.base import ScanNotice
+        rule = EnvExampleFileRule()
+        # Parent directory contains a token
+        result = rule.check_file(f"dir/{SYNTH_GITHUB_TOKEN}/.env.example", 100)
+        assert result is not None
+        assert isinstance(result, ScanNotice)
+        assert SYNTH_GITHUB_TOKEN not in result.file_path
+        assert SYNTH_GITHUB_TOKEN not in repr(result)
+
+    def test_plain_path_unchanged_in_direct_construction(self):
+        """Plain path (no secrets) is unchanged in direct construction."""
+        from app.scanner.base import SkippedFile
+        s = SkippedFile(file_path="src/config/settings.py", reason="binary")
+        assert s.file_path == "src/config/settings.py"
+
+
+# ============================================================================
+# --- Incomplete private key Finding count tests (3 tests) ---
+# ============================================================================
+
+class TestIncompletePrivateKeyCount:
+    """Verify incomplete private key blocks produce at most 1 Finding.
+
+    - Many consecutive BEGINs without END: at most 1 incomplete Finding.
+    - Two consecutive complete keys: 2 Findings.
+    - 10000 consecutive BEGINs: O(n), at most 1 Finding, blocking.
+    """
+
+    def test_many_begins_produce_one_finding(self):
+        """500 consecutive BEGINs without END produce exactly 1 Finding."""
+        from app.scanner.rules import PrivateKeyRule
+        rule = PrivateKeyRule()
+        lines = ["-----BEGIN RSA PRIVATE KEY-----"] * 500
+        findings = rule.scan_content("many_begins.pem", lines)
+        assert len(findings) == 1
+        assert findings[0].is_blocking is True
+        assert findings[0].snippet_masked == "<PRIVATE_KEY_REDACTED>"
+        assert "Incomplete" in findings[0].description
+
+    def test_two_complete_keys_still_two_findings(self):
+        """Two consecutive complete private keys produce two Findings."""
+        from app.scanner.rules import PrivateKeyRule
+        rule = PrivateKeyRule()
+        lines = [
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "MIIEowIBAAKCAQEA" + "D" * 400,
+            "-----END RSA PRIVATE KEY-----",
+            "-----BEGIN EC PRIVATE KEY-----",
+            "MHcCAQEE" + "E" * 100,
+            "-----END EC PRIVATE KEY-----",
+        ]
+        findings = rule.scan_content("two_keys.pem", lines)
+        assert len(findings) == 2
+        for f in findings:
+            assert f.is_blocking is True
+            assert "Incomplete" not in f.description
+
+    def test_10000_begins_linear_one_finding(self):
+        """10000 consecutive BEGINs: O(n), at most 1 Finding, blocking."""
+        import time
+        from app.scanner.rules import PrivateKeyRule
+        rule = PrivateKeyRule()
+        n = 10000
+        lines = ["-----BEGIN RSA PRIVATE KEY-----"] * n
+        start = time.monotonic()
+        findings = rule.scan_content("huge.pem", lines)
+        elapsed = time.monotonic() - start
+        # At most 1 incomplete Finding
+        assert len(findings) == 1
+        assert findings[0].is_blocking is True
+        assert findings[0].snippet_masked == "<PRIVATE_KEY_REDACTED>"
+        # No private key body in any field
+        for f in findings:
+            f_json = json.dumps(dataclasses.asdict(f), default=str)
+            assert "MIIEowIBAAKCAQEA" not in f_json
+        # Should complete quickly (O(n), not O(n²))
+        # 10000 lines should take well under 5 seconds
+        assert elapsed < 5.0, f"Scan took {elapsed:.2f}s for {n} lines"

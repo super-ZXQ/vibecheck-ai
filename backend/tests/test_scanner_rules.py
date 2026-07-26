@@ -923,6 +923,9 @@ class TestPrivateKeyLinearComplexity:
 
         Uses a CountingStr wrapper to verify that str.contains (via 'in')
         is called at most a constant multiple of the number of lines.
+
+        With the new incomplete-block handling, 500 consecutive BEGINs
+        produce at most 1 incomplete Finding (the last BEGIN), not 500.
         """
         call_count = 0
 
@@ -944,12 +947,13 @@ class TestPrivateKeyLinearComplexity:
         wrapped = [CountingStr(l) for l in lines]
         findings = rule.scan_content("test_keys", wrapped)
 
-        # Should produce n findings (all incomplete)
-        assert len(findings) == n
-        # All should be blocking
+        # Should produce at most 1 incomplete finding (not n)
+        assert len(findings) == 1
+        # The one finding should be blocking
         for f in findings:
             assert f.is_blocking is True
             assert f.snippet_masked == "<PRIVATE_KEY_REDACTED>"
+            assert "Incomplete" in f.description
         # contains calls should be O(n), not O(n²)
         # With nested loops it would be ~n²/2. With linear it should be ~2n.
         assert call_count <= n * 10, (

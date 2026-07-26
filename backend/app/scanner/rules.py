@@ -364,12 +364,18 @@ class PrivateKeyRule(Rule):
     Uses a single-pass O(n) state machine — no nested loops. Walks through
     all lines exactly once, tracking at most one pending BEGIN at a time.
 
-    - If END is found: complete block, snippet = <PRIVATE_KEY_REDACTED>.
-    - If END is missing: still blocking, description notes incomplete block.
-      Does NOT pretend to have located the complete key body.
+    Incomplete block handling:
+    - When a BEGIN is found while another BEGIN is already pending (no END),
+      the old pending is DISCARDED (not emitted as a Finding). The new
+      BEGIN replaces it. This prevents result amplification from many
+      consecutive BEGINs without END.
+    - At file end, if a pending BEGIN remains, at most ONE incomplete
+      Finding is emitted.
+    - Consecutive COMPLETE keys (BEGIN + END pairs) still produce
+      separate Findings.
+
     - snippet_masked is ALWAYS <PRIVATE_KEY_REDACTED>, never the key content.
-    - Consecutive complete keys produce separate Findings.
-    - Many BEGINs without END do NOT cause quadratic scanning.
+    - 10000 consecutive BEGINs: O(n), at most 1 incomplete Finding.
     """
 
     rule_id = "R005_PRIVATE_KEY"
@@ -393,8 +399,9 @@ class PrivateKeyRule(Rule):
         """Single-pass O(n) scan using a state machine.
 
         Tracks at most one pending BEGIN at a time. When a new BEGIN is
-        found while another is pending, the old one is emitted as incomplete.
-        This ensures each line is visited exactly once — no nested loops.
+        found while another is pending (no END), the old pending is
+        DISCARDED — no Finding is emitted for it. This ensures 10000
+        consecutive BEGINs produce at most 1 incomplete Finding at EOF.
         """
         findings: list[Finding] = []
         # pending holds info about an unclosed BEGIN: (header, end_header,
@@ -445,33 +452,10 @@ class PrivateKeyRule(Rule):
             if begin_header is None:
                 continue
 
-            # Found a BEGIN — if we had a pending one, it's incomplete
-            if pending is not None:
-                old_header, _, old_line, old_cs, old_ce = pending
-                old_type = old_header.strip("-").strip()
-                findings.append(Finding(
-                    rule_id=self.rule_id,
-                    rule_name=self.rule_name,
-                    severity=self.severity,
-                    confidence=self.confidence,
-                    file_path=file_path,
-                    line_start=old_line,
-                    line_end=old_line,
-                    column_start=old_cs,
-                    column_end=old_ce,
-                    snippet_masked="<PRIVATE_KEY_REDACTED>",
-                    is_blocking=self.is_blocking,
-                    finding_type=self.finding_type,
-                    description=(
-                        f"Incomplete private key block -- BEGIN header found "
-                        f"without matching END ({old_type})"
-                    ),
-                    category="private_key",
-                    secret_type="private_key",
-                    message="Private key block detected",
-                    repair_template_key="rotate_private_key",
-                ))
-                pending = None
+            # Found a BEGIN — if we had a pending one, DISCARD it (no Finding).
+            # This prevents result amplification from many consecutive BEGINs.
+            # The new BEGIN replaces the old pending.
+            pending = None
 
             # Check if END is on the same line (after BEGIN)
             if end_header_matched is not None:
@@ -505,7 +489,7 @@ class PrivateKeyRule(Rule):
                         i + 1, begin_pos, begin_pos + len(begin_header),
                     )
 
-        # --- End of file: emit incomplete finding for any unclosed BEGIN ---
+        # --- End of file: emit at most ONE incomplete finding for unclosed BEGIN ---
         if pending is not None:
             old_header, _, old_line, old_cs, old_ce = pending
             old_type = old_header.strip("-").strip()

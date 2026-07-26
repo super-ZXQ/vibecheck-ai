@@ -747,34 +747,34 @@ class _SecretRange:
     masked_value: str
 
 
-# Patterns for detecting prefix-based tokens within a line of text.
-# These are the EXPLICIT-FORMAT patterns shared by mask_snippet and
-# mask_untrusted_text. They do NOT depend on key=value semantics.
-_EXPLICIT_FORMAT_PATTERNS: list[tuple[re.Pattern, str]] = [
+# Patterns for explicit-format TOKENS only (not connection strings).
+# These are masked FIRST so that tokens embedded inside connection string
+# username/host/path/password are always covered, even if the connection
+# string pattern also matches the surrounding text.
+_TOKEN_FORMAT_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"(ghp_[A-Za-z0-9]{36})"), GITHUB_TOKEN),
     (re.compile(r"(AKIA[A-Z0-9]{16})"), AWS_ACCESS_KEY),
     (re.compile(r"(AIza[A-Za-z0-9_\-]{35})"), GOOGLE_API_KEY),
-    (re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://[^:/@\s]+:[^@\s]+@\S+)"), CONNECTION_STRING),
 ]
 
+# Connection string pattern — masked SECOND, after tokens are already
+# replaced. This ensures tokens inside the connection string are already
+# gone before the password-only masking runs.
+_CONNECTION_STRING_PATTERN: re.Pattern = re.compile(
+    r"([a-zA-Z][a-zA-Z0-9+.-]*://[^:/@\s]+:[^@\s]+@\S+)"
+)
 
-def _collect_explicit_format_ranges(text: str) -> list[_SecretRange]:
-    """Collect all explicit-format secret ranges in arbitrary text.
 
-    This is the SHARED range-collection logic used by both mask_snippet
-    and mask_untrusted_text. It scans for GitHub tokens, AWS access keys,
-    Google API keys, and connection strings — all of which have
-    unambiguous format patterns that do NOT depend on key=value semantics.
+def _collect_token_ranges(text: str) -> list[_SecretRange]:
+    """Collect GitHub/AWS/Google token ranges (Phase 1).
 
-    Args:
-        text: Arbitrary text (may be a file path, directory name, or any
-              user-controlled string).
-
-    Returns:
-        List of _SecretRange objects for detected explicit-format secrets.
+    Phase 1 of phased masking: collect all explicit-format token ranges
+    so they can be applied BEFORE connection string masking. This
+    prevents tokens embedded inside connection strings from surviving
+    when the connection string range swallows the inner token range.
     """
     ranges: list[_SecretRange] = []
-    for pattern, stype in _EXPLICIT_FORMAT_PATTERNS:
+    for pattern, stype in _TOKEN_FORMAT_PATTERNS:
         for match in pattern.finditer(text):
             group = match.group(1)
             masked = mask_secret(group, stype)
@@ -788,7 +788,13 @@ def _collect_explicit_format_ranges(text: str) -> list[_SecretRange]:
 
 
 def _apply_ranges(text: str, ranges: list[_SecretRange]) -> str:
-    """Sort, merge, and apply secret ranges to text (back-to-front replace)."""
+    """Sort, merge, and apply secret ranges to text (back-to-front replace).
+
+    Overlapping ranges are merged by keeping the EARLIER range's
+    masked_value and extending the end. This is safe because ranges
+    collected within the same phase never overlap in problematic ways
+    (different token formats are mutually exclusive).
+    """
     if not ranges:
         return text
     ranges.sort(key=lambda r: (r.start, r.end))
@@ -810,18 +816,35 @@ def _apply_ranges(text: str, ranges: list[_SecretRange]) -> str:
     return result
 
 
+def _mask_connection_strings(text: str) -> str:
+    """Mask connection string passwords (Phase 2).
+
+    Phase 2 of phased masking: applied AFTER tokens are already masked.
+    This function finds connection strings in the already-token-masked
+    text and replaces the password portion with ***.
+
+    Idempotent: if the password is already *** (from a previous pass),
+    the connection string pattern still matches but replacing *** with
+    *** is a no-op.
+    """
+    def _replace_conn(m: re.Match) -> str:
+        full = m.group(1)
+        return mask_secret(full, CONNECTION_STRING)
+    return _CONNECTION_STRING_PATTERN.sub(_replace_conn, text)
+
+
 def mask_untrusted_text(text: str) -> str:
     """Mask explicit-format secrets in arbitrary user-controlled text.
 
-    This is the GENERAL-PURPOSE path/identifier sanitization function.
-    It masks GitHub tokens, AWS access keys, Google API keys, and
-    connection strings in ANY text — including file paths, directory
-    names, error messages, and other non-assignment contexts.
+    Uses PHASED masking to prevent overlapping range leakage:
+    - Phase 1: Mask GitHub/AWS/Google format tokens.
+    - Phase 2: Mask connection string passwords on the Phase 1 result.
 
-    Unlike mask_snippet, this function does NOT use key=value semantics
-    or iter_assignments. It relies ONLY on explicit-format pattern
-    matching, which is safe because these formats (ghp_+36, AKIA+16,
-    AIza+35, scheme://user:pass@host) are unambiguous.
+    This ensures tokens embedded inside connection string
+    username/host/path/password are ALWAYS masked, because Phase 1
+    runs first and replaces them before Phase 2 sees the text.
+
+    Each phase is idempotent. The overall function is idempotent.
 
     Used to sanitize file_path in Finding, ScanNotice, SkippedFile, and
     ScanError — all of which may contain user-controlled path components
@@ -836,12 +859,27 @@ def mask_untrusted_text(text: str) -> str:
     """
     if not text:
         return text
-    ranges = _collect_explicit_format_ranges(text)
-    return _apply_ranges(text, ranges)
+    # Phase 1: mask tokens
+    token_ranges = _collect_token_ranges(text)
+    phase1 = _apply_ranges(text, token_ranges)
+    # Phase 2: mask connection strings on the token-masked result
+    phase2 = _mask_connection_strings(phase1)
+    return phase2
 
 
 def mask_snippet(line_text: str) -> str:
     """Mask ALL secrets in a line of text.
+
+    Uses PHASED masking to prevent overlapping range leakage:
+    - Phase 1: Mask sensitive assignment values (password=, token=, etc.)
+      using iter_assignments + classify_key.
+    - Phase 2: Apply mask_untrusted_text on the Phase 1 result, which
+      itself runs token masking first, then connection string masking.
+
+    This ensures tokens embedded inside connection string
+    username/host/path/password are ALWAYS masked, because the
+    explicit-format token patterns run on the assignment-masked text
+    and catch any remaining tokens regardless of context.
 
     Conservative masking strategy: any identified assignment value whose
     key is classified as sensitive is masked. The ONLY values skipped are
@@ -854,13 +892,7 @@ def mask_snippet(line_text: str) -> str:
     output. Quoted values are NEVER treated as env references — they are
     literal strings and are always masked.
 
-    Uses iter_assignments() to identify ALL key=value assignments by
-    recognizing complete keys first (NOT by searching for sensitive
-    substrings). classify_key() determines which keys are sensitive.
-    Already-parsed value text is never re-scanned.
-
-    Idempotent: already-masked values are skipped, so re-processing never
-    exposes additional characters.
+    Each phase is idempotent. The overall function is idempotent.
 
     Args:
         line_text: A single line of text (may contain multiple secrets).
@@ -871,12 +903,8 @@ def mask_snippet(line_text: str) -> str:
     if not line_text:
         return line_text
 
+    # Phase 1: mask sensitive assignment values
     ranges: list[_SecretRange] = []
-
-    # 1. Collect explicit-format token ranges (shared logic)
-    ranges.extend(_collect_explicit_format_ranges(line_text))
-
-    # 2. Collect assignment-style secret ranges using iter_assignments
     for assignment in iter_assignments(line_text):
         # Only mask if the key is classified as sensitive
         if classify_key(assignment.key_raw) is None:
@@ -899,5 +927,11 @@ def mask_snippet(line_text: str) -> str:
             secret_type=GENERIC,
             masked_value=masked,
         ))
+    phase1 = _apply_ranges(line_text, ranges)
 
-    return _apply_ranges(line_text, ranges)
+    # Phase 2: apply mask_untrusted_text (tokens first, then conn strings)
+    # This catches explicit-format tokens and connection strings that were
+    # NOT inside a sensitive assignment value, or that were embedded
+    # inside connection string username/host/path/password.
+    phase2 = mask_untrusted_text(phase1)
+    return phase2
