@@ -15,13 +15,16 @@ Error handling:
 - No code from the repository is ever executed.
 - Scanner exceptions are caught and mapped to SCAN_INTERNAL_ERROR.
 - Persistence exceptions are caught and mapped to SCAN_RESULT_PERSIST_FAILED.
+- Oversized results are caught and mapped to SCAN_RESULT_TOO_LARGE.
 - Logs never contain str(exc), repr(exc), repo content, or absolute paths.
 
-Scan timeout (P0-5):
-- scan_timeout config is retained but NOT enforced as a hard timeout.
-- This phase relies on P0-4 built-in limits (file size, ignore dirs,
-  finding cap, linear private key scan) rather than asyncio.wait_for.
-- A hard timeout + immediate cleanup would race with the scanner thread.
+Non-blocking I/O (P0-5):
+- scan_directory and save_scan_result are synchronous, CPU/IO-bound
+  operations. They are executed via asyncio.to_thread so the FastAPI
+  event loop remains responsive during scanning and persistence.
+- No asyncio.wait_for or hard timeout — relies on P0-4 built-in limits.
+- Cleanup (temp file deletion) only runs AFTER the thread completes,
+  guaranteed by await on asyncio.to_thread.
 """
 
 import asyncio
@@ -41,6 +44,7 @@ from app.core.error_codes import (
     CLEANUP_FAILED,
     SCAN_INTERNAL_ERROR,
     SCAN_RESULT_PERSIST_FAILED,
+    SCAN_RESULT_TOO_LARGE,
     get_error_message,
 )
 from app.core.github import (
@@ -54,7 +58,7 @@ from app.core.safe_extract import (
     cleanup_temp_dir,
 )
 from app.scanner.sensitive import scan_directory
-from app.services.scan_result_service import save_scan_result
+from app.services.scan_result_service import save_scan_result, ScanResultTooLargeError
 from app.services.task_manager import (
     STAGE_DOWNLOADING,
     STAGE_EXTRACTING,
@@ -150,12 +154,17 @@ async def _process_task(task_id: str) -> None:
             return
 
         # --- Stage 3: Scan ---
-        # scan_directory is synchronous (CPU-bound). It relies on P0-4
-        # built-in limits rather than a hard timeout. The event loop is
-        # blocked during scanning — acceptable for MVP single-worker model.
+        # scan_directory is synchronous (CPU-bound). Run it in a thread
+        # via asyncio.to_thread so the event loop stays responsive.
+        # No asyncio.wait_for or hard timeout — relies on P0-4 built-in
+        # limits (file size, ignore dirs, finding cap, etc.).
+        # The await guarantees the thread has completed before cleanup.
         mark_running(task_id, STAGE_SCANNING, 80)
         try:
-            scan_result = scan_directory(Path(extract_dest))
+            scan_result = await asyncio.to_thread(
+                scan_directory,
+                Path(extract_dest),
+            )
         except Exception as e:
             # Log only the exception type — never str(exc), repr(exc),
             # stack traces, or repo content.
@@ -171,8 +180,27 @@ async def _process_task(task_id: str) -> None:
         # --- Stage 4: Persist scan result ---
         # Persist BEFORE marking completed — if persistence fails,
         # the task must NOT be marked as completed.
+        # save_scan_result is synchronous (CPU/IO-bound). Run it in a
+        # thread via asyncio.to_thread so the event loop stays responsive.
+        # The await guarantees the thread has completed before cleanup.
         try:
-            save_scan_result(task_id, scan_result)
+            await asyncio.to_thread(
+                save_scan_result,
+                task_id,
+                scan_result,
+            )
+        except ScanResultTooLargeError as e:
+            # Serialized result_json exceeded scan_max_result_json_bytes.
+            # Log only the exception type — never str(exc) or DB details.
+            logger.error(
+                "Scan result too large for task %s: %s",
+                task_id, type(e).__name__,
+            )
+            mark_failed(
+                task_id, SCAN_RESULT_TOO_LARGE,
+                get_error_message(SCAN_RESULT_TOO_LARGE),
+            )
+            return
         except Exception as e:
             # Log only the exception type — never str(exc) or DB errors.
             logger.error(

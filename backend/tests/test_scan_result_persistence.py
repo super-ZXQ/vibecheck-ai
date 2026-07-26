@@ -461,6 +461,10 @@ class TestGetScanResult:
             "total_findings", "blocking_findings", "total_notices",
             "total_skipped_files", "total_scan_errors",
             "total_files_scanned", "total_lines_scanned",
+            "returned_findings", "findings_truncated",
+            "returned_notices", "notices_truncated",
+            "returned_skipped_files", "skipped_files_truncated",
+            "returned_scan_errors", "scan_errors_truncated",
         }
         assert set(summary.keys()) == expected_fields
 

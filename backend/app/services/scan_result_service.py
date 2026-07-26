@@ -81,7 +81,7 @@ _ERROR_FIELDS = (
     "error_message",
 )
 
-# Stable field order for summary.
+# Stable field order for summary (includes truncation metadata).
 _SUMMARY_FIELDS = (
     "total_findings",
     "blocking_findings",
@@ -90,7 +90,39 @@ _SUMMARY_FIELDS = (
     "total_scan_errors",
     "total_files_scanned",
     "total_lines_scanned",
+    "returned_findings",
+    "findings_truncated",
+    "returned_notices",
+    "notices_truncated",
+    "returned_skipped_files",
+    "skipped_files_truncated",
+    "returned_scan_errors",
+    "scan_errors_truncated",
 )
+
+# Risk-priority ordering for severity and confidence.
+# Lower number = higher priority = retained first when truncating.
+_SEVERITY_ORDER = {
+    Severity.CRITICAL: 0,
+    Severity.HIGH: 1,
+    Severity.MEDIUM: 2,
+    Severity.LOW: 3,
+    Severity.INFO: 4,
+}
+_CONFIDENCE_ORDER = {
+    Confidence.HIGH: 0,
+    Confidence.MEDIUM: 1,
+    Confidence.LOW: 2,
+}
+
+
+class ScanResultTooLargeError(Exception):
+    """Raised when serialized result_json exceeds scan_max_result_json_bytes.
+
+    The caller (background_runner) catches this and maps it to the
+    fixed error code SCAN_RESULT_TOO_LARGE.
+    """
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -241,11 +273,61 @@ def _serialize_error(error: ScanError) -> dict:
     return result
 
 
-def _compute_summary(scan_result: ScanResult) -> dict:
+def _truncate_findings(
+    findings: tuple[Finding, ...], limit: int
+) -> tuple[list[Finding], bool]:
+    """Truncate findings to limit using risk-priority retention.
+
+    Priority order (highest first):
+    1. is_blocking = True
+    2. severity: critical > high > medium > low > info
+    3. confidence: high > medium > low
+    4. original position (earlier items retained first for same risk)
+
+    This ensures blocking findings are NEVER squeezed out by large
+    numbers of low-severity findings.
+
+    Returns (truncated_list, was_truncated).
+    """
+    if len(findings) <= limit:
+        return list(findings), False
+    indexed = list(enumerate(findings))
+    indexed.sort(key=lambda x: (
+        0 if x[1].is_blocking else 1,
+        _SEVERITY_ORDER[x[1].severity],
+        _CONFIDENCE_ORDER[x[1].confidence],
+        x[0],  # original position — stable tiebreaker
+    ))
+    return [f for _, f in indexed[:limit]], True
+
+
+def _truncate_collection(
+    items: tuple, limit: int
+) -> tuple[list, bool]:
+    """Truncate a collection to limit, preserving original order.
+
+    Returns (truncated_list, was_truncated).
+    """
+    if len(items) <= limit:
+        return list(items), False
+    return list(items[:limit]), True
+
+
+def _compute_summary(
+    scan_result: ScanResult,
+    findings_list: list,
+    notices_list: list,
+    skipped_list: list,
+    errors_list: list,
+    findings_truncated: bool,
+    notices_truncated: bool,
+    skipped_truncated: bool,
+    errors_truncated: bool,
+) -> dict:
     """Compute summary statistics from a ScanResult.
 
-    Counts are derived from the tuple collections — not from separate
-    counters — to ensure consistency.
+    total_* fields reflect the ACTUAL scan detection counts (not truncated).
+    returned_* and *_truncated fields reflect what was persisted.
     """
     findings = scan_result.findings
     blocking_count = sum(1 for f in findings if f.is_blocking)
@@ -257,6 +339,14 @@ def _compute_summary(scan_result: ScanResult) -> dict:
         "total_scan_errors": len(scan_result.scan_errors),
         "total_files_scanned": scan_result.total_files_scanned,
         "total_lines_scanned": scan_result.total_lines_scanned,
+        "returned_findings": len(findings_list),
+        "findings_truncated": findings_truncated,
+        "returned_notices": len(notices_list),
+        "notices_truncated": notices_truncated,
+        "returned_skipped_files": len(skipped_list),
+        "skipped_files_truncated": skipped_truncated,
+        "returned_scan_errors": len(errors_list),
+        "scan_errors_truncated": errors_truncated,
     }
 
 
@@ -270,7 +360,9 @@ def serialize_scan_result(scan_result: ScanResult) -> dict:
     - Converts tuples to JSON arrays (via list())
     - Preserves None as null
     - Produces deterministic field ordering
-    - Never includes raw secrets (guaranteed by P0-4 desensitization)
+    - Re-sanitizes all string fields at the persistence boundary
+    - Truncates collections to task-level limits (risk-priority for findings)
+    - summary.total_* = actual scan counts; returned_* = persisted counts
 
     Args:
         scan_result: A ScanResult from scan_directory().
@@ -286,13 +378,43 @@ def serialize_scan_result(scan_result: ScanResult) -> dict:
             "summary": {...}
         }
     """
-    # Convert tuples to lists (tuples become JSON arrays)
-    findings_list = [_serialize_finding(f) for f in scan_result.findings]
-    notices_list = [_serialize_notice(n) for n in scan_result.notices]
-    skipped_list = [_serialize_skipped(s) for s in scan_result.skipped_files]
-    errors_list = [_serialize_error(e) for e in scan_result.scan_errors]
+    from app.core.config import settings
 
-    summary = _compute_summary(scan_result)
+    # Truncate collections to task-level limits BEFORE serialization
+    truncated_findings, findings_truncated = _truncate_findings(
+        scan_result.findings,
+        settings.scan_max_persisted_findings_per_task,
+    )
+    truncated_notices, notices_truncated = _truncate_collection(
+        scan_result.notices,
+        settings.scan_max_persisted_notices_per_task,
+    )
+    truncated_skipped, skipped_truncated = _truncate_collection(
+        scan_result.skipped_files,
+        settings.scan_max_persisted_skipped_files_per_task,
+    )
+    truncated_errors, errors_truncated = _truncate_collection(
+        scan_result.scan_errors,
+        settings.scan_max_persisted_scan_errors_per_task,
+    )
+
+    # Serialize each (possibly truncated) collection
+    findings_list = [_serialize_finding(f) for f in truncated_findings]
+    notices_list = [_serialize_notice(n) for n in truncated_notices]
+    skipped_list = [_serialize_skipped(s) for s in truncated_skipped]
+    errors_list = [_serialize_error(e) for e in truncated_errors]
+
+    summary = _compute_summary(
+        scan_result,
+        findings_list,
+        notices_list,
+        skipped_list,
+        errors_list,
+        findings_truncated,
+        notices_truncated,
+        skipped_truncated,
+        errors_truncated,
+    )
 
     # Build result with fixed key ordering
     return {
@@ -312,18 +434,23 @@ def serialize_scan_result(scan_result: ScanResult) -> dict:
 def save_scan_result(task_id: str, scan_result: ScanResult) -> None:
     """Persist a scan result snapshot for a task.
 
-    Uses INSERT OR REPLACE (safe upsert) — if a row for this task_id
-    already exists, it is replaced atomically.
+    Uses SQLite native upsert (INSERT ON CONFLICT DO UPDATE) — created_at
+    is preserved on update, only updated_at changes.
 
     Args:
         task_id:      The task ID this result belongs to.
         scan_result:  The ScanResult from scan_directory().
 
     Raises:
+        ScanResultTooLargeError: If serialized result_json exceeds
+            scan_max_result_json_bytes. The caller must handle this
+            and mark the task as failed with SCAN_RESULT_TOO_LARGE.
         sqlite3.Error: If the database operation fails. The caller must
                        handle this and mark the task as failed with
                        SCAN_RESULT_PERSIST_FAILED.
     """
+    from app.core.config import settings
+
     init_db()
     now = now_iso()
 
@@ -331,6 +458,12 @@ def save_scan_result(task_id: str, scan_result: ScanResult) -> None:
     # we don't want a half-open transaction.
     result_dict = serialize_scan_result(scan_result)
     result_json = json.dumps(result_dict, ensure_ascii=False, sort_keys=True)
+
+    # Check byte size limit — refuse to persist oversized snapshots
+    if len(result_json.encode("utf-8")) > settings.scan_max_result_json_bytes:
+        raise ScanResultTooLargeError(
+            "result_json exceeds scan_max_result_json_bytes"
+        )
 
     summary = result_dict["summary"]
 
@@ -406,7 +539,11 @@ def get_scan_summary(task_id: str) -> Optional[dict]:
     """Get only the summary portion of a persisted scan result.
 
     Returns None if no result has been persisted for this task_id.
-    The returned dict has stable field ordering matching _SUMMARY_FIELDS.
+    The returned dict includes both total_* (actual scan counts) and
+    returned_* / *_truncated (persisted subset metadata).
+
+    Reads from result_json (not database columns) to ensure the full
+    summary structure — including truncation metadata — is returned.
 
     Args:
         task_id: The task ID to look up.
@@ -414,24 +551,21 @@ def get_scan_summary(task_id: str) -> Optional[dict]:
     Returns:
         A dict with total_findings, blocking_findings, total_notices,
         total_skipped_files, total_scan_errors, total_files_scanned,
-        total_lines_scanned — or None if not found.
+        total_lines_scanned, returned_findings, findings_truncated,
+        returned_notices, notices_truncated, returned_skipped_files,
+        skipped_files_truncated, returned_scan_errors,
+        scan_errors_truncated — or None if not found.
     """
     init_db()
     conn = _get_connection()
     try:
         row = conn.execute(
-            """SELECT total_findings, blocking_findings, total_notices,
-                      total_skipped_files, total_scan_errors,
-                      total_files_scanned, total_lines_scanned
-               FROM scan_results WHERE task_id = ?""",
+            "SELECT result_json FROM scan_results WHERE task_id = ?",
             (task_id,),
         ).fetchone()
         if row is None:
             return None
-        # Build dict with stable field ordering
-        return {
-            field: row[col]
-            for col, field in enumerate(_SUMMARY_FIELDS)
-        }
+        result_dict = json.loads(row["result_json"])
+        return result_dict.get("summary")
     finally:
         conn.close()

@@ -82,8 +82,11 @@ class TaskRecord:
     def to_response(self) -> dict:
         """Convert to API response dict (no sensitive fields).
 
-        For completed tasks, includes scan_summary and report_url
-        from the persisted scan result (P0-5).
+        For completed tasks with a persisted scan result, includes
+        scan_summary and report_url (P0-5).
+        For completed tasks WITHOUT a persisted result (e.g. legacy
+        tasks from before P0-5), scan_summary is None and report_url
+        is None — the result endpoint will return SCAN_RESULT_MISSING.
         """
         resp = {
             "task_id": self.id,
@@ -103,7 +106,14 @@ class TaskRecord:
             from app.services.scan_result_service import get_scan_summary
             scan_summary = get_scan_summary(self.id)
             resp["scan_summary"] = scan_summary
-            resp["report_url"] = f"/api/check/{self.id}/result"
+            # report_url is only set when scan_summary exists.
+            # If scan_summary is None (e.g. legacy completed task without
+            # a persisted result), report_url is None — the result endpoint
+            # will return SCAN_RESULT_MISSING.
+            if scan_summary is not None:
+                resp["report_url"] = f"/api/check/{self.id}/result"
+            else:
+                resp["report_url"] = None
         return resp
 
 
