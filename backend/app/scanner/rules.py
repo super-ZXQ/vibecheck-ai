@@ -29,6 +29,7 @@ from __future__ import annotations
 import re
 from typing import Optional
 
+from app.core.config import settings
 from app.core.security.desensitize import (
     CATEGORY_AWS_SECRET,
     CATEGORY_PASSWORD,
@@ -39,6 +40,7 @@ from app.core.security.desensitize import (
     is_env_reference,
     is_low_entropy,
     iter_assignments,
+    iter_connection_strings,
     mask_secret,
     mask_snippet,
 )
@@ -131,6 +133,34 @@ def _make_masked_snippet(line_text: str, max_length: int = 200) -> str:
     return masked[:max_length] if len(masked) > max_length else masked
 
 
+class _LineSnippetCache:
+    """Per-line masked-snippet cache.
+
+    Ensures ``mask_snippet`` is called at most ONCE per line per rule,
+    regardless of how many matches the rule produces on that line. All
+    Findings generated from the same line share the same safe snippet.
+
+    Usage::
+
+        cache = _LineSnippetCache(lines)
+        for i, line in enumerate(lines):
+            snippet = cache.get(i, line)   # computed once, then cached
+    """
+
+    __slots__ = ("_lines", "_cache")
+
+    def __init__(self, lines: list[str]) -> None:
+        self._lines = lines
+        self._cache: dict[int, str] = {}
+
+    def get(self, index: int, line: str) -> str:
+        snippet = self._cache.get(index)
+        if snippet is None:
+            snippet = _make_masked_snippet(line)
+            self._cache[index] = snippet
+        return snippet
+
+
 # ---------------------------------------------------------------------------
 # --- R001: GitHub Token ---
 # ---------------------------------------------------------------------------
@@ -149,8 +179,13 @@ class GitHubTokenRule(Rule):
 
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
         findings: list[Finding] = []
+        limit = settings.scan_max_findings_per_rule_per_file
+        cache = _LineSnippetCache(lines)
         for i, line in enumerate(lines):
+            snippet = None
             for match in self._pattern.finditer(line):
+                if len(findings) >= limit:
+                    return findings
                 token = match.group()
                 # Low-entropy placeholder downgrade (e.g., ghp_AAAAAA...)
                 if is_low_entropy(token, prefix_len=4):
@@ -161,6 +196,8 @@ class GitHubTokenRule(Rule):
                     severity = self.severity
                     confidence = self.confidence
                     blocking = self.is_blocking
+                if snippet is None:
+                    snippet = cache.get(i, line)
                 findings.append(Finding(
                     rule_id=self.rule_id,
                     rule_name=self.rule_name,
@@ -171,7 +208,7 @@ class GitHubTokenRule(Rule):
                     line_end=i + 1,
                     column_start=match.start(),
                     column_end=match.end(),
-                    snippet_masked=_make_masked_snippet(line),
+                    snippet_masked=snippet,
                     is_blocking=blocking,
                     finding_type=self.finding_type,
                     description="GitHub personal access token detected",
@@ -201,8 +238,13 @@ class AWSAccessKeyRule(Rule):
 
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
         findings: list[Finding] = []
+        limit = settings.scan_max_findings_per_rule_per_file
+        cache = _LineSnippetCache(lines)
         for i, line in enumerate(lines):
+            snippet = None
             for match in self._pattern.finditer(line):
+                if len(findings) >= limit:
+                    return findings
                 token = match.group()
                 if is_low_entropy(token, prefix_len=4):
                     severity = Severity.LOW
@@ -212,6 +254,8 @@ class AWSAccessKeyRule(Rule):
                     severity = self.severity
                     confidence = self.confidence
                     blocking = self.is_blocking
+                if snippet is None:
+                    snippet = cache.get(i, line)
                 findings.append(Finding(
                     rule_id=self.rule_id,
                     rule_name=self.rule_name,
@@ -222,7 +266,7 @@ class AWSAccessKeyRule(Rule):
                     line_end=i + 1,
                     column_start=match.start(),
                     column_end=match.end(),
-                    snippet_masked=_make_masked_snippet(line),
+                    snippet_masked=snippet,
                     is_blocking=blocking,
                     finding_type=self.finding_type,
                     description="AWS access key ID detected",
@@ -256,7 +300,10 @@ class AWSSecretKeyRule(Rule):
 
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
         findings: list[Finding] = []
+        limit = settings.scan_max_findings_per_rule_per_file
+        cache = _LineSnippetCache(lines)
         for i, line in enumerate(lines):
+            snippet = None
             for assignment in iter_assignments(line):
                 if classify_key(assignment.key_raw) != CATEGORY_AWS_SECRET:
                     continue
@@ -270,6 +317,8 @@ class AWSSecretKeyRule(Rule):
                     continue
                 if _is_placeholder(value):
                     continue
+                if len(findings) >= limit:
+                    return findings
                 # Low-entropy placeholder downgrade (e.g., all same char)
                 if is_low_entropy(value, prefix_len=0):
                     severity = Severity.LOW
@@ -279,6 +328,8 @@ class AWSSecretKeyRule(Rule):
                     severity = self.severity
                     confidence = self.confidence
                     blocking = self.is_blocking
+                if snippet is None:
+                    snippet = cache.get(i, line)
                 findings.append(Finding(
                     rule_id=self.rule_id,
                     rule_name=self.rule_name,
@@ -289,7 +340,7 @@ class AWSSecretKeyRule(Rule):
                     line_end=i + 1,
                     column_start=assignment.value_start,
                     column_end=assignment.value_end,
-                    snippet_masked=_make_masked_snippet(line),
+                    snippet_masked=snippet,
                     is_blocking=blocking,
                     finding_type=self.finding_type,
                     description="AWS secret access key detected",
@@ -319,8 +370,13 @@ class GoogleAPIKeyRule(Rule):
 
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
         findings: list[Finding] = []
+        limit = settings.scan_max_findings_per_rule_per_file
+        cache = _LineSnippetCache(lines)
         for i, line in enumerate(lines):
+            snippet = None
             for match in self._pattern.finditer(line):
+                if len(findings) >= limit:
+                    return findings
                 token = match.group()
                 if is_low_entropy(token, prefix_len=4):
                     severity = Severity.LOW
@@ -330,6 +386,8 @@ class GoogleAPIKeyRule(Rule):
                     severity = self.severity
                     confidence = self.confidence
                     blocking = self.is_blocking
+                if snippet is None:
+                    snippet = cache.get(i, line)
                 findings.append(Finding(
                     rule_id=self.rule_id,
                     rule_name=self.rule_name,
@@ -340,7 +398,7 @@ class GoogleAPIKeyRule(Rule):
                     line_end=i + 1,
                     column_start=match.start(),
                     column_end=match.end(),
-                    snippet_masked=_make_masked_snippet(line),
+                    snippet_masked=snippet,
                     is_blocking=blocking,
                     finding_type=self.finding_type,
                     description="Google API key detected",
@@ -364,11 +422,13 @@ class PrivateKeyRule(Rule):
     Uses a single-pass O(n) state machine — no nested loops. Walks through
     all lines exactly once, tracking at most one pending BEGIN at a time.
 
-    Incomplete block handling:
-    - When a BEGIN is found while another BEGIN is already pending (no END),
-      the old pending is DISCARDED (not emitted as a Finding). The new
-      BEGIN replaces it. This prevents result amplification from many
-      consecutive BEGINs without END.
+    Pending semantics (revised):
+    - While a BEGIN is pending (no matching END found yet), the scanner
+      ONLY looks for the matching END header. Any new BEGIN headers that
+      appear before the END are IGNORED — they do NOT replace the
+      pending BEGIN and do NOT produce Findings.
+    - This means ``BEGIN / BEGIN / END`` produces ONE Finding spanning
+      from the FIRST BEGIN (line 1) to the END (line 3).
     - At file end, if a pending BEGIN remains, at most ONE incomplete
       Finding is emitted.
     - Consecutive COMPLETE keys (BEGIN + END pairs) still produce
@@ -398,23 +458,27 @@ class PrivateKeyRule(Rule):
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
         """Single-pass O(n) scan using a state machine.
 
-        Tracks at most one pending BEGIN at a time. When a new BEGIN is
-        found while another is pending (no END), the old pending is
-        DISCARDED — no Finding is emitted for it. This ensures 10000
-        consecutive BEGINs produce at most 1 incomplete Finding at EOF.
+        While a BEGIN is pending, ONLY the matching END is searched for.
+        New BEGIN headers encountered before the END are IGNORED — they
+        do not replace the pending BEGIN. This keeps the FIRST BEGIN's
+        line number as the block start, so ``BEGIN / BEGIN / END``
+        yields line_start=1, line_end=3.
         """
         findings: list[Finding] = []
+        limit = settings.scan_max_findings_per_rule_per_file
         # pending holds info about an unclosed BEGIN: (header, end_header,
         # begin_line_1based, col_start, col_end)
         pending: tuple[str, str, int, int, int] | None = None
 
         for i, line in enumerate(lines):
-            # --- If we have a pending BEGIN, check for matching END on this line ---
+            # --- If we have a pending BEGIN, ONLY look for the matching END ---
             if pending is not None:
-                _, end_header, begin_line, col_s, col_e = pending
+                begin_header, end_header, begin_line, col_s, col_e = pending
                 if end_header in line:
-                    # Found matching END — emit complete finding
-                    key_type = pending[0].strip("-").strip()
+                    # Found matching END — emit complete finding.
+                    if len(findings) >= limit:
+                        return findings
+                    key_type = begin_header.strip("-").strip()
                     findings.append(Finding(
                         rule_id=self.rule_id,
                         rule_name=self.rule_name,
@@ -435,9 +499,11 @@ class PrivateKeyRule(Rule):
                         repair_template_key="rotate_private_key",
                     ))
                     pending = None
-                    continue
+                # While pending, IGNORE any new BEGIN headers on this line.
+                # Only the matching END can close the block.
+                continue
 
-            # --- Check for any BEGIN header on this line ---
+            # --- No pending BEGIN: check for a BEGIN header on this line ---
             begin_header: str | None = None
             begin_pos = -1
             end_header_matched: str | None = None
@@ -452,16 +518,13 @@ class PrivateKeyRule(Rule):
             if begin_header is None:
                 continue
 
-            # Found a BEGIN — if we had a pending one, DISCARD it (no Finding).
-            # This prevents result amplification from many consecutive BEGINs.
-            # The new BEGIN replaces the old pending.
-            pending = None
-
             # Check if END is on the same line (after BEGIN)
             if end_header_matched is not None:
                 end_pos = line.find(end_header_matched, begin_pos + len(begin_header))
                 if end_pos != -1:
                     # Complete on same line
+                    if len(findings) >= limit:
+                        return findings
                     key_type = begin_header.strip("-").strip()
                     findings.append(Finding(
                         rule_id=self.rule_id,
@@ -548,7 +611,10 @@ class PasswordAssignmentRule(Rule):
 
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
         findings: list[Finding] = []
+        limit = settings.scan_max_findings_per_rule_per_file
+        cache = _LineSnippetCache(lines)
         for i, line in enumerate(lines):
+            snippet = None
             for assignment in iter_assignments(line):
                 if classify_key(assignment.key_raw) != CATEGORY_PASSWORD:
                     continue
@@ -559,6 +625,8 @@ class PasswordAssignmentRule(Rule):
                     continue
                 if is_already_masked(value):
                     continue
+                if len(findings) >= limit:
+                    return findings
 
                 # Determine severity/confidence based on placeholder check
                 if _is_placeholder(value):
@@ -570,6 +638,8 @@ class PasswordAssignmentRule(Rule):
                     confidence = self.confidence
                     blocking = self.is_blocking
 
+                if snippet is None:
+                    snippet = cache.get(i, line)
                 findings.append(Finding(
                     rule_id=self.rule_id,
                     rule_name=self.rule_name,
@@ -580,7 +650,7 @@ class PasswordAssignmentRule(Rule):
                     line_end=i + 1,
                     column_start=assignment.value_start,
                     column_end=assignment.value_end,
-                    snippet_masked=_make_masked_snippet(line),
+                    snippet_masked=snippet,
                     is_blocking=blocking,
                     finding_type=self.finding_type,
                     description="Hardcoded password assignment detected",
@@ -636,7 +706,10 @@ class GenericTokenAssignmentRule(Rule):
 
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
         findings: list[Finding] = []
+        limit = settings.scan_max_findings_per_rule_per_file
+        cache = _LineSnippetCache(lines)
         for i, line in enumerate(lines):
+            snippet = None
             for assignment in iter_assignments(line):
                 category = classify_key(assignment.key_raw)
 
@@ -660,6 +733,8 @@ class GenericTokenAssignmentRule(Rule):
                     continue
                 if is_already_masked(value):
                     continue
+                if len(findings) >= limit:
+                    return findings
 
                 if _is_placeholder(value):
                     severity = Severity.LOW
@@ -680,6 +755,8 @@ class GenericTokenAssignmentRule(Rule):
                     secret_type = "generic_token"
                     repair_template_key = "use_env_var_secret"
 
+                if snippet is None:
+                    snippet = cache.get(i, line)
                 findings.append(Finding(
                     rule_id=self.rule_id,
                     rule_name=self.rule_name,
@@ -690,7 +767,7 @@ class GenericTokenAssignmentRule(Rule):
                     line_end=i + 1,
                     column_start=assignment.value_start,
                     column_end=assignment.value_end,
-                    snippet_masked=_make_masked_snippet(line),
+                    snippet_masked=snippet,
                     is_blocking=blocking,
                     finding_type=self.finding_type,
                     description=description,
@@ -711,6 +788,15 @@ class ConnectionStringRule(Rule):
 
     Pattern: scheme://user:password@host
 
+    Uses the SHARED ``iter_connection_strings`` matcher from
+    ``app.core.security.desensitize`` — the SAME matcher used by
+    ``mask_untrusted_text`` and ``mask_snippet``. No rule may maintain
+    a duplicate connection-string regex. The host/rest group stops at
+    source/config separators (quotes, backtick, comma, semicolon, right
+    bracket, right brace, whitespace), so multiple connection strings
+    on the same line are matched SEPARATELY — each produces its own
+    Finding and each password is masked.
+
     NOTE: Medium confidence, non-blocking. This is a heuristic detection;
     a future strict high-confidence mode may be added separately.
     """
@@ -722,23 +808,14 @@ class ConnectionStringRule(Rule):
     is_blocking = False
     finding_type = FindingType.CONTENT
 
-    # Accurately captures scheme://user:password@host with separate groups.
-    # Group 3 is the password — used for placeholder check and column range.
-    # Does NOT use r":([^@]+)@" which can over-capture.
-    _pattern = re.compile(
-        r"([a-zA-Z][a-zA-Z0-9+.-]*)"  # group 1: scheme
-        r"://"                         # ://
-        r"([^:/@\s]+)"                 # group 2: user
-        r":"                            # :
-        r"([^@\s]+)"                   # group 3: password
-        r"@"                            # @
-        r"(\S+)"                        # group 4: host/rest
-    )
-
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
         findings: list[Finding] = []
+        limit = settings.scan_max_findings_per_rule_per_file
+        cache = _LineSnippetCache(lines)
         for i, line in enumerate(lines):
-            for match in self._pattern.finditer(line):
+            snippet = None
+            for match in iter_connection_strings(line):
+                # group 3 is the password in the shared pattern
                 password = match.group(3)
 
                 # 1. Skip environment variable references
@@ -747,6 +824,8 @@ class ConnectionStringRule(Rule):
                 # 2. Skip already-masked values
                 if is_already_masked(password):
                     continue
+                if len(findings) >= limit:
+                    return findings
 
                 # 3. Placeholder / weak passwords: generate low/low/non-blocking
                 if _is_placeholder(password):
@@ -760,6 +839,8 @@ class ConnectionStringRule(Rule):
                     blocking = self.is_blocking
 
                 # 5. snippet always replaces password with ***
+                if snippet is None:
+                    snippet = cache.get(i, line)
                 findings.append(Finding(
                     rule_id=self.rule_id,
                     rule_name=self.rule_name,
@@ -770,7 +851,7 @@ class ConnectionStringRule(Rule):
                     line_end=i + 1,
                     column_start=match.start(3),
                     column_end=match.end(3),
-                    snippet_masked=_make_masked_snippet(line),
+                    snippet_masked=snippet,
                     is_blocking=blocking,
                     finding_type=self.finding_type,
                     description="Connection string with embedded password detected",
@@ -894,11 +975,14 @@ class ProductionEnvWithSecretRule(Rule):
             return []
 
         findings: list[Finding] = []
+        limit = settings.scan_max_findings_per_rule_per_file
+        cache = _LineSnippetCache(lines)
         for i, line in enumerate(lines):
             line_stripped = line.strip()
             if not line_stripped or line_stripped.startswith("#"):
                 continue
 
+            snippet = None
             for assignment in iter_assignments(line):
                 # --- Requirement 1: variable name must have sensitive semantics ---
                 if classify_key(assignment.key_raw) is None:
@@ -917,7 +1001,11 @@ class ProductionEnvWithSecretRule(Rule):
                     continue
                 if _is_likely_non_secret(value):
                     continue
+                if len(findings) >= limit:
+                    return findings
 
+                if snippet is None:
+                    snippet = cache.get(i, line)
                 findings.append(Finding(
                     rule_id=self.rule_id,
                     rule_name=self.rule_name,
@@ -928,7 +1016,7 @@ class ProductionEnvWithSecretRule(Rule):
                     line_end=i + 1,
                     column_start=assignment.value_start,
                     column_end=assignment.value_end,
-                    snippet_masked=_make_masked_snippet(line),
+                    snippet_masked=snippet,
                     is_blocking=self.is_blocking,
                     finding_type=self.finding_type,
                     description="Production environment file contains hardcoded secret",

@@ -924,8 +924,10 @@ class TestPrivateKeyLinearComplexity:
         Uses a CountingStr wrapper to verify that str.contains (via 'in')
         is called at most a constant multiple of the number of lines.
 
-        With the new incomplete-block handling, 500 consecutive BEGINs
-        produce at most 1 incomplete Finding (the last BEGIN), not 500.
+        With the pending semantics, while a BEGIN is pending the scanner
+        ONLY looks for the matching END — new BEGINs are ignored. So 500
+        consecutive BEGINs produce at most 1 incomplete Finding (the
+        FIRST BEGIN), not 500.
         """
         call_count = 0
 

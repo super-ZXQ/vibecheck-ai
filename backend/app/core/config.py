@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     # No line limit: files under scan_max_file_size are scanned in full.
     # Removing max_line_read prevents missing secrets in later lines.
     scan_max_file_size: int = 1024 * 1024  # 1 MB — skip files larger than this
+    # Safety bound: each rule may return at most this many Findings per
+    # file. Prevents result amplification from files containing thousands
+    # of format-correct tokens. When the limit is reached the rule stops
+    # building Findings but never returns raw secret content.
+    scan_max_findings_per_rule_per_file: int = 100
     scan_ignore_dirs: list[str] = [
         "node_modules", ".next", "dist", "build", "coverage",
         "__pycache__", ".git", "vendor", ".venv", "venv",

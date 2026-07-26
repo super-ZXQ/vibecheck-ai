@@ -1950,3 +1950,261 @@ class TestIncompletePrivateKeyCount:
         # Should complete quickly (O(n), not O(n²))
         # 10000 lines should take well under 5 seconds
         assert elapsed < 5.0, f"Scan took {elapsed:.2f}s for {n} lines"
+
+    def test_begin_begin_end_keeps_first_begin(self):
+        """BEGIN/BEGIN/END produces ONE Finding from line 1 to line 3.
+
+        With the revised pending semantics, while a BEGIN is pending the
+        scanner ONLY looks for the matching END — the second BEGIN is
+        IGNORED. The Finding spans from the FIRST BEGIN (line 1) to the
+        END (line 3).
+        """
+        from app.scanner.rules import PrivateKeyRule
+        rule = PrivateKeyRule()
+        lines = [
+            "-----BEGIN RSA PRIVATE KEY-----",   # line 1
+            "-----BEGIN RSA PRIVATE KEY-----",   # line 2 (ignored)
+            "-----END RSA PRIVATE KEY-----",     # line 3
+        ]
+        findings = rule.scan_content("dup_begin.pem", lines)
+        assert len(findings) == 1
+        f = findings[0]
+        assert f.line_start == 1
+        assert f.line_end == 3
+        assert f.is_blocking is True
+        assert f.snippet_masked == "<PRIVATE_KEY_REDACTED>"
+        assert "Incomplete" not in f.description
+
+
+# ============================================================================
+# --- Multiple connection strings on one line (leakage fix) ---
+# ============================================================================
+
+class TestMultipleConnectionStringsOneLine:
+    """Verify multiple connection strings on the same line are masked separately.
+
+    The old greedy \\S+ host pattern swallowed the second connection string,
+    causing only the first password to be masked. The shared separator-safe
+    matcher stops at quotes, commas, semicolons, brackets, braces, and
+    whitespace — so each connection string is matched independently.
+    """
+
+    def test_two_conn_strings_comma_separated(self):
+        """Two connection strings separated by a comma: both passwords masked."""
+        from app.core.security.desensitize import mask_untrusted_text, mask_snippet
+        line = (
+            f'postgres://u1:password1@host1/db,'
+            f'mysql://u2:password2@host2/db'
+        )
+        # mask_untrusted_text
+        result = mask_untrusted_text(line)
+        assert "password1" not in result
+        assert "password2" not in result
+        # mask_snippet
+        result2 = mask_snippet(line)
+        assert "password1" not in result2
+        assert "password2" not in result2
+
+    def test_two_conn_strings_semicolon_separated(self):
+        """Two connection strings separated by a semicolon: both passwords masked."""
+        from app.core.security.desensitize import mask_untrusted_text
+        line = (
+            f'postgres://u1:password1@host1/db;'
+            f'mysql://u2:password2@host2/db'
+        )
+        result = mask_untrusted_text(line)
+        assert "password1" not in result
+        assert "password2" not in result
+
+    def test_compact_json_object_two_conn_strings(self):
+        """Compact JSON object with two connection strings: both passwords masked."""
+        from app.core.security.desensitize import mask_untrusted_text, mask_snippet
+        line = (
+            '{"primary":"postgres://u1:password1@host1/db",'
+            '"backup":"mysql://u2:password2@host2/db"}'
+        )
+        result = mask_untrusted_text(line)
+        assert "password1" not in result
+        assert "password2" not in result
+        result2 = mask_snippet(line)
+        assert "password1" not in result2
+        assert "password2" not in result2
+
+    def test_compact_json_array_two_conn_strings(self):
+        """Compact JSON array with two connection strings: both passwords masked."""
+        from app.core.security.desensitize import mask_untrusted_text
+        line = (
+            '["postgres://u1:password1@host1/db",'
+            '"mysql://u2:password2@host2/db"]'
+        )
+        result = mask_untrusted_text(line)
+        assert "password1" not in result
+        assert "password2" not in result
+
+    def test_two_conn_strings_space_separated(self):
+        """Two connection strings separated by whitespace: both passwords masked."""
+        from app.core.security.desensitize import mask_untrusted_text
+        line = (
+            f'postgres://u1:password1@host1/db '
+            f'mysql://u2:password2@host2/db'
+        )
+        result = mask_untrusted_text(line)
+        assert "password1" not in result
+        assert "password2" not in result
+
+    def test_token_in_second_conn_string_fields(self):
+        """Token embedded in the SECOND connection string's user/pass/host/path."""
+        from app.core.security.desensitize import mask_untrusted_text, mask_snippet
+        # Token in username of second conn string
+        line = (
+            f'postgres://u1:pw1@host1/db,'
+            f'mysql://{SYNTH_GITHUB_TOKEN}:password2@host2/db'
+        )
+        result = mask_untrusted_text(line)
+        assert SYNTH_GITHUB_TOKEN not in result
+        assert "password2" not in result
+        # Token in password of second conn string
+        line2 = (
+            f'postgres://u1:pw1@host1/db,'
+            f'mysql://u2:{SYNTH_GITHUB_TOKEN}@host2/db'
+        )
+        result2 = mask_untrusted_text(line2)
+        assert SYNTH_GITHUB_TOKEN not in result2
+        # Token in host of second conn string
+        line3 = (
+            f'postgres://u1:pw1@host1/db,'
+            f'mysql://u2:pw2@{SYNTH_GITHUB_TOKEN}/db'
+        )
+        result3 = mask_untrusted_text(line3)
+        assert SYNTH_GITHUB_TOKEN not in result3
+        # Token in path of second conn string
+        line4 = (
+            f'postgres://u1:pw1@host1/db,'
+            f'mysql://u2:pw2@host2/{SYNTH_GITHUB_TOKEN}'
+        )
+        result4 = mask_untrusted_text(line4)
+        assert SYNTH_GITHUB_TOKEN not in result4
+        # mask_snippet too
+        result5 = mask_snippet(line)
+        assert SYNTH_GITHUB_TOKEN not in result5
+
+    def test_r008_two_findings_two_conn_strings(self):
+        """R008 produces TWO Findings for two connection strings on one line."""
+        from app.scanner.rules import ConnectionStringRule
+        rule = ConnectionStringRule()
+        line = (
+            f'DB_URL = "postgres://u1:password1@host1/db,'
+            f'mysql://u2:password2@host2/db"'
+        )
+        findings = rule.scan_content("config.py", [line])
+        assert len(findings) == 2
+        for f in findings:
+            assert "password1" not in f.snippet_masked
+            assert "password2" not in f.snippet_masked
+            assert SYNTH_GITHUB_TOKEN not in f.snippet_masked
+            # repr and JSON safety
+            assert "password1" not in repr(f)
+            assert "password2" not in repr(f)
+            f_json = json.dumps(dataclasses.asdict(f), default=str)
+            assert "password1" not in f_json
+            assert "password2" not in f_json
+
+
+# ============================================================================
+# --- Token amplification: snippet caching + Finding limit ---
+# ============================================================================
+
+class TestTokenAmplificationBound:
+    """Verify large token inputs don't cause CPU/result amplification.
+
+    - Snippet is computed at most ONCE per line (not per Finding).
+    - Finding count is capped at scan_max_findings_per_rule_per_file.
+    - Overall execution is approximately linear.
+    - No raw token appears in any returned object.
+    """
+
+    def test_snippet_computed_once_per_line(self):
+        """mask_snippet is called at most ONCE per line, not per Finding."""
+        from app.scanner.rules import GitHubTokenRule, _make_masked_snippet
+        import app.scanner.rules as rules_mod
+
+        call_count = 0
+        original = rules_mod._make_masked_snippet
+
+        def counting_make_snippet(line_text, max_length=200):
+            nonlocal call_count
+            call_count += 1
+            return original(line_text, max_length)
+
+        rules_mod._make_masked_snippet = counting_make_snippet
+        try:
+            rule = GitHubTokenRule()
+            # 50 tokens on one line
+            line = " ".join([SYNTH_GITHUB_TOKEN] * 50)
+            findings = rule.scan_content("many_tokens.py", [line])
+            # Should produce findings (capped at limit=100, so all 50)
+            assert len(findings) == 50
+            # Snippet should be computed exactly ONCE for this line
+            assert call_count == 1, (
+                f"Expected snippet to be computed once, got {call_count} calls"
+            )
+        finally:
+            rules_mod._make_masked_snippet = original
+
+    def test_finding_count_capped_at_limit(self):
+        """Single line with 1000 tokens: Finding count <= configured limit."""
+        from app.core.config import settings
+        from app.scanner.rules import GitHubTokenRule
+        rule = GitHubTokenRule()
+        line = " ".join([SYNTH_GITHUB_TOKEN] * 1000)
+        findings = rule.scan_content("huge.py", [line])
+        limit = settings.scan_max_findings_per_rule_per_file
+        assert len(findings) <= limit
+        assert len(findings) == limit
+
+    def test_10000_tokens_linear_and_capped(self):
+        """10000 tokens on one line: linear, capped, no raw token in output."""
+        from app.core.config import settings
+        from app.scanner.rules import GitHubTokenRule
+        rule = GitHubTokenRule()
+        n = 10000
+        line = " ".join([SYNTH_GITHUB_TOKEN] * n)
+        findings = rule.scan_content("massive.py", [line])
+        limit = settings.scan_max_findings_per_rule_per_file
+        # Capped
+        assert len(findings) <= limit
+        assert len(findings) == limit
+        # No raw token in any Finding
+        for f in findings:
+            assert SYNTH_GITHUB_TOKEN not in f.snippet_masked
+            assert SYNTH_GITHUB_TOKEN not in repr(f)
+            f_json = json.dumps(dataclasses.asdict(f), default=str)
+            assert SYNTH_GITHUB_TOKEN not in f_json
+
+    def test_snippet_cache_with_multiple_lines(self):
+        """Snippet cache works across multiple lines — one call per line."""
+        from app.scanner.rules import GitHubTokenRule, _make_masked_snippet
+        import app.scanner.rules as rules_mod
+
+        call_count = 0
+        original = rules_mod._make_masked_snippet
+
+        def counting_make_snippet(line_text, max_length=200):
+            nonlocal call_count
+            call_count += 1
+            return original(line_text, max_length)
+
+        rules_mod._make_masked_snippet = counting_make_snippet
+        try:
+            rule = GitHubTokenRule()
+            # 5 lines, each with 3 tokens
+            lines = [" ".join([SYNTH_GITHUB_TOKEN] * 3) for _ in range(5)]
+            findings = rule.scan_content("multi.py", lines)
+            # 5 lines * 3 tokens = 15 findings (under limit of 100)
+            assert len(findings) == 15
+            # One snippet call per line = 5 calls
+            assert call_count == 5, (
+                f"Expected 5 snippet calls (one per line), got {call_count}"
+            )
+        finally:
+            rules_mod._make_masked_snippet = original

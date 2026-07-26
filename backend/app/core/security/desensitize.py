@@ -760,9 +760,48 @@ _TOKEN_FORMAT_PATTERNS: list[tuple[re.Pattern, str]] = [
 # Connection string pattern — masked SECOND, after tokens are already
 # replaced. This ensures tokens inside the connection string are already
 # gone before the password-only masking runs.
+#
+# SECURITY: The host/rest group uses a NEGATED character class instead of
+# greedy \S+ so a single match CANNOT cross source/config separators:
+#   - double quote, single quote, backtick
+#   - comma, semicolon
+#   - right bracket ], right brace }
+#   - whitespace
+# This prevents one match from swallowing a second connection string on
+# the same line (e.g., JSON objects, comma/semicolon-separated lists).
+#
+# SHARED MATCHER: ConnectionStringRule imports and reuses this exact
+# pattern — no rule may maintain a duplicate connection-string regex.
+# Group layout (1-based):
+#   1: scheme
+#   2: user
+#   3: password
+#   4: host/rest (separator-safe)
 _CONNECTION_STRING_PATTERN: re.Pattern = re.compile(
-    r"([a-zA-Z][a-zA-Z0-9+.-]*://[^:/@\s]+:[^@\s]+@\S+)"
+    r"([a-zA-Z][a-zA-Z0-9+.-]*)"        # group 1: scheme
+    r"://"                               # ://
+    r"([^:/@\s\"'`,;\]}]+)"              # group 2: user (no separators)
+    r":"                                 # :
+    r"([^@\s\"'`,;\]}]+)"                # group 3: password (no separators)
+    r"@"                                 # @
+    r"([^\s\"'`,;\]}]+)"                 # group 4: host/rest (no separators)
 )
+
+
+def iter_connection_strings(text: str) -> Iterator[re.Match]:
+    """Yield all non-overlapping connection-string matches in ``text``.
+
+    Shared matcher used by BOTH ``mask_untrusted_text`` (via
+    ``_mask_connection_strings``) and ``ConnectionStringRule``. No rule
+    may duplicate the connection-string regex — import this function or
+    ``_CONNECTION_STRING_PATTERN`` instead.
+
+    Each match's host/rest group (group 4) stops at the first separator
+    character (quote, backtick, comma, semicolon, right bracket, right
+    brace, whitespace), so two connection strings on the same line are
+    matched separately.
+    """
+    yield from _CONNECTION_STRING_PATTERN.finditer(text)
 
 
 def _collect_token_ranges(text: str) -> list[_SecretRange]:
@@ -788,12 +827,18 @@ def _collect_token_ranges(text: str) -> list[_SecretRange]:
 
 
 def _apply_ranges(text: str, ranges: list[_SecretRange]) -> str:
-    """Sort, merge, and apply secret ranges to text (back-to-front replace).
+    """Sort, merge, and apply secret ranges to text.
 
     Overlapping ranges are merged by keeping the EARLIER range's
-    masked_value and extending the end. This is safe because ranges
+    ``masked_value`` and extending the end. This is safe because ranges
     collected within the same phase never overlap in problematic ways
     (different token formats are mutually exclusive).
+
+    LINEAR assembly: builds the result with a single forward pass that
+    appends untouched slices and masked values to a list, then
+    ``"".join(parts)``. Avoids the previous back-to-front pattern that
+    re-sliced the whole string for every range — O(n + k) instead of
+    O(n*k) where n = len(text) and k = number of ranges.
     """
     if not ranges:
         return text
@@ -810,10 +855,16 @@ def _apply_ranges(text: str, ranges: list[_SecretRange]) -> str:
                 )
         else:
             merged.append(r)
-    result = text
-    for r in reversed(merged):
-        result = result[:r.start] + r.masked_value + result[r.end:]
-    return result
+    parts: list[str] = []
+    cursor = 0
+    for r in merged:
+        if r.start > cursor:
+            parts.append(text[cursor:r.start])
+        parts.append(r.masked_value)
+        cursor = r.end
+    if cursor < len(text):
+        parts.append(text[cursor:])
+    return "".join(parts)
 
 
 def _mask_connection_strings(text: str) -> str:
@@ -823,14 +874,34 @@ def _mask_connection_strings(text: str) -> str:
     This function finds connection strings in the already-token-masked
     text and replaces the password portion with ***.
 
+    Uses the SHARED ``_CONNECTION_STRING_PATTERN`` (via
+    ``iter_connection_strings``) so the matcher stays in sync with
+    ``ConnectionStringRule``. The host/rest group stops at separators,
+    so multiple connection strings on the same line are masked
+    independently — each password becomes ***.
+
     Idempotent: if the password is already *** (from a previous pass),
     the connection string pattern still matches but replacing *** with
     *** is a no-op.
+
+    LINEAR assembly: ranges are sorted and applied via a single forward
+    pass that appends untouched slices and masked values to a list,
+    then ``"".join(parts)``. No repeated full-string slicing.
     """
-    def _replace_conn(m: re.Match) -> str:
-        full = m.group(1)
-        return mask_secret(full, CONNECTION_STRING)
-    return _CONNECTION_STRING_PATTERN.sub(_replace_conn, text)
+    ranges: list[_SecretRange] = []
+    for match in iter_connection_strings(text):
+        scheme = match.group(1)
+        user = match.group(2)
+        password = match.group(3)
+        host_rest = match.group(4)
+        masked_full = f"{scheme}://{user}:***@{host_rest}"
+        ranges.append(_SecretRange(
+            start=match.start(),
+            end=match.end(),
+            secret_type=CONNECTION_STRING,
+            masked_value=masked_full,
+        ))
+    return _apply_ranges(text, ranges)
 
 
 def mask_untrusted_text(text: str) -> str:
