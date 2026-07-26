@@ -4,6 +4,7 @@ Sensitive values (GitHub Token, LLM API Key) are read from environment variables
 and NEVER hardcoded. This module is the single source of truth for all limits.
 """
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -33,6 +34,18 @@ class Settings(BaseSettings):
     # of format-correct tokens. When the limit is reached the rule stops
     # building Findings but never returns raw secret content.
     scan_max_findings_per_rule_per_file: int = 100
+
+    @field_validator("scan_max_findings_per_rule_per_file")
+    @classmethod
+    def enforce_min_findings_limit(cls, v: int) -> int:
+        """Ensure the per-rule finding limit is at least 1.
+
+        A limit of 0 would silently disable ALL detection for every rule,
+        which is never the intended configuration. Clamp to 1 so at least
+        one finding per rule per file is always retained.
+        """
+        return max(1, v)
+
     scan_ignore_dirs: list[str] = [
         "node_modules", ".next", "dist", "build", "coverage",
         "__pycache__", ".git", "vendor", ".venv", "venv",

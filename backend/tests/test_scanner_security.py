@@ -43,7 +43,14 @@ _MIXED_UPPER = "ABCDEF1234567890GHIJKLMNOP"
 SYNTH_GITHUB_TOKEN = "ghp_" + _MIXED[:36]
 SYNTH_AWS_KEY = "AKIA" + _MIXED_UPPER[:16]
 SYNTH_AWS_SECRET = ("AbCdEf1234" * 4)[:40]
+SYNTH_GOOGLE_KEY = "AIza" + _MIXED[:35]
 SYNTH_PASSWORD = "s3cur3P@ssw0rd!"
+
+# Low-entropy placeholder tokens (all same char after prefix)
+LOW_GITHUB = "ghp_" + "A" * 36
+LOW_AWS_KEY = "AKIA" + "X" * 16
+LOW_AWS_SECRET = "X" * 40
+LOW_GOOGLE = "AIza" + "X" * 35
 
 
 # ============================================================================
@@ -2208,3 +2215,258 @@ class TestTokenAmplificationBound:
             )
         finally:
             rules_mod._make_masked_snippet = original
+
+
+# ============================================================================
+# --- Risk-priority bounded retention tests ---
+# ============================================================================
+
+class TestRiskPriorityRetention:
+    """Verify high-risk findings are preserved when under result caps.
+
+    100 low-entropy placeholder tokens must NOT evict the 101st real
+    blocking token. The BoundedFindingCollector always keeps the
+    highest-risk findings, replacing low-risk ones when the limit is
+    reached.
+    """
+
+    def test_100_low_github_then_1_high_risk(self):
+        """100 low-entropy GitHub tokens + 1 real token: real one is kept."""
+        from app.scanner.rules import GitHubTokenRule
+
+        rule = GitHubTokenRule()
+        # 100 low-entropy placeholders
+        low_lines = [f"token = '{LOW_GITHUB}'" for _ in range(100)]
+        # 1 real high-entropy token on line 101
+        high_line = f"token = '{SYNTH_GITHUB_TOKEN}'"
+        lines = low_lines + [high_line]
+
+        findings = rule.scan_content("many_tokens.py", lines)
+        limit = 100
+
+        # Should have exactly limit findings
+        assert len(findings) <= limit
+        assert len(findings) == limit
+
+        # At least one finding should be blocking (the real token)
+        blocking = [f for f in findings if f.is_blocking]
+        assert len(blocking) >= 1
+
+        # The blocking finding should point to line 101
+        assert any(f.line_start == 101 for f in blocking)
+
+        # No raw token should appear in any finding
+        for f in findings:
+            assert SYNTH_GITHUB_TOKEN not in f.snippet_masked
+            assert SYNTH_GITHUB_TOKEN not in repr(f)
+
+    def test_100_low_aws_access_then_1_high_risk(self):
+        """100 low-entropy AWS access keys + 1 real key: real one is kept."""
+        from app.scanner.rules import AWSAccessKeyRule
+
+        rule = AWSAccessKeyRule()
+        low_lines = [f"key = {LOW_AWS_KEY}" for _ in range(100)]
+        high_line = f"key = {SYNTH_AWS_KEY}"
+        lines = low_lines + [high_line]
+
+        findings = rule.scan_content("many_keys.py", lines)
+        limit = 100
+
+        assert len(findings) <= limit
+        assert len(findings) == limit
+
+        blocking = [f for f in findings if f.is_blocking]
+        assert len(blocking) >= 1
+        assert any(f.line_start == 101 for f in blocking)
+
+        for f in findings:
+            assert SYNTH_AWS_KEY not in f.snippet_masked
+            assert SYNTH_AWS_KEY not in repr(f)
+
+    def test_100_low_aws_secret_then_1_high_risk(self):
+        """100 low-entropy AWS secret keys + 1 real secret: real one is kept."""
+        from app.scanner.rules import AWSSecretKeyRule
+
+        rule = AWSSecretKeyRule()
+        low_lines = [f"aws_secret_access_key = {LOW_AWS_SECRET}" for _ in range(100)]
+        high_line = f"aws_secret_access_key = {SYNTH_AWS_SECRET}"
+        lines = low_lines + [high_line]
+
+        findings = rule.scan_content("many_secrets.py", lines)
+        limit = 100
+
+        assert len(findings) <= limit
+        assert len(findings) == limit
+
+        blocking = [f for f in findings if f.is_blocking]
+        assert len(blocking) >= 1
+        assert any(f.line_start == 101 for f in blocking)
+
+        for f in findings:
+            assert SYNTH_AWS_SECRET not in f.snippet_masked
+            assert SYNTH_AWS_SECRET not in repr(f)
+
+    def test_100_low_google_then_1_high_risk(self):
+        """100 low-entropy Google API keys + 1 real key: real one is kept."""
+        from app.scanner.rules import GoogleAPIKeyRule
+
+        rule = GoogleAPIKeyRule()
+        low_lines = [f"key = '{LOW_GOOGLE}'" for _ in range(100)]
+        high_line = f"key = '{SYNTH_GOOGLE_KEY}'"
+        lines = low_lines + [high_line]
+
+        findings = rule.scan_content("many_google_keys.py", lines)
+        limit = 100
+
+        assert len(findings) <= limit
+        assert len(findings) == limit
+
+        blocking = [f for f in findings if f.is_blocking]
+        assert len(blocking) >= 1
+        assert any(f.line_start == 101 for f in blocking)
+
+        for f in findings:
+            assert SYNTH_GOOGLE_KEY not in f.snippet_masked
+            assert SYNTH_GOOGLE_KEY not in repr(f)
+
+    def test_limit_1_low_then_high_keeps_high(self, monkeypatch):
+        """With limit=1: first low, second blocking — blocking is kept."""
+        from app.core.config import settings
+        from app.scanner.rules import GitHubTokenRule
+
+        monkeypatch.setattr(settings, "scan_max_findings_per_rule_per_file", 1)
+
+        rule = GitHubTokenRule()
+        # Line 1: low-entropy (non-blocking)
+        # Line 2: real token (blocking)
+        lines = [
+            f"token = '{LOW_GITHUB}'",
+            f"token = '{SYNTH_GITHUB_TOKEN}'",
+        ]
+
+        findings = rule.scan_content("limit1.py", lines)
+
+        # Only 1 finding (limit=1)
+        assert len(findings) == 1
+
+        # The retained finding MUST be the blocking one
+        f = findings[0]
+        assert f.is_blocking is True
+        assert f.severity == Severity.CRITICAL
+        assert f.line_start == 2  # points to the real token
+
+        # No raw token in output
+        assert SYNTH_GITHUB_TOKEN not in f.snippet_masked
+        assert SYNTH_GITHUB_TOKEN not in repr(f)
+
+    def test_cross_line_high_risk_at_last_line(self):
+        """100 low tokens at file start, real token at last line: still BLOCKED."""
+        from app.scanner.rules import GitHubTokenRule
+
+        rule = GitHubTokenRule()
+        # 100 lines of low-entropy tokens
+        low_lines = [f"t = '{LOW_GITHUB}'" for _ in range(100)]
+        # Real token on the last line (line 101)
+        lines = low_lines + [f"t = '{SYNTH_GITHUB_TOKEN}'"]
+
+        findings = rule.scan_content("cross_line.py", lines)
+
+        # Must have at least one blocking finding
+        blocking = [f for f in findings if f.is_blocking]
+        assert len(blocking) >= 1
+
+        # The blocking finding must point to the last line
+        last_line = len(lines)
+        assert any(f.line_start == last_line for f in blocking)
+
+        # No raw token in output
+        for f in findings:
+            assert SYNTH_GITHUB_TOKEN not in f.snippet_masked
+            assert SYNTH_GITHUB_TOKEN not in repr(f)
+
+    def test_scan_directory_e2e_with_low_and_high(self, tmp_path):
+        """End-to-end: repo with many low-entropy tokens + 1 real token."""
+        from pathlib import Path
+
+        # Create a file with 100 low-entropy tokens and 1 real token
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        config_file = repo_dir / "config.py"
+
+        lines = [f"token_{i} = '{LOW_GITHUB}'" for i in range(100)]
+        lines.append(f"real_token = '{SYNTH_GITHUB_TOKEN}'")
+        config_file.write_text("\n".join(lines), encoding="utf-8")
+
+        result = scan_directory(Path(repo_dir))
+
+        # result.findings must contain at least one blocking finding
+        blocking = [f for f in result.findings if f.is_blocking]
+        assert len(blocking) >= 1
+
+        # No raw token in any finding
+        for f in result.findings:
+            assert SYNTH_GITHUB_TOKEN not in f.snippet_masked
+            assert SYNTH_GITHUB_TOKEN not in repr(f)
+
+    def test_10000_tokens_snippet_calls_constant(self):
+        """10000 tokens: Finding count capped, snippet calls stay constant."""
+        import app.scanner.rules as rules_mod
+        from app.core.config import settings
+        from app.scanner.rules import GitHubTokenRule
+
+        call_count = 0
+        original = rules_mod._make_masked_snippet
+
+        def counting_make_snippet(line_text, max_length=200):
+            nonlocal call_count
+            call_count += 1
+            return original(line_text, max_length)
+
+        rules_mod._make_masked_snippet = counting_make_snippet
+        try:
+            rule = GitHubTokenRule()
+            # 10000 low-entropy tokens on one line + 1 real token
+            low_part = " ".join([LOW_GITHUB] * 10000)
+            high_part = SYNTH_GITHUB_TOKEN
+            line = f"{low_part} {high_part}"
+
+            findings = rule.scan_content("massive.py", [line])
+            limit = settings.scan_max_findings_per_rule_per_file
+
+            # Finding count capped
+            assert len(findings) <= limit
+            assert len(findings) == limit
+
+            # Snippet calls: exactly 1 (one line, cached)
+            # should_accept() prevents snippet computation for evicted candidates
+            assert call_count == 1, (
+                f"Expected 1 snippet call (cached per line), got {call_count}"
+            )
+
+            # At least one blocking finding (the real token)
+            blocking = [f for f in findings if f.is_blocking]
+            assert len(blocking) >= 1
+
+            # No raw token in output
+            for f in findings:
+                assert SYNTH_GITHUB_TOKEN not in f.snippet_masked
+                assert SYNTH_GITHUB_TOKEN not in repr(f)
+                f_json = json.dumps(dataclasses.asdict(f), default=str)
+                assert SYNTH_GITHUB_TOKEN not in f_json
+        finally:
+            rules_mod._make_masked_snippet = original
+
+    def test_config_limit_0_clamped_to_1(self):
+        """Config value of 0 is clamped to 1 by the validator."""
+        from app.core.config import Settings
+
+        s = Settings(scan_max_findings_per_rule_per_file=0)
+        assert s.scan_max_findings_per_rule_per_file >= 1
+        assert s.scan_max_findings_per_rule_per_file == 1
+
+    def test_config_limit_negative_clamped_to_1(self):
+        """Config value of -5 is clamped to 1 by the validator."""
+        from app.core.config import Settings
+
+        s = Settings(scan_max_findings_per_rule_per_file=-5)
+        assert s.scan_max_findings_per_rule_per_file == 1

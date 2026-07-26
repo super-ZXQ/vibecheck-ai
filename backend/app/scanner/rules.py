@@ -161,6 +161,174 @@ class _LineSnippetCache:
         return snippet
 
 
+# Risk ordering for BoundedFindingCollector.
+# Higher number = higher risk. Used to compare Findings so that blocking
+# critical findings are never evicted by low-entropy placeholders.
+_SEVERITY_RANK: dict[Severity, int] = {
+    Severity.CRITICAL: 5,
+    Severity.HIGH: 4,
+    Severity.MEDIUM: 3,
+    Severity.LOW: 2,
+    Severity.INFO: 1,
+}
+_CONFIDENCE_RANK: dict[Confidence, int] = {
+    Confidence.HIGH: 3,
+    Confidence.MEDIUM: 2,
+    Confidence.LOW: 1,
+}
+
+
+def _finding_risk_key(f: Finding) -> tuple[int, int, int, int, int, str]:
+    """Risk-sort key for a Finding.
+
+    Higher tuple = higher risk. Ordering:
+      1. is_blocking (True first)
+      2. severity rank (critical > high > medium > low > info)
+      3. confidence rank (high > medium > low)
+      4. line_start (earlier = higher priority when risk ties)
+      5. column_start (earlier = higher priority)
+      6. rule_id (stable tiebreaker)
+    """
+    return (
+        1 if f.is_blocking else 0,
+        _SEVERITY_RANK.get(f.severity, 0),
+        _CONFIDENCE_RANK.get(f.confidence, 0),
+        -f.line_start if f.line_start is not None else 0,
+        -f.column_start if f.column_start is not None else 0,
+        f.rule_id,
+    )
+
+
+class BoundedFindingCollector:
+    """Risk-priority bounded collector for a single rule's Findings.
+
+    Keeps at most ``limit`` Findings per rule per file, but ALWAYS
+    preserves the highest-risk ones. This prevents 100 low-entropy
+    placeholder tokens from evicting the 101st real blocking token.
+
+    Scanning continues across the ENTIRE file — the limit is never used
+    as an early-exit gate. When the list is full:
+    - A new candidate with risk <= the current minimum is SKIPPED (no
+      Finding object constructed, no snippet computed).
+    - A new candidate with risk > the current minimum REPLACES the
+      minimum.
+
+    After scanning, call ``finalize()`` to get the list restored to
+    stable file order (by line_start, column_start, rule_id).
+
+    Usage::
+
+        collector = BoundedFindingCollector(limit=100)
+        for i, line in enumerate(lines):
+            for match in pattern.finditer(line):
+                severity, confidence, blocking = classify(...)
+                if not collector.should_accept(severity, confidence, blocking, i+1, match.start()):
+                    continue
+                snippet = cache.get(i, line)
+                collector.add(Finding(...))
+        findings = collector.finalize()
+    """
+
+    __slots__ = ("_limit", "_findings", "_min_key", "_min_index")
+
+    def __init__(self, limit: int) -> None:
+        # Guard against misconfiguration (limit <= 0). At least 1 so
+        # detection is never fully disabled.
+        self._limit = max(1, limit)
+        self._findings: list[Finding] = []
+        self._min_key: tuple | None = None
+        self._min_index: int = 0
+
+    def _candidate_key(
+        self,
+        is_blocking: bool,
+        severity: Severity,
+        confidence: Confidence,
+        line_start: int,
+        column_start: int,
+        rule_id: str,
+    ) -> tuple[int, int, int, int, int, str]:
+        return (
+            1 if is_blocking else 0,
+            _SEVERITY_RANK.get(severity, 0),
+            _CONFIDENCE_RANK.get(confidence, 0),
+            -line_start,
+            -column_start,
+            rule_id,
+        )
+
+    def should_accept(
+        self,
+        is_blocking: bool,
+        severity: Severity,
+        confidence: Confidence,
+        line_start: int,
+        column_start: int,
+        rule_id: str,
+    ) -> bool:
+        """Check whether a candidate would be kept, WITHOUT constructing a Finding.
+
+        Call this BEFORE building the Finding object and BEFORE computing
+        the snippet. This avoids wasted work when the candidate would be
+        evicted anyway.
+
+        Returns True if:
+        - The list is not yet full, OR
+        - The candidate's risk is higher than the current minimum.
+        """
+        if len(self._findings) < self._limit:
+            return True
+        # List is full — compare against the minimum.
+        candidate_key = self._candidate_key(
+            is_blocking, severity, confidence, line_start, column_start, rule_id,
+        )
+        return candidate_key > (self._min_key or ())
+
+    def add(self, finding: Finding) -> None:
+        """Add a Finding to the collector, evicting the lowest-risk if full."""
+        f_key = _finding_risk_key(finding)
+        if len(self._findings) < self._limit:
+            self._findings.append(finding)
+            # Update min tracking
+            if self._min_key is None or f_key < self._min_key:
+                self._min_key = f_key
+                self._min_index = len(self._findings) - 1
+        else:
+            # Full — replace the minimum if new is higher risk
+            if f_key > (self._min_key or ()):
+                self._findings[self._min_index] = finding
+                # Recompute min (the replaced slot's old min is gone)
+                self._recompute_min()
+
+    def _recompute_min(self) -> None:
+        """Recompute the minimum-risk slot after a replacement."""
+        if not self._findings:
+            self._min_key = None
+            self._min_index = 0
+            return
+        min_key = _finding_risk_key(self._findings[0])
+        min_index = 0
+        for idx in range(1, len(self._findings)):
+            k = _finding_risk_key(self._findings[idx])
+            if k < min_key:
+                min_key = k
+                min_index = idx
+        self._min_key = min_key
+        self._min_index = min_index
+
+    def finalize(self) -> list[Finding]:
+        """Return findings in stable file order (line, column, rule_id)."""
+        result = sorted(
+            self._findings,
+            key=lambda f: (
+                f.line_start if f.line_start is not None else 0,
+                f.column_start if f.column_start is not None else 0,
+                f.rule_id,
+            ),
+        )
+        return result
+
+
 # ---------------------------------------------------------------------------
 # --- R001: GitHub Token ---
 # ---------------------------------------------------------------------------
@@ -178,14 +346,10 @@ class GitHubTokenRule(Rule):
     _pattern = re.compile(r"ghp_[A-Za-z0-9]{36}")
 
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
-        findings: list[Finding] = []
-        limit = settings.scan_max_findings_per_rule_per_file
+        collector = BoundedFindingCollector(settings.scan_max_findings_per_rule_per_file)
         cache = _LineSnippetCache(lines)
         for i, line in enumerate(lines):
-            snippet = None
             for match in self._pattern.finditer(line):
-                if len(findings) >= limit:
-                    return findings
                 token = match.group()
                 # Low-entropy placeholder downgrade (e.g., ghp_AAAAAA...)
                 if is_low_entropy(token, prefix_len=4):
@@ -196,9 +360,12 @@ class GitHubTokenRule(Rule):
                     severity = self.severity
                     confidence = self.confidence
                     blocking = self.is_blocking
-                if snippet is None:
-                    snippet = cache.get(i, line)
-                findings.append(Finding(
+                if not collector.should_accept(
+                    blocking, severity, confidence, i + 1, match.start(), self.rule_id,
+                ):
+                    continue
+                snippet = cache.get(i, line)
+                collector.add(Finding(
                     rule_id=self.rule_id,
                     rule_name=self.rule_name,
                     severity=severity,
@@ -217,7 +384,7 @@ class GitHubTokenRule(Rule):
                     message="GitHub personal access token detected",
                     repair_template_key="rotate_github_token",
                 ))
-        return findings
+        return collector.finalize()
 
 
 # ---------------------------------------------------------------------------
@@ -237,14 +404,10 @@ class AWSAccessKeyRule(Rule):
     _pattern = re.compile(r"AKIA[A-Z0-9]{16}")
 
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
-        findings: list[Finding] = []
-        limit = settings.scan_max_findings_per_rule_per_file
+        collector = BoundedFindingCollector(settings.scan_max_findings_per_rule_per_file)
         cache = _LineSnippetCache(lines)
         for i, line in enumerate(lines):
-            snippet = None
             for match in self._pattern.finditer(line):
-                if len(findings) >= limit:
-                    return findings
                 token = match.group()
                 if is_low_entropy(token, prefix_len=4):
                     severity = Severity.LOW
@@ -254,9 +417,12 @@ class AWSAccessKeyRule(Rule):
                     severity = self.severity
                     confidence = self.confidence
                     blocking = self.is_blocking
-                if snippet is None:
-                    snippet = cache.get(i, line)
-                findings.append(Finding(
+                if not collector.should_accept(
+                    blocking, severity, confidence, i + 1, match.start(), self.rule_id,
+                ):
+                    continue
+                snippet = cache.get(i, line)
+                collector.add(Finding(
                     rule_id=self.rule_id,
                     rule_name=self.rule_name,
                     severity=severity,
@@ -275,7 +441,7 @@ class AWSAccessKeyRule(Rule):
                     message="AWS access key ID detected",
                     repair_template_key="rotate_aws_credentials",
                 ))
-        return findings
+        return collector.finalize()
 
 
 # ---------------------------------------------------------------------------
@@ -299,11 +465,9 @@ class AWSSecretKeyRule(Rule):
     finding_type = FindingType.CONTENT
 
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
-        findings: list[Finding] = []
-        limit = settings.scan_max_findings_per_rule_per_file
+        collector = BoundedFindingCollector(settings.scan_max_findings_per_rule_per_file)
         cache = _LineSnippetCache(lines)
         for i, line in enumerate(lines):
-            snippet = None
             for assignment in iter_assignments(line):
                 if classify_key(assignment.key_raw) != CATEGORY_AWS_SECRET:
                     continue
@@ -317,8 +481,6 @@ class AWSSecretKeyRule(Rule):
                     continue
                 if _is_placeholder(value):
                     continue
-                if len(findings) >= limit:
-                    return findings
                 # Low-entropy placeholder downgrade (e.g., all same char)
                 if is_low_entropy(value, prefix_len=0):
                     severity = Severity.LOW
@@ -328,9 +490,12 @@ class AWSSecretKeyRule(Rule):
                     severity = self.severity
                     confidence = self.confidence
                     blocking = self.is_blocking
-                if snippet is None:
-                    snippet = cache.get(i, line)
-                findings.append(Finding(
+                if not collector.should_accept(
+                    blocking, severity, confidence, i + 1, assignment.value_start, self.rule_id,
+                ):
+                    continue
+                snippet = cache.get(i, line)
+                collector.add(Finding(
                     rule_id=self.rule_id,
                     rule_name=self.rule_name,
                     severity=severity,
@@ -349,7 +514,7 @@ class AWSSecretKeyRule(Rule):
                     message="AWS secret access key detected",
                     repair_template_key="rotate_aws_credentials",
                 ))
-        return findings
+        return collector.finalize()
 
 
 # ---------------------------------------------------------------------------
@@ -369,14 +534,10 @@ class GoogleAPIKeyRule(Rule):
     _pattern = re.compile(r"AIza[A-Za-z0-9_\-]{35}")
 
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
-        findings: list[Finding] = []
-        limit = settings.scan_max_findings_per_rule_per_file
+        collector = BoundedFindingCollector(settings.scan_max_findings_per_rule_per_file)
         cache = _LineSnippetCache(lines)
         for i, line in enumerate(lines):
-            snippet = None
             for match in self._pattern.finditer(line):
-                if len(findings) >= limit:
-                    return findings
                 token = match.group()
                 if is_low_entropy(token, prefix_len=4):
                     severity = Severity.LOW
@@ -386,9 +547,12 @@ class GoogleAPIKeyRule(Rule):
                     severity = self.severity
                     confidence = self.confidence
                     blocking = self.is_blocking
-                if snippet is None:
-                    snippet = cache.get(i, line)
-                findings.append(Finding(
+                if not collector.should_accept(
+                    blocking, severity, confidence, i + 1, match.start(), self.rule_id,
+                ):
+                    continue
+                snippet = cache.get(i, line)
+                collector.add(Finding(
                     rule_id=self.rule_id,
                     rule_name=self.rule_name,
                     severity=severity,
@@ -407,7 +571,7 @@ class GoogleAPIKeyRule(Rule):
                     message="Google API key detected",
                     repair_template_key="rotate_google_api_key",
                 ))
-        return findings
+        return collector.finalize()
 
 
 # ---------------------------------------------------------------------------
@@ -610,11 +774,9 @@ class PasswordAssignmentRule(Rule):
     finding_type = FindingType.CONTENT
 
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
-        findings: list[Finding] = []
-        limit = settings.scan_max_findings_per_rule_per_file
+        collector = BoundedFindingCollector(settings.scan_max_findings_per_rule_per_file)
         cache = _LineSnippetCache(lines)
         for i, line in enumerate(lines):
-            snippet = None
             for assignment in iter_assignments(line):
                 if classify_key(assignment.key_raw) != CATEGORY_PASSWORD:
                     continue
@@ -625,8 +787,6 @@ class PasswordAssignmentRule(Rule):
                     continue
                 if is_already_masked(value):
                     continue
-                if len(findings) >= limit:
-                    return findings
 
                 # Determine severity/confidence based on placeholder check
                 if _is_placeholder(value):
@@ -638,9 +798,12 @@ class PasswordAssignmentRule(Rule):
                     confidence = self.confidence
                     blocking = self.is_blocking
 
-                if snippet is None:
-                    snippet = cache.get(i, line)
-                findings.append(Finding(
+                if not collector.should_accept(
+                    blocking, severity, confidence, i + 1, assignment.value_start, self.rule_id,
+                ):
+                    continue
+                snippet = cache.get(i, line)
+                collector.add(Finding(
                     rule_id=self.rule_id,
                     rule_name=self.rule_name,
                     severity=severity,
@@ -659,7 +822,7 @@ class PasswordAssignmentRule(Rule):
                     message="Hardcoded password assignment detected",
                     repair_template_key="use_env_var_password",
                 ))
-        return findings
+        return collector.finalize()
 
 
 # ---------------------------------------------------------------------------
@@ -705,11 +868,9 @@ class GenericTokenAssignmentRule(Rule):
     _AWS_STRICT_FORMAT = re.compile(r"[A-Za-z0-9/+]{40}")
 
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
-        findings: list[Finding] = []
-        limit = settings.scan_max_findings_per_rule_per_file
+        collector = BoundedFindingCollector(settings.scan_max_findings_per_rule_per_file)
         cache = _LineSnippetCache(lines)
         for i, line in enumerate(lines):
-            snippet = None
             for assignment in iter_assignments(line):
                 category = classify_key(assignment.key_raw)
 
@@ -733,8 +894,6 @@ class GenericTokenAssignmentRule(Rule):
                     continue
                 if is_already_masked(value):
                     continue
-                if len(findings) >= limit:
-                    return findings
 
                 if _is_placeholder(value):
                     severity = Severity.LOW
@@ -744,6 +903,11 @@ class GenericTokenAssignmentRule(Rule):
                     severity = self.severity
                     confidence = self.confidence
                     blocking = self.is_blocking
+
+                if not collector.should_accept(
+                    blocking, severity, confidence, i + 1, assignment.value_start, self.rule_id,
+                ):
+                    continue
 
                 # Use appropriate description based on category
                 if category == CATEGORY_AWS_SECRET:
@@ -755,9 +919,8 @@ class GenericTokenAssignmentRule(Rule):
                     secret_type = "generic_token"
                     repair_template_key = "use_env_var_secret"
 
-                if snippet is None:
-                    snippet = cache.get(i, line)
-                findings.append(Finding(
+                snippet = cache.get(i, line)
+                collector.add(Finding(
                     rule_id=self.rule_id,
                     rule_name=self.rule_name,
                     severity=severity,
@@ -776,7 +939,7 @@ class GenericTokenAssignmentRule(Rule):
                     message=description,
                     repair_template_key=repair_template_key,
                 ))
-        return findings
+        return collector.finalize()
 
 
 # ---------------------------------------------------------------------------
@@ -809,11 +972,9 @@ class ConnectionStringRule(Rule):
     finding_type = FindingType.CONTENT
 
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
-        findings: list[Finding] = []
-        limit = settings.scan_max_findings_per_rule_per_file
+        collector = BoundedFindingCollector(settings.scan_max_findings_per_rule_per_file)
         cache = _LineSnippetCache(lines)
         for i, line in enumerate(lines):
-            snippet = None
             for match in iter_connection_strings(line):
                 # group 3 is the password in the shared pattern
                 password = match.group(3)
@@ -824,8 +985,6 @@ class ConnectionStringRule(Rule):
                 # 2. Skip already-masked values
                 if is_already_masked(password):
                     continue
-                if len(findings) >= limit:
-                    return findings
 
                 # 3. Placeholder / weak passwords: generate low/low/non-blocking
                 if _is_placeholder(password):
@@ -838,10 +997,14 @@ class ConnectionStringRule(Rule):
                     confidence = self.confidence
                     blocking = self.is_blocking
 
+                if not collector.should_accept(
+                    blocking, severity, confidence, i + 1, match.start(3), self.rule_id,
+                ):
+                    continue
+
                 # 5. snippet always replaces password with ***
-                if snippet is None:
-                    snippet = cache.get(i, line)
-                findings.append(Finding(
+                snippet = cache.get(i, line)
+                collector.add(Finding(
                     rule_id=self.rule_id,
                     rule_name=self.rule_name,
                     severity=severity,
@@ -860,7 +1023,7 @@ class ConnectionStringRule(Rule):
                     message="Connection string with embedded password detected",
                     repair_template_key="use_env_var_connection_string",
                 ))
-        return findings
+        return collector.finalize()
 
 
 # ---------------------------------------------------------------------------
@@ -974,15 +1137,13 @@ class ProductionEnvWithSecretRule(Rule):
         if basename not in self._env_filenames:
             return []
 
-        findings: list[Finding] = []
-        limit = settings.scan_max_findings_per_rule_per_file
+        collector = BoundedFindingCollector(settings.scan_max_findings_per_rule_per_file)
         cache = _LineSnippetCache(lines)
         for i, line in enumerate(lines):
             line_stripped = line.strip()
             if not line_stripped or line_stripped.startswith("#"):
                 continue
 
-            snippet = None
             for assignment in iter_assignments(line):
                 # --- Requirement 1: variable name must have sensitive semantics ---
                 if classify_key(assignment.key_raw) is None:
@@ -1001,12 +1162,15 @@ class ProductionEnvWithSecretRule(Rule):
                     continue
                 if _is_likely_non_secret(value):
                     continue
-                if len(findings) >= limit:
-                    return findings
 
-                if snippet is None:
-                    snippet = cache.get(i, line)
-                findings.append(Finding(
+                if not collector.should_accept(
+                    self.is_blocking, self.severity, self.confidence,
+                    i + 1, assignment.value_start, self.rule_id,
+                ):
+                    continue
+
+                snippet = cache.get(i, line)
+                collector.add(Finding(
                     rule_id=self.rule_id,
                     rule_name=self.rule_name,
                     severity=self.severity,
@@ -1025,4 +1189,4 @@ class ProductionEnvWithSecretRule(Rule):
                     message="Production environment file contains hardcoded secret",
                     repair_template_key="use_env_var_production",
                 ))
-        return findings
+        return collector.finalize()
