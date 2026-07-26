@@ -12,8 +12,11 @@ SECURITY:
 - Only reads the desensitized result_json / summary_json from SQLite.
 - assessment_json output contains NO raw secrets, NO temp paths,
   NO internal exception objects.
-- All string fields in blocking_reasons are already desensitized by
-  P0-5's persistence boundary — we trust the persisted data.
+- The persistence boundary (save_assessment_result) applies a SECOND
+  defensive desensitization pass via mask_untrusted_text on all string
+  fields, even though P0-5 already desensitized the input.
+- The serialization boundary (serialize_assessment_result) enforces
+  strict field whitelists — unknown fields are discarded.
 
 DETERMINISM:
 - Same (policy_version, persisted ScanResult, summary) → identical output.
@@ -22,6 +25,15 @@ DETERMINISM:
 - score_breakdown is sorted by rule_id (alphabetical).
 - score_caps are sorted by (cap_value ASC, reason_code ASC).
 - Only created_at, updated_at, task_id may differ between runs.
+
+TIMESTAMPS:
+- assess_scan_result returns None for created_at and updated_at.
+- save_assessment_result determines the final timestamps in a single
+  persistence flow:
+  - First save: created_at = now, updated_at = now.
+  - Upsert: created_at preserved from existing row, updated_at = now.
+- The same timestamp values are used in both assessment_json and the
+  database columns, ensuring consistency.
 
 ASYNC:
 - Database reads/writes and assessment computation are synchronous.
@@ -35,6 +47,7 @@ import json
 from typing import Any, Optional
 
 from app.core.config import settings
+from app.core.security.desensitize import mask_untrusted_text
 from app.db.database import _get_connection, init_db, now_iso
 from app.services.assessment_policy import (
     ASSESSMENT_SCHEMA_VERSION,
@@ -80,6 +93,239 @@ class AssessmentResultTooLargeError(Exception):
     fixed error code ASSESSMENT_RESULT_TOO_LARGE.
     """
     pass
+
+
+class AssessmentInternalError(Exception):
+    """Raised when reading or parsing a persisted scan result fails,
+    or when assessment computation fails.
+
+    The caller (background_runner) catches this and maps it to the
+    fixed error code ASSESSMENT_INTERNAL_ERROR.
+    """
+    pass
+
+
+class AssessmentPersistError(Exception):
+    """Raised when SQLite assessment persistence fails.
+
+    The caller (background_runner) catches this and maps it to the
+    fixed error code ASSESSMENT_PERSIST_FAILED.
+    """
+    pass
+
+
+# ---------------------------------------------------------------------------
+# --- Explicit serialization boundary ---
+# ---------------------------------------------------------------------------
+#
+# serialize_assessment_result is the ONLY function that builds the dict
+# that gets persisted as assessment_json. It enforces:
+# 1. Strict top-level field whitelist (unknown fields are discarded).
+# 2. Forced canonical values for schema_version, policy_version,
+#    assessment_scope, and task_id (never trusts the input dict).
+# 3. Type validation for score, score_before_caps, and verdict.
+# 4. Per-field whitelist for all nested structures.
+# 5. Defensive desensitization via mask_untrusted_text on all string
+#    fields that could carry untrusted content.
+# 6. No vars(), __dict__, asdict, or recursive serialization of unknown
+#    objects — every field is explicitly constructed.
+
+
+def _safe_masked_str(value: Any) -> str:
+    """Convert a value to str and apply defensive desensitization.
+
+    mask_untrusted_text is idempotent: re-processing an already-masked
+    string produces the same output. None is converted to empty string.
+    """
+    if value is None:
+        return ""
+    return mask_untrusted_text(str(value))
+
+
+def _serialize_score_breakdown_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """Whitelist and mask a single score_breakdown entry.
+
+    Allowed fields:
+    - reason_code, rule_id, category, severity (masked strings)
+    - finding_count, deduction_before_rule_cap, rule_cap,
+      applied_deduction (ints)
+    - occurrence_deductions (list of ints)
+    - description (masked string)
+    """
+    return {
+        "reason_code": _safe_masked_str(entry.get("reason_code")),
+        "rule_id": _safe_masked_str(entry.get("rule_id")),
+        "category": _safe_masked_str(entry.get("category")),
+        "severity": _safe_masked_str(entry.get("severity")),
+        "finding_count": int(entry.get("finding_count", 0)),
+        "occurrence_deductions": [
+            int(d) for d in entry.get("occurrence_deductions", [])
+        ],
+        "deduction_before_rule_cap": int(
+            entry.get("deduction_before_rule_cap", 0)
+        ),
+        "rule_cap": int(entry.get("rule_cap", 0)),
+        "applied_deduction": int(entry.get("applied_deduction", 0)),
+        "description": _safe_masked_str(entry.get("description")),
+    }
+
+
+def _serialize_score_cap_entry(cap: dict[str, Any]) -> dict[str, Any]:
+    """Whitelist and mask a single score_caps entry.
+
+    Allowed fields:
+    - reason_code, description (masked strings)
+    - cap_value, score_before_cap, score_after_cap (ints)
+    - applied (bool)
+    """
+    return {
+        "reason_code": _safe_masked_str(cap.get("reason_code")),
+        "cap_value": int(cap.get("cap_value", 0)),
+        "score_before_cap": int(cap.get("score_before_cap", 0)),
+        "score_after_cap": int(cap.get("score_after_cap", 0)),
+        "applied": bool(cap.get("applied", False)),
+        "description": _safe_masked_str(cap.get("description")),
+    }
+
+
+def _serialize_blocking_reason_entry(reason: dict[str, Any]) -> dict[str, Any]:
+    """Whitelist and mask a single blocking_reasons entry.
+
+    Allowed fields:
+    - rule_id, rule_name, severity, file_path, description (masked strings)
+
+    file_path uses mask_untrusted_text (the existing path desensitization
+    capability) which masks format-correct tokens embedded in paths.
+    """
+    return {
+        "rule_id": _safe_masked_str(reason.get("rule_id")),
+        "rule_name": _safe_masked_str(reason.get("rule_name")),
+        "severity": _safe_masked_str(reason.get("severity")),
+        "file_path": _safe_masked_str(reason.get("file_path")),
+        "description": _safe_masked_str(reason.get("description")),
+    }
+
+
+def _serialize_coverage(coverage: dict[str, Any]) -> dict[str, Any]:
+    """Whitelist and mask the coverage structure.
+
+    Allowed fields:
+    - status (string)
+    - reasons (list of masked strings)
+    - total_findings, scored_findings, total_blocking_findings,
+      returned_blocking_reasons, total_scan_errors,
+      total_files_scanned, total_skipped_files (ints)
+    - findings_truncated, blocking_reasons_truncated (bools)
+    """
+    return {
+        "status": _safe_masked_str(coverage.get("status")),
+        "reasons": [
+            _safe_masked_str(r) for r in coverage.get("reasons", [])
+        ],
+        "total_findings": int(coverage.get("total_findings", 0)),
+        "scored_findings": int(coverage.get("scored_findings", 0)),
+        "findings_truncated": bool(coverage.get("findings_truncated", False)),
+        "total_blocking_findings": int(
+            coverage.get("total_blocking_findings", 0)
+        ),
+        "returned_blocking_reasons": int(
+            coverage.get("returned_blocking_reasons", 0)
+        ),
+        "blocking_reasons_truncated": bool(
+            coverage.get("blocking_reasons_truncated", False)
+        ),
+        "total_scan_errors": int(coverage.get("total_scan_errors", 0)),
+        "total_files_scanned": int(coverage.get("total_files_scanned", 0)),
+        "total_skipped_files": int(coverage.get("total_skipped_files", 0)),
+    }
+
+
+def serialize_assessment_result(
+    task_id: str,
+    assessment: dict[str, Any],
+    created_at: Optional[str],
+    updated_at: str,
+) -> dict[str, Any]:
+    """Explicit serialization boundary for AssessmentResult.
+
+    This is the ONLY function that constructs the dict persisted as
+    assessment_json. It enforces strict field whitelists and defensive
+    desensitization.
+
+    Top-level allowed fields:
+    - schema_version, policy_version, assessment_scope (forced from
+      policy constants, NOT from the input assessment dict)
+    - task_id (from the parameter, NOT from the assessment dict)
+    - score, score_before_caps (int, clamped to [0, 100])
+    - verdict (only "pass", "warning", "blocked")
+    - score_breakdown, score_caps, blocking_reasons, coverage
+      (per-field whitelisted and masked)
+    - created_at, updated_at (from parameters)
+
+    Unknown fields in the input assessment dict are silently discarded.
+    No vars(), __dict__, asdict, or recursive serialization of unknown
+    objects is performed.
+
+    Args:
+        task_id:     The authoritative task ID (from the caller, NOT
+                     from assessment["task_id"]).
+        assessment:  The raw assessment dict from assess_scan_result().
+        created_at:  The original created_at (None for first save,
+                     preserved from DB for upsert).
+        updated_at:  The current timestamp for this save.
+
+    Returns:
+        A safe, explicitly-constructed dict with only whitelisted fields.
+    """
+    # --- Force canonical identity fields from policy ---
+    # Never trust the input dict for these — they are policy constants.
+    # --- Type-validate score ---
+    raw_score = assessment.get("score", 0)
+    try:
+        score = int(raw_score)
+    except (TypeError, ValueError):
+        score = 0
+    score = max(0, min(100, score))
+
+    raw_score_before_caps = assessment.get("score_before_caps", 0)
+    try:
+        score_before_caps = int(raw_score_before_caps)
+    except (TypeError, ValueError):
+        score_before_caps = 0
+    score_before_caps = max(0, min(100, score_before_caps))
+
+    # --- Validate verdict ---
+    verdict = assessment.get("verdict", "blocked")
+    if verdict not in ("pass", "warning", "blocked"):
+        verdict = "blocked"
+
+    # --- Explicitly construct the safe dict ---
+    # Every field is whitelisted and constructed by hand.
+    # No unknown fields can leak through.
+    return {
+        "schema_version": ASSESSMENT_SCHEMA_VERSION,
+        "policy_version": POLICY_VERSION,
+        "assessment_scope": ASSESSMENT_SCOPE,
+        "task_id": task_id,
+        "score": score,
+        "score_before_caps": score_before_caps,
+        "verdict": verdict,
+        "score_breakdown": [
+            _serialize_score_breakdown_entry(e)
+            for e in assessment.get("score_breakdown", [])
+        ],
+        "score_caps": [
+            _serialize_score_cap_entry(c)
+            for c in assessment.get("score_caps", [])
+        ],
+        "blocking_reasons": [
+            _serialize_blocking_reason_entry(r)
+            for r in assessment.get("blocking_reasons", [])
+        ],
+        "coverage": _serialize_coverage(assessment.get("coverage", {})),
+        "created_at": created_at,
+        "updated_at": updated_at,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -475,6 +721,9 @@ def assess_scan_result(task_id: str, scan_result: dict[str, Any]) -> dict[str, A
             score_breakdown, score_caps, blocking_reasons,
             coverage, created_at, updated_at
         }
+
+    Note: created_at and updated_at are set to None — the persistence
+    layer (save_assessment_result) determines the final timestamps.
     """
     findings = scan_result.get("findings", [])
     summary = scan_result.get("summary", {})
@@ -513,7 +762,9 @@ def assess_scan_result(task_id: str, scan_result: dict[str, Any]) -> dict[str, A
     )
 
     # --- 7. Assemble AssessmentResult ---
-    now = now_iso()
+    # Timestamps are None — the persistence layer (save_assessment_result)
+    # determines the final created_at and updated_at in a single
+    # persistence flow, ensuring JSON and DB columns are identical.
     return {
         "schema_version": ASSESSMENT_SCHEMA_VERSION,
         "policy_version": POLICY_VERSION,
@@ -526,8 +777,8 @@ def assess_scan_result(task_id: str, scan_result: dict[str, Any]) -> dict[str, A
         "score_caps": score_caps,
         "blocking_reasons": blocking_reasons,
         "coverage": coverage,
-        "created_at": now,
-        "updated_at": now,
+        "created_at": None,
+        "updated_at": None,
     }
 
 
@@ -565,7 +816,7 @@ def save_assessment_result(
     task_id: str,
     assessment: dict[str, Any],
     source_scan_updated_at: str,
-) -> None:
+) -> dict[str, Any]:
     """Persist an assessment result to the assessment_results table.
 
     Uses SQLite native upsert (INSERT ON CONFLICT DO UPDATE):
@@ -574,32 +825,79 @@ def save_assessment_result(
     - source_scan_updated_at tracks which scan_results version this
       assessment was computed from.
 
+    This function is the EXPLICIT SERIALIZATION BOUNDARY:
+    - Calls serialize_assessment_result() to build a safe dict with
+      strict field whitelists and defensive desensitization.
+    - Forces schema_version, policy_version, assessment_scope, and
+      task_id from policy constants / parameters — never trusts the
+      input assessment dict.
+    - The same created_at and updated_at values are used in both the
+      assessment_json and the database columns, ensuring consistency.
+
     Args:
-        task_id:                The task ID.
-        assessment:             The AssessmentResult dict.
+        task_id:                The authoritative task ID (used for both
+                                the DB primary key and the JSON task_id).
+        assessment:             The AssessmentResult dict from
+                                assess_scan_result(). Its task_id,
+                                schema_version, etc. are NOT trusted.
         source_scan_updated_at: The updated_at of the scan_results row
                                 this assessment was computed from.
+
+    Returns:
+        The final safe persisted dict (as written to assessment_json).
+        This is the authoritative version — callers should use this
+        return value rather than the pre-save assessment dict.
 
     Raises:
         AssessmentResultTooLargeError: If serialized assessment_json exceeds
             assessment_max_json_bytes.
-        sqlite3.Error: If the database operation fails.
+        AssessmentPersistError: If the database operation fails.
     """
     init_db()
     now = now_iso()
 
-    # Explicit serialization — no vars(), __dict__, asdict, or recursive
-    # serialization. json.dumps with sort_keys for deterministic output.
-    assessment_json = json.dumps(assessment, ensure_ascii=False, sort_keys=True)
-
-    # Check byte size limit.
-    if len(assessment_json.encode("utf-8")) > settings.assessment_max_json_bytes:
-        raise AssessmentResultTooLargeError(
-            "assessment_json exceeds assessment_max_json_bytes"
-        )
-
     conn = _get_connection()
     try:
+        # --- Determine created_at ---
+        # For upsert, read the original created_at from the existing row.
+        # For first save, created_at = now.
+        existing = conn.execute(
+            "SELECT created_at FROM assessment_results WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+
+        if existing is not None:
+            created_at = existing["created_at"]
+        else:
+            created_at = now
+
+        # --- Explicit serialization boundary ---
+        # Build the safe dict with strict whitelists and defensive masking.
+        # task_id comes from the parameter, NOT from assessment["task_id"].
+        # schema_version, policy_version, assessment_scope come from policy.
+        safe_assessment = serialize_assessment_result(
+            task_id=task_id,
+            assessment=assessment,
+            created_at=created_at,
+            updated_at=now,
+        )
+
+        # --- Serialize to JSON ---
+        # json.dumps with sort_keys for deterministic output.
+        # Only the already-safe dict is serialized — no vars, __dict__, asdict.
+        assessment_json = json.dumps(
+            safe_assessment, ensure_ascii=False, sort_keys=True
+        )
+
+        # --- Check byte size limit ---
+        if len(assessment_json.encode("utf-8")) > settings.assessment_max_json_bytes:
+            raise AssessmentResultTooLargeError(
+                "assessment_json exceeds assessment_max_json_bytes"
+            )
+
+        # --- Execute upsert ---
+        # The SAME created_at and updated_at values are used in both the
+        # assessment_json and the database columns.
         conn.execute(
             """INSERT INTO assessment_results
                (task_id, schema_version, policy_version, assessment_scope,
@@ -617,20 +915,28 @@ def save_assessment_result(
                    updated_at=excluded.updated_at""",
             (
                 task_id,
-                assessment["schema_version"],
-                assessment["policy_version"],
-                assessment["assessment_scope"],
+                safe_assessment["schema_version"],
+                safe_assessment["policy_version"],
+                safe_assessment["assessment_scope"],
                 assessment_json,
-                assessment["score"],
-                assessment["verdict"],
+                safe_assessment["score"],
+                safe_assessment["verdict"],
                 source_scan_updated_at,
-                now,  # created_at — only set on first INSERT, preserved on UPDATE
-                now,  # updated_at — always updated
+                created_at,  # created_at — preserved on UPDATE
+                now,         # updated_at — always updated
             ),
         )
         conn.commit()
+    except AssessmentResultTooLargeError:
+        raise
+    except Exception as exc:
+        # Wrap unexpected DB errors in AssessmentPersistError.
+        # Never expose str(exc) or repr(exc) to callers.
+        raise AssessmentPersistError("Failed to persist assessment result") from exc
     finally:
         conn.close()
+
+    return safe_assessment
 
 
 def get_assessment_result(task_id: str) -> Optional[dict[str, Any]]:
@@ -702,32 +1008,54 @@ def run_assessment(task_id: str) -> dict[str, Any]:
 
     1. Reads the persisted scan result from scan_results (NOT from temp).
     2. Computes the assessment using assess_scan_result().
-    3. Persists the assessment to assessment_results.
+    3. Persists the assessment to assessment_results via
+       save_assessment_result(), which applies the explicit serialization
+       boundary and defensive desensitization.
 
-    If the scan result is missing or the assessment is too large,
-    raises an appropriate exception for the caller to handle.
+    Returns the FINAL PERSISTED version (the safe dict from
+    save_assessment_result), NOT the pre-save assessment dict. This
+    ensures callers see the exact data that was written to the database,
+    including correct timestamps and masked fields.
 
     Args:
         task_id: The task ID to assess.
 
     Returns:
-        The AssessmentResult dict.
+        The final persisted AssessmentResult dict.
 
     Raises:
-        ValueError: If no scan result has been persisted for this task.
+        AssessmentInternalError: If reading or parsing the scan result
+            fails, or if assessment computation fails.
         AssessmentResultTooLargeError: If the assessment exceeds size limit.
-        sqlite3.Error: If the database operation fails.
+        AssessmentPersistError: If the database persistence fails.
     """
     # Step 1: Read persisted scan result with timestamp.
-    scan_data = get_scan_result_with_timestamp(task_id)
+    try:
+        scan_data = get_scan_result_with_timestamp(task_id)
+    except Exception as exc:
+        raise AssessmentInternalError(
+            "Failed to read persisted scan result"
+        ) from exc
+
     if scan_data is None:
-        raise ValueError(f"No scan result found for task {task_id}")
+        raise AssessmentInternalError(
+            f"No scan result found for task {task_id}"
+        )
     scan_result, source_scan_updated_at = scan_data
 
     # Step 2: Compute assessment.
-    assessment = assess_scan_result(task_id, scan_result)
+    try:
+        assessment = assess_scan_result(task_id, scan_result)
+    except Exception as exc:
+        raise AssessmentInternalError(
+            "Assessment computation failed"
+        ) from exc
 
-    # Step 3: Persist assessment.
-    save_assessment_result(task_id, assessment, source_scan_updated_at)
+    # Step 3: Persist assessment and return the final persisted version.
+    # save_assessment_result applies the serialization boundary and
+    # returns the safe dict that was actually written to the database.
+    persisted = save_assessment_result(
+        task_id, assessment, source_scan_updated_at
+    )
 
-    return assessment
+    return persisted

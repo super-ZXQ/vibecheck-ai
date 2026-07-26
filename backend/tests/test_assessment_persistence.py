@@ -12,7 +12,7 @@
 9. get_assessment_score_verdict 对不存在的任务返回 None
 10. get_assessment_result 对不存在的任务返回 None
 11. run_assessment 从 SQLite 读取（非临时目录），计算并持久化
-12. run_assessment 在无扫描结果时抛出 ValueError
+12. run_assessment 在无扫描结果时抛出 AssessmentInternalError
 13. 完整往返：创建任务 → 保存扫描 → run_assessment → get_assessment_result
 """
 
@@ -31,6 +31,9 @@ from app.services.assessment_service import (
     get_assessment_score_verdict,
     get_scan_result_with_timestamp,
     run_assessment,
+    serialize_assessment_result,
+    AssessmentInternalError,
+    AssessmentPersistError,
     AssessmentResultTooLargeError,
 )
 from app.services.scan_result_service import save_scan_result, serialize_scan_result
@@ -353,14 +356,14 @@ class TestAssessmentPersistence:
         assert score_verdict[0] == assessment["score"]
         assert score_verdict[1] == assessment["verdict"]
 
-    def test_run_assessment_raises_value_error_without_scan_result(self, test_db):
-        """run_assessment 在无扫描结果时应抛出 ValueError。"""
+    def test_run_assessment_raises_internal_error_without_scan_result(self, test_db):
+        """run_assessment 在无扫描结果时应抛出 AssessmentInternalError。"""
         # 创建任务但不保存扫描结果
         task = task_manager.create_task(
             "https://github.com/test/repo", "test", "repo"
         )
 
-        with pytest.raises(ValueError, match="No scan result found"):
+        with pytest.raises(AssessmentInternalError):
             run_assessment(task.id)
 
     def test_full_round_trip(self, test_db):

@@ -72,6 +72,8 @@ from app.core.safe_extract import (
 )
 from app.scanner.sensitive import scan_directory
 from app.services.assessment_service import (
+    AssessmentInternalError,
+    AssessmentPersistError,
     AssessmentResultTooLargeError,
     run_assessment,
 )
@@ -260,11 +262,12 @@ async def _process_task(task_id: str) -> None:
                 get_error_message(ASSESSMENT_RESULT_TOO_LARGE),
             )
             return
-        except ValueError as e:
-            # No scan result found — should not happen after successful
-            # persistence, but handle defensively.
+        except AssessmentInternalError as e:
+            # Reading or parsing the persisted scan result failed, or
+            # assessment computation failed.
+            # Log only the exception type — never str(exc) or stack traces.
             logger.error(
-                "Assessment failed (no scan result) for task %s: %s",
+                "Assessment internal error for task %s: %s",
                 task_id, type(e).__name__,
             )
             mark_failed(
@@ -272,7 +275,20 @@ async def _process_task(task_id: str) -> None:
                 get_error_message(ASSESSMENT_INTERNAL_ERROR),
             )
             return
+        except AssessmentPersistError as e:
+            # SQLite assessment_results write failed.
+            # Log only the exception type — never str(exc) or DB errors.
+            logger.error(
+                "Assessment persistence failed for task %s: %s",
+                task_id, type(e).__name__,
+            )
+            mark_failed(
+                task_id, ASSESSMENT_PERSIST_FAILED,
+                get_error_message(ASSESSMENT_PERSIST_FAILED),
+            )
+            return
         except Exception as e:
+            # Catch-all for any unexpected error not covered above.
             # Log only the exception type — never str(exc) or DB errors.
             logger.error(
                 "Assessment failed for task %s: %s",

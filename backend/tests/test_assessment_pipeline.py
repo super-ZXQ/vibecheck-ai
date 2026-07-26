@@ -4,11 +4,12 @@
 1. 完整管道成功：mock download/extract/scan → 任务完成，评估存在，分数/判定可用
 2. 评估从 SQLite 读取（非临时）：管道完成后临时目录已清理，评估仍可读
 3. 评估在完成前成功：评估失败时任务不被标记为已完成
-4. 评估计算失败：mock run_assessment 抛出 Exception → 任务失败 ASSESSMENT_PERSIST_FAILED
-5. 评估结果过大：mock run_assessment 抛出 AssessmentResultTooLargeError → 任务失败 ASSESSMENT_RESULT_TOO_LARGE
-6. 失败任务不返回残留评估：评估已保存但 mark_completed 失败时，API 返回安全空评估
-7. 清理在所有路径中执行（成功、扫描失败、评估失败）
-8. 事件循环保持响应（管道完成不阻塞）
+4. 评估内部错误：mock run_assessment 抛出 AssessmentInternalError → 任务失败 ASSESSMENT_INTERNAL_ERROR
+5. 评估持久化失败：mock run_assessment 抛出 AssessmentPersistError → 任务失败 ASSESSMENT_PERSIST_FAILED
+6. 评估结果过大：mock run_assessment 抛出 AssessmentResultTooLargeError → 任务失败 ASSESSMENT_RESULT_TOO_LARGE
+7. 失败任务不返回残留评估：评估已保存但 mark_completed 失败时，API 返回安全空评估
+8. 清理在所有路径中执行（成功、扫描失败、评估失败）
+9. 事件循环保持响应（管道完成不阻塞）
 """
 
 import asyncio
@@ -26,11 +27,14 @@ from app.services.background_runner import _process_task, reset_runner_state
 from app.services.assessment_service import (
     get_assessment_result,
     get_assessment_score_verdict,
+    AssessmentInternalError,
+    AssessmentPersistError,
     AssessmentResultTooLargeError,
 )
 from app.services.scan_result_service import get_scan_result
 from app.scanner.base import ScanResult, Finding, Severity, Confidence, FindingType
 from app.core.error_codes import (
+    ASSESSMENT_INTERNAL_ERROR,
     ASSESSMENT_PERSIST_FAILED,
     ASSESSMENT_RESULT_TOO_LARGE,
     SCAN_INTERNAL_ERROR,
@@ -297,8 +301,8 @@ class TestAssessmentPipeline:
         assert result.status == "failed"
         assert result.status != "completed"
 
-    def test_assessment_computation_failure(self, test_db, tmp_path):
-        """评估计算失败：mock run_assessment 抛出 Exception → 任务失败 ASSESSMENT_PERSIST_FAILED。"""
+    def test_assessment_internal_error(self, test_db, tmp_path):
+        """评估内部错误：mock run_assessment 抛出 AssessmentInternalError → 任务失败 ASSESSMENT_INTERNAL_ERROR。"""
         task = task_manager.create_task(
             "https://github.com/testuser/testrepo", "testuser", "testrepo"
         )
@@ -321,7 +325,39 @@ class TestAssessmentPipeline:
                 ):
                     with patch(
                         "app.services.background_runner.run_assessment",
-                        side_effect=Exception("DB write failed"),
+                        side_effect=AssessmentInternalError("Computation failed"),
+                    ):
+                        _run_pipeline(task.id)
+
+        result = task_manager.get_task(task.id)
+        assert result.status == "failed"
+        assert result.error_code == ASSESSMENT_INTERNAL_ERROR
+
+    def test_assessment_persist_failed(self, test_db, tmp_path):
+        """评估持久化失败：mock run_assessment 抛出 AssessmentPersistError → 任务失败 ASSESSMENT_PERSIST_FAILED。"""
+        task = task_manager.create_task(
+            "https://github.com/testuser/testrepo", "testuser", "testrepo"
+        )
+
+        download_result = make_mock_download_result(tmp_path)
+        extract_result = make_mock_extract_result(tmp_path)
+        scan_result = make_mock_scan_result()
+
+        with patch(
+            "app.services.background_runner.download_tarball",
+            return_value=download_result,
+        ):
+            with patch(
+                "app.services.background_runner.safe_extract_to_temp",
+                return_value=extract_result,
+            ):
+                with patch(
+                    "app.services.background_runner.scan_directory",
+                    return_value=scan_result,
+                ):
+                    with patch(
+                        "app.services.background_runner.run_assessment",
+                        side_effect=AssessmentPersistError("DB write failed"),
                     ):
                         _run_pipeline(task.id)
 
