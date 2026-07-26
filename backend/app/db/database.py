@@ -6,6 +6,11 @@ Design:
 - WAL mode enabled for better concurrency.
 - Thread-safe via check_same_thread=False + short-lived connections.
 - NEVER stores downloaded files, code snippets, or sensitive content.
+
+Tables:
+- tasks:       Task lifecycle records (P0-3).
+- scan_results: Persisted scan result snapshots (P0-5). One row per task_id.
+               result_json contains only desensitized public models from P0-4.
 """
 
 import sqlite3
@@ -83,6 +88,26 @@ def init_db() -> None:
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at)
             """)
+            # --- scan_results: one persisted snapshot per task (P0-5) ---
+            # result_json contains ONLY desensitized public models from P0-4.
+            # Never stores raw secrets, absolute paths, or internal objects.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS scan_results (
+                    task_id TEXT PRIMARY KEY,
+                    schema_version INTEGER NOT NULL,
+                    result_json TEXT NOT NULL,
+                    total_findings INTEGER NOT NULL,
+                    blocking_findings INTEGER NOT NULL,
+                    total_notices INTEGER NOT NULL,
+                    total_skipped_files INTEGER NOT NULL,
+                    total_scan_errors INTEGER NOT NULL,
+                    total_files_scanned INTEGER NOT NULL,
+                    total_lines_scanned INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (task_id) REFERENCES tasks(id)
+                )
+            """)
             conn.commit()
             _initialized = True
         finally:
@@ -95,6 +120,8 @@ def reset_db() -> None:
     with _init_lock:
         conn = _get_connection()
         try:
+            # Drop scan_results first (FK references tasks)
+            conn.execute("DROP TABLE IF EXISTS scan_results")
             conn.execute("DROP TABLE IF EXISTS tasks")
             conn.commit()
         finally:
