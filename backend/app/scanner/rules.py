@@ -221,8 +221,11 @@ class BoundedFindingCollector:
         collector = BoundedFindingCollector(limit=100)
         for i, line in enumerate(lines):
             for match in pattern.finditer(line):
-                severity, confidence, blocking = classify(...)
-                if not collector.should_accept(severity, confidence, blocking, i+1, match.start()):
+                blocking, severity, confidence = classify(...)
+                if not collector.should_accept(
+                    blocking, severity, confidence,
+                    i + 1, match.start(), self.rule_id,
+                ):
                     continue
                 snippet = cache.get(i, line)
                 collector.add(Finding(...))
