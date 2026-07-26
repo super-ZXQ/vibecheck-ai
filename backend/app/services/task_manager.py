@@ -29,6 +29,7 @@ STAGE_QUEUED = "queued"
 STAGE_DOWNLOADING = "downloading"
 STAGE_EXTRACTING = "extracting"
 STAGE_SCANNING = "scanning"
+STAGE_ASSESSING = "assessing"
 STAGE_FINISHED = "finished"
 
 
@@ -87,6 +88,12 @@ class TaskRecord:
         For completed tasks WITHOUT a persisted result (e.g. legacy
         tasks from before P0-5), scan_summary is None and report_url
         is None — the result endpoint will return SCAN_RESULT_MISSING.
+
+        For completed tasks with a persisted assessment (P0-6), includes
+        security_score, security_verdict, and assessment_url.
+        For completed tasks WITHOUT a persisted assessment (e.g. legacy
+        P0-5 tasks), these fields are None — the assessment endpoint
+        will return ASSESSMENT_NOT_AVAILABLE.
         """
         resp = {
             "task_id": self.id,
@@ -114,6 +121,21 @@ class TaskRecord:
                 resp["report_url"] = f"/api/check/{self.id}/result"
             else:
                 resp["report_url"] = None
+
+            # Include lightweight assessment fields (P0-6)
+            # Reads ONLY the redundant score and verdict columns —
+            # does NOT parse the full assessment_json.
+            # For legacy P0-5 tasks without an assessment, these are None.
+            from app.services.assessment_service import get_assessment_score_verdict
+            assessment_data = get_assessment_score_verdict(self.id)
+            if assessment_data is not None:
+                resp["security_score"] = assessment_data[0]
+                resp["security_verdict"] = assessment_data[1]
+                resp["assessment_url"] = f"/api/check/{self.id}/assessment"
+            else:
+                resp["security_score"] = None
+                resp["security_verdict"] = None
+                resp["assessment_url"] = None
         return resp
 
 

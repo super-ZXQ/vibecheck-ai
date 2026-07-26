@@ -1,12 +1,13 @@
-"""Background task runner — processes download + extract + scan sequentially.
+"""Background task runner — processes download + extract + scan + assess sequentially.
 
 Concurrency model (MVP):
 - Only 1 task runs at a time (global asyncio.Lock).
 - Pending tasks wait in the SQLite queue.
 - After each task completes, the next pending task is automatically picked up.
 
-Pipeline stages (P0-5):
-  download → extract → scan → persist → completed → cleanup
+Pipeline stages (P0-6):
+  download → extract → scan → persist scan result → assess → persist
+  assessment → completed → cleanup
 
 Error handling:
 - All errors are mapped to machine-readable error codes.
@@ -14,17 +15,26 @@ Error handling:
 - Temp files are always cleaned up via try/finally.
 - No code from the repository is ever executed.
 - Scanner exceptions are caught and mapped to SCAN_INTERNAL_ERROR.
-- Persistence exceptions are caught and mapped to SCAN_RESULT_PERSIST_FAILED.
-- Oversized results are caught and mapped to SCAN_RESULT_TOO_LARGE.
+- Scan persistence exceptions are caught and mapped to SCAN_RESULT_PERSIST_FAILED.
+- Oversized scan results are caught and mapped to SCAN_RESULT_TOO_LARGE.
+- Assessment exceptions are caught and mapped to ASSESSMENT_INTERNAL_ERROR
+  or ASSESSMENT_PERSIST_FAILED or ASSESSMENT_RESULT_TOO_LARGE.
 - Logs never contain str(exc), repr(exc), repo content, or absolute paths.
 
-Non-blocking I/O (P0-5):
-- scan_directory and save_scan_result are synchronous, CPU/IO-bound
-  operations. They are executed via asyncio.to_thread so the FastAPI
-  event loop remains responsive during scanning and persistence.
+Non-blocking I/O (P0-5/P0-6):
+- scan_directory, save_scan_result, and run_assessment are synchronous,
+  CPU/IO-bound operations. They are executed via asyncio.to_thread so
+  the FastAPI event loop stays responsive.
 - No asyncio.wait_for or hard timeout — relies on P0-4 built-in limits.
 - Cleanup (temp file deletion) only runs AFTER the thread completes,
   guaranteed by await on asyncio.to_thread.
+
+Assessment boundary (P0-6):
+- Assessment reads ONLY from persisted scan_results (never from temp).
+- Assessment must succeed BEFORE mark_completed.
+- If assessment fails, the task is marked failed — even if scan_results
+  was already persisted. The failed task's assessment API will NOT
+  return residual assessment data.
 """
 
 import asyncio
@@ -33,6 +43,9 @@ from pathlib import Path
 
 from app.core.config import settings
 from app.core.error_codes import (
+    ASSESSMENT_INTERNAL_ERROR,
+    ASSESSMENT_PERSIST_FAILED,
+    ASSESSMENT_RESULT_TOO_LARGE,
     DOWNLOAD_FAILED,
     DOWNLOAD_TOO_LARGE,
     EXTRACTION_LIMIT_EXCEEDED,
@@ -58,8 +71,13 @@ from app.core.safe_extract import (
     cleanup_temp_dir,
 )
 from app.scanner.sensitive import scan_directory
+from app.services.assessment_service import (
+    AssessmentResultTooLargeError,
+    run_assessment,
+)
 from app.services.scan_result_service import save_scan_result, ScanResultTooLargeError
 from app.services.task_manager import (
+    STAGE_ASSESSING,
     STAGE_DOWNLOADING,
     STAGE_EXTRACTING,
     STAGE_SCANNING,
@@ -100,18 +118,19 @@ def _map_extraction_error(error: ExtractionError) -> tuple[str, str]:
 
 
 async def _process_task(task_id: str) -> None:
-    """Process a single task: download → extract → scan → persist → complete.
+    """Process a single task: download → extract → scan → assess → complete.
 
     Pipeline:
     1. Download tarball from GitHub.
     2. Extract to temp directory safely.
     3. Scan extracted directory with P0-4 scanner.
     4. Persist scan result to scan_results table.
-    5. Mark task as completed (only after successful persistence).
+    5. Assess: read persisted scan result, compute score, persist assessment.
+    6. Mark task as completed (only after successful assessment persistence).
 
     On any failure, marks the task as failed with a desensitized error.
     Temp files are always cleaned up via try/finally — in success, scan
-    failure, and persistence failure paths.
+    failure, persistence failure, and assessment failure paths.
     """
     download_result = None
     extract_dest = None
@@ -213,9 +232,63 @@ async def _process_task(task_id: str) -> None:
             )
             return
 
-        # --- Stage 5: Complete with summary ---
-        # Only reached after scan result is successfully persisted.
-        # The scan_summary is fetched from scan_results by to_response().
+        # --- Stage 5: Assess ---
+        # Assessment reads ONLY from the persisted scan_results table
+        # (never from temp directory). It computes a deterministic score
+        # and persists it to assessment_results.
+        # run_assessment is synchronous (CPU/IO-bound). Run it in a thread
+        # via asyncio.to_thread so the event loop stays responsive.
+        # The await guarantees the thread has completed before cleanup.
+        # Assessment MUST succeed before mark_completed — if it fails,
+        # the task is marked failed even though scan_results was persisted.
+        # The failed task's assessment API will NOT return residual data.
+        mark_running(task_id, STAGE_ASSESSING, 90)
+        try:
+            await asyncio.to_thread(
+                run_assessment,
+                task_id,
+            )
+        except AssessmentResultTooLargeError as e:
+            # Serialized assessment_json exceeded assessment_max_json_bytes.
+            # Log only the exception type — never str(exc) or DB details.
+            logger.error(
+                "Assessment result too large for task %s: %s",
+                task_id, type(e).__name__,
+            )
+            mark_failed(
+                task_id, ASSESSMENT_RESULT_TOO_LARGE,
+                get_error_message(ASSESSMENT_RESULT_TOO_LARGE),
+            )
+            return
+        except ValueError as e:
+            # No scan result found — should not happen after successful
+            # persistence, but handle defensively.
+            logger.error(
+                "Assessment failed (no scan result) for task %s: %s",
+                task_id, type(e).__name__,
+            )
+            mark_failed(
+                task_id, ASSESSMENT_INTERNAL_ERROR,
+                get_error_message(ASSESSMENT_INTERNAL_ERROR),
+            )
+            return
+        except Exception as e:
+            # Log only the exception type — never str(exc) or DB errors.
+            logger.error(
+                "Assessment failed for task %s: %s",
+                task_id, type(e).__name__,
+            )
+            mark_failed(
+                task_id, ASSESSMENT_PERSIST_FAILED,
+                get_error_message(ASSESSMENT_PERSIST_FAILED),
+            )
+            return
+
+        # --- Stage 6: Complete with summary ---
+        # Only reached after scan result AND assessment are successfully
+        # persisted. The scan_summary is fetched from scan_results by
+        # to_response(). The security_score and security_verdict are
+        # fetched from assessment_results by to_response().
         mark_completed(
             task_id,
             file_count=extract_result.file_count,
@@ -229,7 +302,8 @@ async def _process_task(task_id: str) -> None:
 
     finally:
         # --- Always clean up temp files ---
-        # Cleanup runs in ALL paths: success, scan failure, persistence failure.
+        # Cleanup runs in ALL paths: success, scan failure, persistence
+        # failure, and assessment failure.
         # Clean up download file
         if download_result is not None:
             try:

@@ -85,6 +85,9 @@ class TaskStatusResponse(BaseModel):
     total_size: int | None = None
     top_level_dir: str | None = None
     scan_summary: dict | None = None
+    security_score: int | None = None
+    security_verdict: str | None = None
+    assessment_url: str | None = None
 
 
 # --- Fixed safe empty response for failed tasks without results ---
