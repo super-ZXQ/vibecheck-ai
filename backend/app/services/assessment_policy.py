@@ -6,6 +6,8 @@ and verdict thresholds used by the P0-6 security assessment engine.
 IMMUTABILITY CONTRACT:
 - Policy values are hardcoded constants. They must NEVER be read from
   environment variables, config files, or runtime parameters.
+- All dict-like policy structures use MappingProxyType (immutable).
+- All cap objects are frozen dataclasses.
 - The same (policy_version, persisted ScanResult, summary) input MUST
   always produce identical score, verdict, score_breakdown, score_caps,
   coverage, and blocking_reasons.
@@ -24,6 +26,8 @@ ARITHMETIC:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 
@@ -37,27 +41,27 @@ ASSESSMENT_SCHEMA_VERSION = 1
 
 
 # ---------------------------------------------------------------------------
-# --- Severity base deduction points ---
+# --- Severity base deduction points (frozen) ---
 # ---------------------------------------------------------------------------
 
-SEVERITY_BASE_POINTS: dict[str, int] = {
+SEVERITY_BASE_POINTS: MappingProxyType = MappingProxyType({
     "critical": 25,
     "high": 15,
     "medium": 8,
     "low": 3,
     "info": 0,
-}
+})
 
 
 # ---------------------------------------------------------------------------
-# --- Confidence percentages (0-100) ---
+# --- Confidence percentages (frozen, 0-100) ---
 # ---------------------------------------------------------------------------
 
-CONFIDENCE_PERCENT: dict[str, int] = {
+CONFIDENCE_PERCENT: MappingProxyType = MappingProxyType({
     "high": 100,
     "medium": 75,
     "low": 50,
-}
+})
 
 # Blocking findings are ALWAYS scored at 100% confidence, regardless
 # of the detected confidence level. This prevents a low-confidence
@@ -95,20 +99,20 @@ def get_repeat_percent(occurrence_index: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# --- Per-rule_id deduction caps ---
+# --- Per-rule_id deduction caps (frozen) ---
 # ---------------------------------------------------------------------------
 #
 # Each rule_id's total deduction is capped based on the highest severity
 # in that rule group. This prevents a single rule with many findings
 # from dominating the entire score.
 
-RULE_CAP_BY_SEVERITY: dict[str, int] = {
+RULE_CAP_BY_SEVERITY: MappingProxyType = MappingProxyType({
     "critical": 50,
     "high": 40,
     "medium": 24,
     "low": 10,
     "info": 0,
-}
+})
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +150,7 @@ def compute_single_deduction(
 
 
 # ---------------------------------------------------------------------------
-# --- Score caps ---
+# --- Score caps (frozen dataclass) ---
 # ---------------------------------------------------------------------------
 
 # Each cap is applied after the base deduction. Multiple caps may trigger;
@@ -159,47 +163,57 @@ CAP_FINDINGS_TRUNCATED = "FINDINGS_TRUNCATED"
 CAP_SCAN_ERRORS_PRESENT = "SCAN_ERRORS_PRESENT"
 CAP_NO_FILES_SCANNED = "NO_FILES_SCANNED"
 
-# Cap definitions: (reason_code, cap_value, description)
-# NOTE: These are defined as constants, NOT as env-configurable values.
+
+@dataclass(frozen=True)
+class ScoreCap:
+    """Immutable score cap definition.
+
+    Frozen dataclass prevents runtime modification of cap values.
+    Attempting to set attributes raises FrozenInstanceError.
+    """
+    reason_code: str
+    cap_value: int
+    description: str
+
+
+# Cap definitions: frozen objects, NOT env-configurable values.
 
 # Cap 1: blocking findings present → score capped at 49
-CAP_BLOCKING = {
-    "reason_code": CAP_BLOCKING_FINDING_PRESENT,
-    "cap_value": 49,
-    "description": "存在阻断级安全问题，分数上限为49。",
-}
+CAP_BLOCKING = ScoreCap(
+    reason_code=CAP_BLOCKING_FINDING_PRESENT,
+    cap_value=49,
+    description="存在阻断级安全问题，分数上限为49。",
+)
 
 # Cap 2: findings truncated → score capped at 74
-CAP_TRUNCATED = {
-    "reason_code": CAP_FINDINGS_TRUNCATED,
-    "cap_value": 74,
-    "description": "扫描结果被截断，分数上限为74。",
-}
+CAP_TRUNCATED = ScoreCap(
+    reason_code=CAP_FINDINGS_TRUNCATED,
+    cap_value=74,
+    description="扫描结果被截断，分数上限为74。",
+)
 
 # Cap 3: scan errors present → score capped at 74
-CAP_ERRORS = {
-    "reason_code": CAP_SCAN_ERRORS_PRESENT,
-    "cap_value": 74,
-    "description": "扫描过程中存在错误，分数上限为74。",
-}
+CAP_ERRORS = ScoreCap(
+    reason_code=CAP_SCAN_ERRORS_PRESENT,
+    cap_value=74,
+    description="扫描过程中存在错误，分数上限为74。",
+)
 
 # Cap 4: no files scanned → score capped at 74
-CAP_NO_FILES = {
-    "reason_code": CAP_NO_FILES_SCANNED,
-    "cap_value": 74,
-    "description": "未扫描任何文件，分数上限为74。",
-}
+CAP_NO_FILES = ScoreCap(
+    reason_code=CAP_NO_FILES_SCANNED,
+    cap_value=74,
+    description="未扫描任何文件，分数上限为74。",
+)
 
 
-def determine_triggered_caps(summary: dict[str, Any]) -> list[dict[str, Any]]:
+def determine_triggered_caps(summary: dict[str, Any]) -> list[ScoreCap]:
     """Determine which score caps are triggered by the scan summary.
 
-    Returns a list of cap dicts, each containing:
-    - reason_code
-    - cap_value
-    - description
-
-    The caller is responsible for sorting and applying them in order.
+    Returns a list of NEW ScoreCap objects (copies of the frozen
+    constants). The caller receives fresh objects, not references to
+    the global constants. Even if the caller modifies the returned
+    list, the global constants remain unchanged.
 
     NOTE: skipped_files does NOT trigger any cap. Binary files, images,
     archives, and other unsupported files are normally skipped and do
@@ -211,32 +225,48 @@ def determine_triggered_caps(summary: dict[str, Any]) -> list[dict[str, Any]]:
             total_files_scanned.
 
     Returns:
-        List of triggered cap dicts (unsorted).
+        List of triggered ScoreCap objects (unsorted).
     """
-    triggered: list[dict[str, Any]] = []
+    triggered: list[ScoreCap] = []
 
     if summary.get("blocking_findings", 0) > 0:
-        triggered.append(CAP_BLOCKING)
+        triggered.append(ScoreCap(
+            reason_code=CAP_BLOCKING.reason_code,
+            cap_value=CAP_BLOCKING.cap_value,
+            description=CAP_BLOCKING.description,
+        ))
 
     if summary.get("findings_truncated", False):
-        triggered.append(CAP_TRUNCATED)
+        triggered.append(ScoreCap(
+            reason_code=CAP_TRUNCATED.reason_code,
+            cap_value=CAP_TRUNCATED.cap_value,
+            description=CAP_TRUNCATED.description,
+        ))
 
     if summary.get("total_scan_errors", 0) > 0:
-        triggered.append(CAP_ERRORS)
+        triggered.append(ScoreCap(
+            reason_code=CAP_ERRORS.reason_code,
+            cap_value=CAP_ERRORS.cap_value,
+            description=CAP_ERRORS.description,
+        ))
 
     if summary.get("total_files_scanned", 0) == 0:
-        triggered.append(CAP_NO_FILES)
+        triggered.append(ScoreCap(
+            reason_code=CAP_NO_FILES.reason_code,
+            cap_value=CAP_NO_FILES.cap_value,
+            description=CAP_NO_FILES.description,
+        ))
 
     return triggered
 
 
-def sort_caps(caps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def sort_caps(caps: list[ScoreCap]) -> list[ScoreCap]:
     """Sort caps deterministically by (cap_value ASC, reason_code ASC).
 
     This ensures the same set of triggered caps always produces the
     same application order and therefore the same final score.
     """
-    return sorted(caps, key=lambda c: (c["cap_value"], c["reason_code"]))
+    return sorted(caps, key=lambda c: (c.cap_value, c.reason_code))
 
 
 # ---------------------------------------------------------------------------

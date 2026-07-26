@@ -86,30 +86,94 @@ class AssessmentResultTooLargeError(Exception):
 # --- Finding sorting (deterministic within a rule_id group) ---
 # ---------------------------------------------------------------------------
 
+# Fields included in the canonical finding sort key.
+# This tuple defines the COMPLETE set of fields that participate in
+# deterministic ordering. Any field not listed here is ignored for
+# sorting purposes. All listed fields are also included in the
+# canonical JSON tiebreaker.
+_FINDING_SORT_FIELDS: tuple[str, ...] = (
+    "is_blocking",
+    "severity",
+    "confidence",
+    "file_path",
+    "line_start",
+    "line_end",
+    "column_start",
+    "column_end",
+    "rule_id",
+    "rule_name",
+    "category",
+    "finding_type",
+    "secret_type",
+    "description",
+    "message",
+    "repair_template_key",
+    "snippet_masked",
+)
+
+
 def _finding_sort_key(f: dict[str, Any]) -> tuple:
-    """Deterministic sort key for findings within the same rule_id.
+    """Complete deterministic sort key for findings.
+
+    Produces a TOTAL ORDER: no two distinct findings produce the same
+    key. None values are converted to fixed, comparable defaults so
+    that heterogeneous types never cause TypeError during comparison.
 
     Sort order (highest priority first):
-    1. is_blocking = True first (blocking findings get 100% confidence
-       and should be scored first for repeat multiplier purposes)
-    2. severity: critical > high > medium > low > info
-    3. confidence: high > medium > low
-    4. file_path: alphabetical (deterministic)
-    5. line_start: ascending (deterministic, None treated as 0)
-    6. rule_id: alphabetical (final tiebreaker)
+    1. is_blocking = True first
+    2. severity rank: critical > high > medium > low > info
+    3. confidence rank: high > medium > low
+    4. file_path: alphabetical
+    5. line_start: ascending
+    6. line_end: ascending
+    7. column_start: ascending
+    8. column_end: ascending
+    9. rule_id: alphabetical
+    10. rule_name: alphabetical
+    11. category: alphabetical
+    12. finding_type: alphabetical
+    13. secret_type: alphabetical
+    14. description: alphabetical
+    15. message: alphabetical
+    16. repair_template_key: alphabetical
+    17. snippet_masked: alphabetical
+    18. canonical JSON string (final tiebreaker, only known public fields)
 
     This ensures the repeat multiplier (100/75/50/25) is applied in
-    a consistent order regardless of input finding order.
+    a consistent order regardless of input finding order, and that
+    blocking_reasons truncation always selects the same subset.
     """
-    severity = f.get("severity", "info")
-    confidence = f.get("confidence", "low")
+    severity = f.get("severity") or ""
+    confidence = f.get("confidence") or ""
+
+    # Build canonical JSON tiebreaker from known public fields only.
+    # json.dumps with sort_keys ensures field order in the JSON string
+    # is always the same regardless of dict insertion order.
+    # default=str converts any unexpected type to str for safety.
+    canonical = json.dumps(
+        {k: f.get(k) for k in _FINDING_SORT_FIELDS},
+        ensure_ascii=False, sort_keys=True, default=str,
+    )
+
     return (
         0 if f.get("is_blocking", False) else 1,
         _SEVERITY_ORDER.get(severity, 99),
         _CONFIDENCE_ORDER.get(confidence, 99),
-        f.get("file_path", ""),
+        f.get("file_path") or "",
         f.get("line_start") or 0,
-        f.get("rule_id", ""),
+        f.get("line_end") or 0,
+        f.get("column_start") or 0,
+        f.get("column_end") or 0,
+        f.get("rule_id") or "",
+        f.get("rule_name") or "",
+        f.get("category") or "",
+        f.get("finding_type") or "",
+        f.get("secret_type") or "",
+        f.get("description") or "",
+        f.get("message") or "",
+        f.get("repair_template_key") or "",
+        f.get("snippet_masked") or "",
+        canonical,
     )
 
 
@@ -264,16 +328,16 @@ def _apply_score_caps(
 
     for cap in sorted_caps:
         score_before = current_score
-        score_after = min(current_score, cap["cap_value"])
+        score_after = min(current_score, cap.cap_value)
         applied = score_after < score_before
 
         cap_records.append({
-            "reason_code": cap["reason_code"],
-            "cap_value": cap["cap_value"],
+            "reason_code": cap.reason_code,
+            "cap_value": cap.cap_value,
             "score_before_cap": score_before,
             "score_after_cap": score_after,
             "applied": applied,
-            "description": cap["description"],
+            "description": cap.description,
         })
 
         current_score = score_after
@@ -433,7 +497,11 @@ def assess_scan_result(task_id: str, scan_result: dict[str, Any]) -> dict[str, A
     verdict = determine_verdict(final_score, total_blocking_findings)
 
     # --- 5. Build blocking_reasons ---
-    max_reasons = settings.assessment_max_blocking_reasons
+    # Runtime defense: clamp to at least 1 so that a misconfigured value
+    # of 0 or -1 never bypasses the limit or produces blocking[:-1].
+    # Pydantic Field(ge=1) covers normal config validation, but this
+    # guard also protects against runtime monkeypatch in tests.
+    max_reasons = max(1, int(settings.assessment_max_blocking_reasons))
     blocking_reasons, _ = _build_blocking_reasons(findings, max_reasons)
 
     # --- 6. Build coverage ---
