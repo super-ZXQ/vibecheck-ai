@@ -127,7 +127,9 @@ def reset_db() -> None:
         finally:
             conn.close()
         _initialized = False
-        init_db()
+    # Call init_db() OUTSIDE the lock to avoid deadlock
+    # (init_db() also acquires _init_lock — threading.Lock is not reentrant)
+    init_db()
 
 
 def now_iso() -> str:
