@@ -26,6 +26,13 @@ CLEANUP_FAILED = "CLEANUP_FAILED"
 # --- Queue errors ---
 QUEUE_FULL = "QUEUE_FULL"
 
+# --- Scan errors (P0-5) ---
+SCAN_INTERNAL_ERROR = "SCAN_INTERNAL_ERROR"
+SCAN_RESULT_PERSIST_FAILED = "SCAN_RESULT_PERSIST_FAILED"
+SCAN_RESULT_NOT_READY = "SCAN_RESULT_NOT_READY"
+SCAN_RESULT_TOO_LARGE = "SCAN_RESULT_TOO_LARGE"
+SCAN_RESULT_MISSING = "SCAN_RESULT_MISSING"
+
 # --- Service lifecycle ---
 SERVICE_RESTARTED = "SERVICE_RESTARTED"
 
@@ -46,6 +53,11 @@ _ERROR_MESSAGES = {
     EXTRACTION_LIMIT_EXCEEDED: "解压内容超过限制（文件数量或总大小），已中止。",
     CLEANUP_FAILED: "临时文件清理失败，但不影响检测结果。",
     QUEUE_FULL: "检测队列已满，请稍后重试。",
+    SCAN_INTERNAL_ERROR: "扫描过程中发生内部错误，请稍后重试。",
+    SCAN_RESULT_PERSIST_FAILED: "扫描结果保存失败，请稍后重试。",
+    SCAN_RESULT_NOT_READY: "扫描结果尚未生成，请稍后重试。",
+    SCAN_RESULT_TOO_LARGE: "扫描结果数据量过大，无法保存。",
+    SCAN_RESULT_MISSING: "扫描结果缺失，请重新提交检测。",
     SERVICE_RESTARTED: "服务在任务执行期间重启，请重新提交检测。",
     INTERNAL_ERROR: "内部错误，请稍后重试。",
 }

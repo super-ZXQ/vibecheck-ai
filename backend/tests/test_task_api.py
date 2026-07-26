@@ -38,8 +38,11 @@ from app.core.safe_extract import (
     ExtractionError,
     ExtractionResult,
 )
+from app.core.error_codes import SCAN_RESULT_NOT_READY
 from app.db import database
 from app.services import background_runner, task_manager
+from app.services.scan_result_service import get_scan_result
+from tests.conftest import SYNTHETIC_GITHUB_TOKEN
 
 
 # --- Fixtures ---
@@ -683,3 +686,271 @@ class TestSQLitePersistence:
         assert result2.total_size == 12
         assert result2.top_level_dir == "mock-extract"
         assert result2.completed_at is not None
+
+
+# ============================================================
+# P0-5: Scan summary in polling response
+# ============================================================
+
+class TestScanSummaryInPolling:
+    """Tests for scan_summary in GET /api/check/{task_id} response."""
+
+    @pytest.mark.asyncio
+    async def test_completed_returns_scan_summary(self, client, test_db, tmp_path):
+        """Completed task should include scan_summary in polling response."""
+        task = task_manager.create_task(
+            "https://github.com/testuser/testrepo",
+            "testuser",
+            "testrepo",
+        )
+
+        with patch(
+            "app.services.background_runner.download_tarball",
+            return_value=make_mock_download_result(tmp_path),
+        ):
+            with patch(
+                "app.services.background_runner.safe_extract_to_temp",
+                return_value=make_mock_extract_result(tmp_path),
+            ):
+                await background_runner._process_task(task.id)
+
+        response = client.get(f"/api/check/{task.id}")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "completed"
+        assert data["scan_summary"] is not None
+        assert "total_findings" in data["scan_summary"]
+        assert "blocking_findings" in data["scan_summary"]
+        assert "total_files_scanned" in data["scan_summary"]
+
+    @pytest.mark.asyncio
+    async def test_completed_returns_report_url(self, client, test_db, tmp_path):
+        """Completed task should include report_url in polling response."""
+        task = task_manager.create_task(
+            "https://github.com/testuser/testrepo",
+            "testuser",
+            "testrepo",
+        )
+
+        with patch(
+            "app.services.background_runner.download_tarball",
+            return_value=make_mock_download_result(tmp_path),
+        ):
+            with patch(
+                "app.services.background_runner.safe_extract_to_temp",
+                return_value=make_mock_extract_result(tmp_path),
+            ):
+                await background_runner._process_task(task.id)
+
+        response = client.get(f"/api/check/{task.id}")
+        data = response.json()
+        assert data["report_url"] == f"/api/check/{task.id}/result"
+
+    @pytest.mark.asyncio
+    async def test_completed_does_not_inline_findings(self, client, test_db, tmp_path):
+        """Polling response should NOT include full findings array."""
+        task = task_manager.create_task(
+            "https://github.com/testuser/testrepo",
+            "testuser",
+            "testrepo",
+        )
+
+        with patch(
+            "app.services.background_runner.download_tarball",
+            return_value=make_mock_download_result(tmp_path),
+        ):
+            with patch(
+                "app.services.background_runner.safe_extract_to_temp",
+                return_value=make_mock_extract_result(tmp_path),
+            ):
+                await background_runner._process_task(task.id)
+
+        response = client.get(f"/api/check/{task.id}")
+        data = response.json()
+        # findings should NOT be in the polling response
+        assert "findings" not in data
+        assert "notices" not in data
+        assert "skipped_files" not in data
+        assert "scan_errors" not in data
+
+    def test_pending_does_not_have_scan_summary(self, client, test_db):
+        """Pending task should not have scan_summary."""
+        task = task_manager.create_task(
+            "https://github.com/testuser/testrepo",
+            "testuser",
+            "testrepo",
+        )
+        response = client.get(f"/api/check/{task.id}")
+        data = response.json()
+        assert data["status"] == "pending"
+        assert data.get("scan_summary") is None
+
+
+# ============================================================
+# P0-5: Result endpoint tests
+# ============================================================
+
+class TestResultEndpoint:
+    """Tests for GET /api/check/{task_id}/result."""
+
+    @pytest.mark.asyncio
+    async def test_result_returns_full_result(self, client, test_db, tmp_path):
+        """Result endpoint should return full persisted scan result."""
+        task = task_manager.create_task(
+            "https://github.com/testuser/testrepo",
+            "testuser",
+            "testrepo",
+        )
+
+        with patch(
+            "app.services.background_runner.download_tarball",
+            return_value=make_mock_download_result(tmp_path),
+        ):
+            with patch(
+                "app.services.background_runner.safe_extract_to_temp",
+                return_value=make_mock_extract_result(tmp_path),
+            ):
+                await background_runner._process_task(task.id)
+
+        response = client.get(f"/api/check/{task.id}/result")
+        assert response.status_code == 200
+        data = response.json()
+        assert "schema_version" in data
+        assert "findings" in data
+        assert "notices" in data
+        assert "skipped_files" in data
+        assert "scan_errors" in data
+        assert "summary" in data
+
+    @pytest.mark.asyncio
+    async def test_result_summary_matches_polling(self, client, test_db, tmp_path):
+        """Summary in result endpoint should match scan_summary in polling."""
+        task = task_manager.create_task(
+            "https://github.com/testuser/testrepo",
+            "testuser",
+            "testrepo",
+        )
+
+        with patch(
+            "app.services.background_runner.download_tarball",
+            return_value=make_mock_download_result(tmp_path),
+        ):
+            with patch(
+                "app.services.background_runner.safe_extract_to_temp",
+                return_value=make_mock_extract_result(tmp_path),
+            ):
+                await background_runner._process_task(task.id)
+
+        poll_response = client.get(f"/api/check/{task.id}")
+        result_response = client.get(f"/api/check/{task.id}/result")
+        poll_summary = poll_response.json()["scan_summary"]
+        result_summary = result_response.json()["summary"]
+        assert poll_summary == result_summary
+
+    def test_result_unknown_task_returns_404(self, client, test_db):
+        """Unknown task_id should return 404 for result endpoint."""
+        random_uuid = str(uuid.uuid4())
+        response = client.get(f"/api/check/{random_uuid}/result")
+        assert response.status_code == 404
+        assert response.json()["detail"]["error_code"] == "TASK_NOT_FOUND"
+
+    def test_result_invalid_uuid_returns_422(self, client, test_db):
+        """Invalid UUID format should return 422 for result endpoint."""
+        response = client.get("/api/check/not-a-uuid/result")
+        assert response.status_code == 422
+        assert response.json()["detail"]["error_code"] == "INVALID_TASK_ID"
+
+    def test_result_pending_returns_409(self, client, test_db):
+        """Pending task should return 409 for result endpoint."""
+        task = task_manager.create_task(
+            "https://github.com/testuser/testrepo",
+            "testuser",
+            "testrepo",
+        )
+        response = client.get(f"/api/check/{task.id}/result")
+        assert response.status_code == 409
+        assert response.json()["detail"]["error_code"] == SCAN_RESULT_NOT_READY
+
+    @pytest.mark.asyncio
+    async def test_result_failed_returns_safe_empty(self, client, test_db, tmp_path):
+        """Failed task with no result should return fixed safe empty response."""
+        task = task_manager.create_task(
+            "https://github.com/testuser/testrepo",
+            "testuser",
+            "testrepo",
+        )
+
+        # Fail the task via download failure
+        with patch(
+            "app.services.background_runner.download_tarball",
+            side_effect=GitHubDownloadError("Repository not found"),
+        ):
+            await background_runner._process_task(task.id)
+
+        response = client.get(f"/api/check/{task.id}/result")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["schema_version"] == 1
+        assert data["findings"] == []
+        assert data["summary"]["total_findings"] == 0
+
+    @pytest.mark.asyncio
+    async def test_result_no_raw_tokens(self, client, test_db, tmp_path):
+        """Result endpoint response should not contain raw synthetic tokens."""
+        # Create extract directory with a synthetic token
+        dest = Path(tmp_path) / "token-repo"
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "config.py").write_text(f'token = "{SYNTHETIC_GITHUB_TOKEN}"\n')
+
+        task = task_manager.create_task(
+            "https://github.com/testuser/testrepo",
+            "testuser",
+            "testrepo",
+        )
+
+        download_result = make_mock_download_result(tmp_path)
+        extract_result = ExtractionResult(
+            dest_dir=str(dest),
+            file_count=1,
+            total_size=50,
+            top_level_dir="token-repo",
+        )
+
+        with patch(
+            "app.services.background_runner.download_tarball",
+            return_value=download_result,
+        ):
+            with patch(
+                "app.services.background_runner.safe_extract_to_temp",
+                return_value=extract_result,
+            ):
+                await background_runner._process_task(task.id)
+
+        response = client.get(f"/api/check/{task.id}/result")
+        data = response.json()
+        # The raw token should NOT appear anywhere in the response
+        assert SYNTHETIC_GITHUB_TOKEN not in response.text
+
+    @pytest.mark.asyncio
+    async def test_result_no_absolute_paths(self, client, test_db, tmp_path):
+        """Result endpoint response should not contain absolute paths."""
+        task = task_manager.create_task(
+            "https://github.com/testuser/testrepo",
+            "testuser",
+            "testrepo",
+        )
+
+        with patch(
+            "app.services.background_runner.download_tarball",
+            return_value=make_mock_download_result(tmp_path),
+        ):
+            with patch(
+                "app.services.background_runner.safe_extract_to_temp",
+                return_value=make_mock_extract_result(tmp_path),
+            ):
+                await background_runner._process_task(task.id)
+
+        response = client.get(f"/api/check/{task.id}/result")
+        # The temp directory path should NOT appear in the response
+        assert str(tmp_path) not in response.text
+        assert "/tmp/vibecheck" not in response.text

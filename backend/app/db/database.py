@@ -5,7 +5,14 @@ Design:
 - Each operation opens a short-lived connection (SQLite handles this efficiently).
 - WAL mode enabled for better concurrency.
 - Thread-safe via check_same_thread=False + short-lived connections.
-- NEVER stores downloaded files, code snippets, or sensitive content.
+- NEVER stores downloaded repository source files or raw sensitive content.
+- scan_results may store explicitly masked display snippets (snippet_masked).
+- Masked snippets must never contain original secrets.
+
+Tables:
+- tasks:       Task lifecycle records (P0-3).
+- scan_results: Persisted scan result snapshots (P0-5). One row per task_id.
+               result_json contains only desensitized public models from P0-4.
 """
 
 import sqlite3
@@ -83,6 +90,43 @@ def init_db() -> None:
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at)
             """)
+            # --- scan_results: one persisted snapshot per task (P0-5) ---
+            # result_json contains ONLY desensitized public models from P0-4.
+            # Never stores raw secrets, absolute paths, or internal objects.
+            # summary_json (P0-5 review): lightweight summary extracted from
+            # result_json, stored separately so status polling never needs to
+            # load or parse the full (up to 8 MB) result_json.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS scan_results (
+                    task_id TEXT PRIMARY KEY,
+                    schema_version INTEGER NOT NULL,
+                    result_json TEXT NOT NULL,
+                    summary_json TEXT NOT NULL,
+                    total_findings INTEGER NOT NULL,
+                    blocking_findings INTEGER NOT NULL,
+                    total_notices INTEGER NOT NULL,
+                    total_skipped_files INTEGER NOT NULL,
+                    total_scan_errors INTEGER NOT NULL,
+                    total_files_scanned INTEGER NOT NULL,
+                    total_lines_scanned INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (task_id) REFERENCES tasks(id)
+                )
+            """)
+            # --- Migration: add summary_json column if missing ---
+            # Old databases created before this change don't have
+            # summary_json. We add it as nullable so old records keep
+            # working — get_scan_summary falls back to result_json for
+            # records with NULL summary_json. New records always set it.
+            columns = conn.execute(
+                "PRAGMA table_info(scan_results)"
+            ).fetchall()
+            column_names = [col["name"] for col in columns]
+            if "summary_json" not in column_names:
+                conn.execute(
+                    "ALTER TABLE scan_results ADD COLUMN summary_json TEXT"
+                )
             conn.commit()
             _initialized = True
         finally:
@@ -95,12 +139,16 @@ def reset_db() -> None:
     with _init_lock:
         conn = _get_connection()
         try:
+            # Drop scan_results first (FK references tasks)
+            conn.execute("DROP TABLE IF EXISTS scan_results")
             conn.execute("DROP TABLE IF EXISTS tasks")
             conn.commit()
         finally:
             conn.close()
         _initialized = False
-        init_db()
+    # Call init_db() OUTSIDE the lock to avoid deadlock
+    # (init_db() also acquires _init_lock — threading.Lock is not reentrant)
+    init_db()
 
 
 def now_iso() -> str:

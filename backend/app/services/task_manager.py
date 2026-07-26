@@ -28,6 +28,7 @@ STATUS_FAILED = "failed"
 STAGE_QUEUED = "queued"
 STAGE_DOWNLOADING = "downloading"
 STAGE_EXTRACTING = "extracting"
+STAGE_SCANNING = "scanning"
 STAGE_FINISHED = "finished"
 
 
@@ -79,7 +80,14 @@ class TaskRecord:
         )
 
     def to_response(self) -> dict:
-        """Convert to API response dict (no sensitive fields)."""
+        """Convert to API response dict (no sensitive fields).
+
+        For completed tasks with a persisted scan result, includes
+        scan_summary and report_url (P0-5).
+        For completed tasks WITHOUT a persisted result (e.g. legacy
+        tasks from before P0-5), scan_summary is None and report_url
+        is None — the result endpoint will return SCAN_RESULT_MISSING.
+        """
         resp = {
             "task_id": self.id,
             "status": self.status,
@@ -89,10 +97,23 @@ class TaskRecord:
             "error_message": self.error_message,
         }
         if self.status == STATUS_COMPLETED:
-            resp["report_url"] = None  # Not implemented in P0-3
+            # Include download/extract summary metadata
             resp["file_count"] = self.file_count
             resp["total_size"] = self.total_size
             resp["top_level_dir"] = self.top_level_dir
+            # Include scan summary from persisted result (P0-5)
+            # Lazy import to avoid circular dependency
+            from app.services.scan_result_service import get_scan_summary
+            scan_summary = get_scan_summary(self.id)
+            resp["scan_summary"] = scan_summary
+            # report_url is only set when scan_summary exists.
+            # If scan_summary is None (e.g. legacy completed task without
+            # a persisted result), report_url is None — the result endpoint
+            # will return SCAN_RESULT_MISSING.
+            if scan_summary is not None:
+                resp["report_url"] = f"/api/check/{self.id}/result"
+            else:
+                resp["report_url"] = None
         return resp
 
 

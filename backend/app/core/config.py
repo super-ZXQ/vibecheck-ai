@@ -4,7 +4,7 @@ Sensitive values (GitHub Token, LLM API Key) are read from environment variables
 and NEVER hardcoded. This module is the single source of truth for all limits.
 """
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -51,6 +51,19 @@ class Settings(BaseSettings):
         "__pycache__", ".git", "vendor", ".venv", "venv",
         ".pytest_cache", ".mypy_cache", ".idea", ".vscode",
     ]
+
+    # --- Persisted result limits (P0-5) ---
+    # Task-level caps on what gets persisted, NOT on what gets scanned.
+    # P0-4 per-rule/per-file limits remain unchanged.
+    # These prevent unbounded result_json from consuming database space.
+    # All limits must be positive integers (ge=1). A limit of 0 would
+    # silently disable ALL persistence for that collection type, and a
+    # negative limit would cause incorrect slice behavior (items[:-1]).
+    scan_max_persisted_findings_per_task: int = Field(default=1000, ge=1)
+    scan_max_persisted_notices_per_task: int = Field(default=500, ge=1)
+    scan_max_persisted_skipped_files_per_task: int = Field(default=2000, ge=1)
+    scan_max_persisted_scan_errors_per_task: int = Field(default=500, ge=1)
+    scan_max_result_json_bytes: int = Field(default=8 * 1024 * 1024, ge=1)
     scan_binary_extensions: list[str] = [
         ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp",
         ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar",
