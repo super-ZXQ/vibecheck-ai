@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 from typing import Any, Optional
 
+from app.core.security.desensitize import mask_snippet, mask_untrusted_text
 from app.db.database import _get_connection, init_db, now_iso
 from app.scanner.base import (
     Confidence,
@@ -93,6 +94,56 @@ _SUMMARY_FIELDS = (
 
 
 # ---------------------------------------------------------------------------
+# --- Defensive re-sanitization at the persistence boundary ---
+# ---------------------------------------------------------------------------
+#
+# P0-4 models only sanitize file_path in __post_init__. We CANNOT assume
+# that snippet_masked, description, message, notice.message, skipped.reason,
+# error_type, or error_message are always safe — a buggy rule, a future
+# code change, or a direct dataclass construction could place raw secret
+# content into these fields.
+#
+# These functions re-apply masking at the persistence boundary, providing
+# defense in depth. They are idempotent: already-masked values pass through
+# unchanged.
+
+def _safe_snippet(value: Optional[str]) -> Optional[str]:
+    """Re-apply mask_snippet to a snippet string.
+
+    mask_snippet is the strongest masking — it handles assignment values,
+    explicit-format tokens, and connection strings. Used for snippet_masked
+    which is the field most likely to contain secret-adjacent content.
+    """
+    if value is None:
+        return value
+    return mask_snippet(value)
+
+
+def _safe_text(value: Optional[str]) -> Optional[str]:
+    """Re-apply mask_untrusted_text to an arbitrary string field.
+
+    Used for description, message, notice.message, skipped.reason,
+    error_type, error_message — any string that could potentially be
+    influenced by repository content.
+    """
+    if value is None:
+        return value
+    return mask_untrusted_text(value)
+
+
+def _safe_path(value: Optional[str]) -> Optional[str]:
+    """Re-apply mask_untrusted_text to a file_path string.
+
+    Double defense: file_path is already sanitized in __post_init__,
+    but we re-sanitize at the persistence boundary to guarantee
+    no secret can enter the database.
+    """
+    if value is None:
+        return value
+    return mask_untrusted_text(value)
+
+
+# ---------------------------------------------------------------------------
 # --- Serialization (explicit, no recursive serialization) ---
 # ---------------------------------------------------------------------------
 
@@ -111,39 +162,82 @@ def _serialize_finding(finding: Finding) -> dict:
 
     Uses getattr with explicit field names — never vars() or __dict__
     to avoid leaking internal state or future private fields.
+
+    String fields that could be influenced by repo content are re-sanitized
+    via _safe_snippet / _safe_text / _safe_path at the persistence boundary.
+    Enums, ints, bools, and None preserve their original types.
     """
     result: dict[str, Any] = {}
     for field in _FINDING_FIELDS:
         val = getattr(finding, field)
-        # Convert enums to stable string values
         if field in ("severity", "confidence", "finding_type"):
+            # Enums → stable string values
             result[field] = _serialize_enum(val)
+        elif field == "snippet_masked":
+            # Re-apply mask_snippet (strongest masking)
+            result[field] = _safe_snippet(val)
+        elif field == "file_path":
+            # Double defense — re-sanitize path
+            result[field] = _safe_path(val)
+        elif field in ("description", "message"):
+            # Re-sanitize arbitrary text that could contain repo content
+            result[field] = _safe_text(val)
         else:
+            # rule_id, rule_name, category, secret_type, repair_template_key
+            # are rule-defined constants, not influenced by repo content.
             result[field] = val
     return result
 
 
 def _serialize_notice(notice: ScanNotice) -> dict:
-    """Convert a ScanNotice to a dict with stable field ordering."""
+    """Convert a ScanNotice to a dict with stable field ordering.
+
+    message and file_path are re-sanitized at the persistence boundary.
+    """
     result: dict[str, Any] = {}
     for field in _NOTICE_FIELDS:
-        result[field] = getattr(notice, field)
+        val = getattr(notice, field)
+        if field == "message":
+            result[field] = _safe_text(val)
+        elif field == "file_path":
+            result[field] = _safe_path(val)
+        else:
+            result[field] = val
     return result
 
 
 def _serialize_skipped(skipped: SkippedFile) -> dict:
-    """Convert a SkippedFile to a dict with stable field ordering."""
+    """Convert a SkippedFile to a dict with stable field ordering.
+
+    reason and file_path are re-sanitized at the persistence boundary.
+    """
     result: dict[str, Any] = {}
     for field in _SKIPPED_FIELDS:
-        result[field] = getattr(skipped, field)
+        val = getattr(skipped, field)
+        if field == "reason":
+            result[field] = _safe_text(val)
+        elif field == "file_path":
+            result[field] = _safe_path(val)
+        else:
+            result[field] = val
     return result
 
 
 def _serialize_error(error: ScanError) -> dict:
-    """Convert a ScanError to a dict with stable field ordering."""
+    """Convert a ScanError to a dict with stable field ordering.
+
+    error_type, error_message, and file_path are re-sanitized at the
+    persistence boundary.
+    """
     result: dict[str, Any] = {}
     for field in _ERROR_FIELDS:
-        result[field] = getattr(error, field)
+        val = getattr(error, field)
+        if field in ("error_type", "error_message"):
+            result[field] = _safe_text(val)
+        elif field == "file_path":
+            result[field] = _safe_path(val)
+        else:
+            result[field] = val
     return result
 
 
@@ -243,13 +337,24 @@ def save_scan_result(task_id: str, scan_result: ScanResult) -> None:
     conn = _get_connection()
     try:
         conn.execute(
-            """INSERT OR REPLACE INTO scan_results
+            """INSERT INTO scan_results
                (task_id, schema_version, result_json,
                 total_findings, blocking_findings, total_notices,
                 total_skipped_files, total_scan_errors,
                 total_files_scanned, total_lines_scanned,
                 created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(task_id) DO UPDATE SET
+                   schema_version=excluded.schema_version,
+                   result_json=excluded.result_json,
+                   total_findings=excluded.total_findings,
+                   blocking_findings=excluded.blocking_findings,
+                   total_notices=excluded.total_notices,
+                   total_skipped_files=excluded.total_skipped_files,
+                   total_scan_errors=excluded.total_scan_errors,
+                   total_files_scanned=excluded.total_files_scanned,
+                   total_lines_scanned=excluded.total_lines_scanned,
+                   updated_at=excluded.updated_at""",
             (
                 task_id,
                 SCHEMA_VERSION,
@@ -261,8 +366,8 @@ def save_scan_result(task_id: str, scan_result: ScanResult) -> None:
                 summary["total_scan_errors"],
                 summary["total_files_scanned"],
                 summary["total_lines_scanned"],
-                now,  # created_at (first insert) — replaced on upsert
-                now,  # updated_at
+                now,  # created_at — only set on first INSERT, preserved on UPDATE
+                now,  # updated_at — always updated
             ),
         )
         conn.commit()
