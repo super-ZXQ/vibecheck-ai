@@ -5,7 +5,9 @@ Design:
 - Each operation opens a short-lived connection (SQLite handles this efficiently).
 - WAL mode enabled for better concurrency.
 - Thread-safe via check_same_thread=False + short-lived connections.
-- NEVER stores downloaded files, code snippets, or sensitive content.
+- NEVER stores downloaded repository source files or raw sensitive content.
+- scan_results may store explicitly masked display snippets (snippet_masked).
+- Masked snippets must never contain original secrets.
 
 Tables:
 - tasks:       Task lifecycle records (P0-3).

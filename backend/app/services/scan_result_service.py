@@ -4,14 +4,22 @@ Security guarantees:
 - serialize_scan_result() uses EXPLICIT field-by-field conversion.
   It NEVER calls json.dumps on unknown internal objects or uses
   recursive serialization that could leak raw values.
-- All Finding/ScanNotice/SkippedFile/ScanError fields are already
-  desensitized by P0-4 (mask_untrusted_text in __post_init__).
+- P0-4 model layer provides self-sanitization for file_path only
+  (mask_untrusted_text in __post_init__).
+- P0-5 persistence boundary re-applies defensive masking to
+  snippet_masked and to any string field that could be influenced by
+  repository content (description, message, notice.message,
+  skipped.reason, error_type, error_message, file_path).
+- Callers cannot be assumed to always pre-pass safe field values; the
+  persistence boundary is the last line of defense.
 - result_json contains ONLY the public result model — no Assignment,
   no temp paths, no raw secrets, no internal exception objects.
 - save_scan_result() uses parameterized SQL (safe upsert) — no string
   interpolation, immune to SQL injection.
-- get_scan_result() and get_scan_summary() return desensitized data
-  directly from the persisted result_json.
+- get_scan_result() reads the full result_json.
+- get_scan_summary() normal path reads ONLY the lightweight summary_json;
+  it falls back to reading result_json only for old records whose
+  summary_json is NULL or empty.
 
 Schema version:
 - Current: 1
