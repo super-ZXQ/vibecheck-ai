@@ -1,15 +1,27 @@
-"""Background task runner — processes download + extraction sequentially.
+"""Background task runner — processes download + extract + scan sequentially.
 
 Concurrency model (MVP):
 - Only 1 task runs at a time (global asyncio.Lock).
 - Pending tasks wait in the SQLite queue.
 - After each task completes, the next pending task is automatically picked up.
 
+Pipeline stages (P0-5):
+  download → extract → scan → persist → completed → cleanup
+
 Error handling:
 - All errors are mapped to machine-readable error codes.
 - error_message is always desensitized — no tokens, paths, or stacks.
 - Temp files are always cleaned up via try/finally.
 - No code from the repository is ever executed.
+- Scanner exceptions are caught and mapped to SCAN_INTERNAL_ERROR.
+- Persistence exceptions are caught and mapped to SCAN_RESULT_PERSIST_FAILED.
+- Logs never contain str(exc), repr(exc), repo content, or absolute paths.
+
+Scan timeout (P0-5):
+- scan_timeout config is retained but NOT enforced as a hard timeout.
+- This phase relies on P0-4 built-in limits (file size, ignore dirs,
+  finding cap, linear private key scan) rather than asyncio.wait_for.
+- A hard timeout + immediate cleanup would race with the scanner thread.
 """
 
 import asyncio
@@ -27,6 +39,8 @@ from app.core.error_codes import (
     REPOSITORY_NOT_FOUND,
     UNSAFE_ARCHIVE,
     CLEANUP_FAILED,
+    SCAN_INTERNAL_ERROR,
+    SCAN_RESULT_PERSIST_FAILED,
     get_error_message,
 )
 from app.core.github import (
@@ -39,9 +53,12 @@ from app.core.safe_extract import (
     safe_extract_to_temp,
     cleanup_temp_dir,
 )
+from app.scanner.sensitive import scan_directory
+from app.services.scan_result_service import save_scan_result
 from app.services.task_manager import (
     STAGE_DOWNLOADING,
     STAGE_EXTRACTING,
+    STAGE_SCANNING,
     mark_running,
     mark_completed,
     mark_failed,
@@ -79,13 +96,22 @@ def _map_extraction_error(error: ExtractionError) -> tuple[str, str]:
 
 
 async def _process_task(task_id: str) -> None:
-    """Process a single task: download → extract → cleanup → summarize.
+    """Process a single task: download → extract → scan → persist → complete.
+
+    Pipeline:
+    1. Download tarball from GitHub.
+    2. Extract to temp directory safely.
+    3. Scan extracted directory with P0-4 scanner.
+    4. Persist scan result to scan_results table.
+    5. Mark task as completed (only after successful persistence).
 
     On any failure, marks the task as failed with a desensitized error.
-    Temp files are always cleaned up via try/finally.
+    Temp files are always cleaned up via try/finally — in success, scan
+    failure, and persistence failure paths.
     """
     download_result = None
     extract_dest = None
+    extract_result = None
     cleanup_failed = False
 
     try:
@@ -123,7 +149,45 @@ async def _process_task(task_id: str) -> None:
             mark_failed(task_id, UNSAFE_ARCHIVE, get_error_message(UNSAFE_ARCHIVE))
             return
 
-        # --- Stage 3: Complete with summary ---
+        # --- Stage 3: Scan ---
+        # scan_directory is synchronous (CPU-bound). It relies on P0-4
+        # built-in limits rather than a hard timeout. The event loop is
+        # blocked during scanning — acceptable for MVP single-worker model.
+        mark_running(task_id, STAGE_SCANNING, 80)
+        try:
+            scan_result = scan_directory(Path(extract_dest))
+        except Exception as e:
+            # Log only the exception type — never str(exc), repr(exc),
+            # stack traces, or repo content.
+            logger.error(
+                "Scan failed for task %s: %s", task_id, type(e).__name__
+            )
+            mark_failed(
+                task_id, SCAN_INTERNAL_ERROR,
+                get_error_message(SCAN_INTERNAL_ERROR),
+            )
+            return
+
+        # --- Stage 4: Persist scan result ---
+        # Persist BEFORE marking completed — if persistence fails,
+        # the task must NOT be marked as completed.
+        try:
+            save_scan_result(task_id, scan_result)
+        except Exception as e:
+            # Log only the exception type — never str(exc) or DB errors.
+            logger.error(
+                "Scan result persistence failed for task %s: %s",
+                task_id, type(e).__name__,
+            )
+            mark_failed(
+                task_id, SCAN_RESULT_PERSIST_FAILED,
+                get_error_message(SCAN_RESULT_PERSIST_FAILED),
+            )
+            return
+
+        # --- Stage 5: Complete with summary ---
+        # Only reached after scan result is successfully persisted.
+        # The scan_summary is fetched from scan_results by to_response().
         mark_completed(
             task_id,
             file_count=extract_result.file_count,
@@ -137,6 +201,7 @@ async def _process_task(task_id: str) -> None:
 
     finally:
         # --- Always clean up temp files ---
+        # Cleanup runs in ALL paths: success, scan failure, persistence failure.
         # Clean up download file
         if download_result is not None:
             try:
