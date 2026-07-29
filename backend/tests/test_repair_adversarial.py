@@ -1630,14 +1630,18 @@ class TestRelatedFilesCountInvariantsRound3:
         assert result is not None
 
     def test_total_greater_returned_truncated_true_passes(self, test_db):
-        """total > returned, truncated=True -> passes."""
+        """total > returned, truncated=True -> passes (with valid partial plan)."""
         task_id = _make_task()
-        safe = _make_valid_safe_plan(task_id=task_id)
+        safe = _make_valid_partial_safe_plan(task_id=task_id)
+        # Modify first group (MANUAL_REVIEW_REQUIRED) to have truncation
         safe["repair_groups"][0]["total_related_files"] = 5
-        safe["repair_groups"][0]["returned_related_files"] = 1
+        safe["repair_groups"][0]["returned_related_files"] = 0
         safe["repair_groups"][0]["related_files_truncated"] = True
         _insert_raw_repair_row_custom(
             task_id, json.dumps(safe, ensure_ascii=False),
+            plan_status="partial",
+            total_repair_groups=safe["summary"]["total_repair_groups"],
+            blocking_repair_groups=safe["summary"]["blocking_repair_groups"],
         )
         result = get_repair_result(task_id)
         assert result is not None
@@ -1740,3 +1744,270 @@ class TestRelatedRuleIdsStrictRound3:
                 # The line should have non-empty content after "规则:"
                 after = line.split("规则:")[-1].strip()
                 assert after, f"Blank rule line found: {line!r}"
+
+
+# ===========================================================================
+# R. Fourth-round: strict snapshot semantics (Fix 1-5 round 4)
+# ===========================================================================
+
+def _make_valid_partial_safe_plan(task_id="test-task"):
+    """Create a valid serialized PARTIAL repair plan.
+
+    Includes MANUAL_REVIEW_REQUIRED and RERUN_SECURITY_SCAN — the
+    required action pair for partial plans with truncation.
+    """
+    plan = {
+        "schema_version": REPAIR_SCHEMA_VERSION,
+        "policy_version": POLICY_VERSION,
+        "repair_scope": REPAIR_SCOPE,
+        "task_id": task_id,
+        "plan_status": "partial",
+        "summary": {
+            "total_repair_groups": 2,
+            "blocking_repair_groups": 1,
+            "manual_review_required": True,
+            "coverage_warning": True,
+            "groups_truncated": False,
+        },
+        "repair_groups": [
+            {
+                "group_id": "RG001",
+                "action_code": ACTION_MANUAL_REVIEW_REQUIRED,
+                "priority": 12, "blocking": False,
+                "highest_severity": "info", "highest_confidence": "low",
+                "title": "Test", "description": "Test",
+                "related_rule_ids": [], "related_files": [],
+                "total_related_files": 0, "returned_related_files": 0,
+                "related_files_truncated": False, "finding_count": 0,
+                "steps": [], "commands": [], "safety_notes": [],
+                "verification_steps": [],
+            },
+            {
+                "group_id": "RG002",
+                "action_code": ACTION_RERUN_SECURITY_SCAN,
+                "priority": 9, "blocking": True,
+                "highest_severity": "info", "highest_confidence": "low",
+                "title": "Test", "description": "Test",
+                "related_rule_ids": [], "related_files": [],
+                "total_related_files": 0, "returned_related_files": 0,
+                "related_files_truncated": False, "finding_count": 0,
+                "steps": [], "commands": [], "safety_notes": [],
+                "verification_steps": [],
+            },
+        ],
+        "verification_steps": [],
+        "agent_prompt": _make_valid_agent_prompt("partial"),
+        "source_scan_updated_at": "2026-01-01T00:00:00Z",
+        "source_assessment_updated_at": "2026-01-01T00:00:00Z",
+        "source_assessment_policy_version": "p0-6-v1",
+        "created_at": None, "updated_at": None,
+    }
+    return serialize_repair_plan(
+        task_id=task_id,
+        repair_plan=plan,
+        source_scan_updated_at="2026-01-01T00:00:00Z",
+        source_assessment_updated_at="2026-01-01T00:00:00Z",
+        source_assessment_policy_version="p0-6-v1",
+        created_at="2026-01-01T00:00:00Z",
+        updated_at="2026-01-01T00:00:00Z",
+    )
+
+
+def _make_complete_with_manual_safe_plan(task_id="test-task"):
+    """Create a serialized plan with plan_status='complete' but containing
+    a MANUAL_REVIEW_REQUIRED group — an invalid combination."""
+    plan = {
+        "schema_version": REPAIR_SCHEMA_VERSION,
+        "policy_version": POLICY_VERSION,
+        "repair_scope": REPAIR_SCOPE,
+        "task_id": task_id,
+        "plan_status": "complete",
+        "summary": {
+            "total_repair_groups": 1,
+            "blocking_repair_groups": 0,
+            "manual_review_required": True,
+            "coverage_warning": False,
+            "groups_truncated": False,
+        },
+        "repair_groups": [
+            {
+                "group_id": "RG001",
+                "action_code": ACTION_MANUAL_REVIEW_REQUIRED,
+                "priority": 12, "blocking": False,
+                "highest_severity": "info", "highest_confidence": "low",
+                "title": "Test", "description": "Test",
+                "related_rule_ids": [], "related_files": [],
+                "total_related_files": 0, "returned_related_files": 0,
+                "related_files_truncated": False, "finding_count": 0,
+                "steps": [], "commands": [], "safety_notes": [],
+                "verification_steps": [],
+            },
+        ],
+        "verification_steps": [],
+        "agent_prompt": _make_valid_agent_prompt("complete"),
+        "source_scan_updated_at": "2026-01-01T00:00:00Z",
+        "source_assessment_updated_at": "2026-01-01T00:00:00Z",
+        "source_assessment_policy_version": "p0-6-v1",
+        "created_at": None, "updated_at": None,
+    }
+    return serialize_repair_plan(
+        task_id=task_id,
+        repair_plan=plan,
+        source_scan_updated_at="2026-01-01T00:00:00Z",
+        source_assessment_updated_at="2026-01-01T00:00:00Z",
+        source_assessment_policy_version="p0-6-v1",
+        created_at="2026-01-01T00:00:00Z",
+        updated_at="2026-01-01T00:00:00Z",
+    )
+
+
+class TestStrictSnapshotSemantics:
+    """Fourth-round: strict type and snapshot semantic validation."""
+
+    # --- 1. schema_version=true -> RepairPlanInternalError ---
+    def test_schema_version_bool_true_raises(self, test_db):
+        """schema_version=true (bool, not int) -> RepairPlanInternalError."""
+        task_id = _make_task()
+        safe = _make_valid_safe_plan(task_id=task_id)
+        safe["schema_version"] = True
+        _insert_raw_repair_row_custom(
+            task_id, json.dumps(safe, ensure_ascii=False),
+        )
+        with pytest.raises(RepairPlanInternalError):
+            get_repair_result(task_id)
+
+    # --- 2. created_at=123 -> RepairPlanInternalError ---
+    def test_created_at_int_raises(self, test_db):
+        """created_at=123 (int, not str) -> RepairPlanInternalError."""
+        task_id = _make_task()
+        safe = _make_valid_safe_plan(task_id=task_id)
+        safe["created_at"] = 123
+        _insert_raw_repair_row_custom(
+            task_id, json.dumps(safe, ensure_ascii=False),
+            created_at="2026-01-01T00:00:00Z",
+        )
+        with pytest.raises(RepairPlanInternalError):
+            get_repair_result(task_id)
+
+    # --- 3. source_scan_updated_at=[] -> RepairPlanInternalError ---
+    def test_source_scan_updated_at_list_raises(self, test_db):
+        """source_scan_updated_at=[] (list, not str) -> RepairPlanInternalError."""
+        task_id = _make_task()
+        safe = _make_valid_safe_plan(task_id=task_id)
+        safe["source_scan_updated_at"] = []
+        _insert_raw_repair_row_custom(
+            task_id, json.dumps(safe, ensure_ascii=False),
+        )
+        with pytest.raises(RepairPlanInternalError):
+            get_repair_result(task_id)
+
+    # --- 4. partial + coverage_warning=false -> RepairPlanInternalError ---
+    def test_partial_coverage_warning_false_raises(self, test_db):
+        """plan_status=partial but coverage_warning=false -> RepairPlanInternalError."""
+        task_id = _make_task()
+        safe = _make_valid_partial_safe_plan(task_id=task_id)
+        safe["summary"]["coverage_warning"] = False
+        _insert_raw_repair_row_custom(
+            task_id, json.dumps(safe, ensure_ascii=False),
+            plan_status="partial",
+            total_repair_groups=safe["summary"]["total_repair_groups"],
+            blocking_repair_groups=safe["summary"]["blocking_repair_groups"],
+        )
+        with pytest.raises(RepairPlanInternalError):
+            get_repair_result(task_id)
+
+    # --- 5. complete + coverage_warning=true -> RepairPlanInternalError ---
+    def test_complete_coverage_warning_true_raises(self, test_db):
+        """plan_status=complete but coverage_warning=true -> RepairPlanInternalError."""
+        task_id = _make_task()
+        safe = _make_valid_safe_plan(task_id=task_id)
+        safe["summary"]["coverage_warning"] = True
+        _insert_raw_repair_row_custom(
+            task_id, json.dumps(safe, ensure_ascii=False),
+            plan_status="complete",
+            total_repair_groups=1,
+            blocking_repair_groups=1,
+        )
+        with pytest.raises(RepairPlanInternalError):
+            get_repair_result(task_id)
+
+    # --- 6. complete + MANUAL_REVIEW_REQUIRED -> RepairPlanInternalError ---
+    def test_complete_with_manual_review_raises(self, test_db):
+        """plan_status=complete but MANUAL_REVIEW_REQUIRED present -> RepairPlanInternalError."""
+        task_id = _make_task()
+        safe = _make_complete_with_manual_safe_plan(task_id=task_id)
+        _insert_raw_repair_row_custom(
+            task_id, json.dumps(safe, ensure_ascii=False),
+            plan_status="complete",
+            total_repair_groups=1,
+            blocking_repair_groups=0,
+        )
+        with pytest.raises(RepairPlanInternalError):
+            get_repair_result(task_id)
+
+    # --- 7. groups_truncated=true but missing manual -> RepairPlanInternalError ---
+    def test_groups_truncated_missing_manual_raises(self, test_db):
+        """groups_truncated=true but no MANUAL_REVIEW_REQUIRED -> RepairPlanInternalError."""
+        task_id = _make_task()
+        safe = _make_valid_safe_plan(task_id=task_id)
+        safe["summary"]["groups_truncated"] = True
+        _insert_raw_repair_row_custom(
+            task_id, json.dumps(safe, ensure_ascii=False),
+            plan_status="complete",
+            total_repair_groups=1,
+            blocking_repair_groups=1,
+        )
+        with pytest.raises(RepairPlanInternalError):
+            get_repair_result(task_id)
+
+    # --- 8. related_files_truncated=true but missing rerun -> RepairPlanInternalError ---
+    def test_related_files_truncated_missing_rerun_raises(self, test_db):
+        """related_files_truncated=true but no RERUN_SECURITY_SCAN -> RepairPlanInternalError."""
+        task_id = _make_task()
+        safe = _make_valid_safe_plan(task_id=task_id)
+        # Modify the group to have related_files_truncated=True
+        safe["repair_groups"][0]["total_related_files"] = 2
+        safe["repair_groups"][0]["related_files_truncated"] = True
+        _insert_raw_repair_row_custom(
+            task_id, json.dumps(safe, ensure_ascii=False),
+            plan_status="complete",
+            total_repair_groups=1,
+            blocking_repair_groups=1,
+        )
+        with pytest.raises(RepairPlanInternalError):
+            get_repair_result(task_id)
+
+    # --- 9. Valid partial snapshot passes ---
+    def test_valid_partial_snapshot_passes(self, test_db):
+        """A valid partial snapshot with MANUAL_REVIEW_REQUIRED and
+        RERUN_SECURITY_SCAN should pass all validation."""
+        task_id = _make_task()
+        safe = _make_valid_partial_safe_plan(task_id=task_id)
+        _insert_raw_repair_row_custom(
+            task_id, json.dumps(safe, ensure_ascii=False),
+            plan_status="partial",
+            total_repair_groups=safe["summary"]["total_repair_groups"],
+            blocking_repair_groups=safe["summary"]["blocking_repair_groups"],
+        )
+        result = get_repair_result(task_id)
+        assert result is not None
+        assert result["plan_status"] == "partial"
+        assert result["summary"]["coverage_warning"] is True
+        assert result["summary"]["manual_review_required"] is True
+
+    # --- 10. Valid complete snapshot passes ---
+    def test_valid_complete_snapshot_passes(self, test_db):
+        """A valid complete snapshot should pass all validation."""
+        task_id = _make_task()
+        safe = _make_valid_safe_plan(task_id=task_id)
+        _insert_raw_repair_row_custom(
+            task_id, json.dumps(safe, ensure_ascii=False),
+            plan_status="complete",
+            total_repair_groups=1,
+            blocking_repair_groups=1,
+        )
+        result = get_repair_result(task_id)
+        assert result is not None
+        assert result["plan_status"] == "complete"
+        assert result["summary"]["coverage_warning"] is False
+        assert result["summary"]["manual_review_required"] is False

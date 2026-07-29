@@ -49,14 +49,10 @@ from app.services.repair_policy import (
     AGENT_PROMPT_REQUIREMENTS,
     BLOCKING_ACTION_SEQUENCE,
     GLOBAL_SINGLETON_ACTIONS,
-    KNOWN_TEMPLATE_KEYS,
     PARTIAL_DECLARATION,
     POLICY_VERSION,
     REPAIR_SCHEMA_VERSION,
     REPAIR_SCOPE,
-    SUPPORTED_ASSESSMENT_POLICY_VERSIONS,
-    ACTION_CODES,
-    ACTION_PRIORITY,
     CONFIDENCE_ORDER,
     SEVERITY_ORDER,
     compute_aggregation_key,
@@ -65,12 +61,10 @@ from app.services.repair_policy import (
     get_allowed_commands,
     get_allowed_template_keys_for_rule,
     get_template_actions,
-    is_command_allowed,
     is_known_rule_id,
     is_known_template_key,
     is_supported_assessment_policy,
     is_valid_action_code,
-    RULE_ALLOWED_TEMPLATE_KEYS,
     ACTION_MANUAL_REVIEW_REQUIRED,
     ACTION_RERUN_SECURITY_SCAN,
     ACTION_RESOLVE_SCAN_ERROR,
@@ -182,7 +176,7 @@ def _validate_rule_id_for_output(rid: str) -> str:
     """Validate a single rule_id for inclusion in repair group output.
 
     Only allows:
-    - Known rule_id values from RULE_ALLOWED_TEMPLATE_KEYS (R001-R011)
+    - Known rule_id values from is_known_rule_id (R001-R011)
     - <unknown-rule> sentinel
 
     Returns the validated rule_id, or raises RepairPlanSerializationError.
@@ -1593,12 +1587,23 @@ def _serialize_repair_group(group: dict) -> dict:
     }
 
 
-def _serialize_summary(summary: dict, repair_groups: list[dict]) -> dict:
+def _serialize_summary(
+    summary: dict, repair_groups: list[dict], plan_status: str
+) -> dict:
     """Whitelist and mask the summary structure.
     
     Recalculates total_repair_groups, blocking_repair_groups, and
     manual_review_required from the final safe repair_groups list.
     Does NOT trust the input summary for these computed fields.
+
+    coverage_warning is rebuilt from plan_status:
+        coverage_warning = (plan_status == "partial")
+    This enforces the deterministic invariant at the serialization
+    boundary — the input summary's coverage_warning is NEVER trusted.
+
+    groups_truncated is strictly read from the input (must be a bool),
+    but its semantic consistency with actions is validated separately
+    in serialize_repair_plan.
     """
     if not isinstance(summary, dict):
         raise RepairPlanSerializationError("summary must be a dict")
@@ -1611,13 +1616,14 @@ def _serialize_summary(summary: dict, repair_groups: list[dict]) -> dict:
         for g in repair_groups
     )
     
+    # coverage_warning rebuilt from plan_status — NEVER trust input
+    coverage_warning = (plan_status == "partial")
+    
     return {
         "total_repair_groups": total,
         "blocking_repair_groups": blocking,
         "manual_review_required": manual,
-        "coverage_warning": _strict_bool(
-            summary.get("coverage_warning", False)
-        ),
+        "coverage_warning": coverage_warning,
         "groups_truncated": _strict_bool(
             summary.get("groups_truncated", False)
         ),
@@ -1662,6 +1668,47 @@ def serialize_repair_plan(
     # Serialize groups first (rebuilt from policy)
     safe_groups = [_serialize_repair_group(g) for g in _groups]
 
+    # --- Validate truncation semantics at serialization boundary ---
+    # groups_truncated: strict read from input, then semantic validation
+    _raw_summary = repair_plan.get("summary", {})
+    if not isinstance(_raw_summary, dict):
+        _raw_summary = {}
+
+    _input_groups_truncated = _raw_summary.get("groups_truncated", False)
+    if type(_input_groups_truncated) is not bool:
+        raise RepairPlanSerializationError(
+            "groups_truncated is not a strict bool"
+        )
+
+    if _input_groups_truncated:
+        _sg_action_codes = {g["action_code"] for g in safe_groups}
+        if ACTION_MANUAL_REVIEW_REQUIRED not in _sg_action_codes:
+            raise RepairPlanSerializationError(
+                "groups_truncated is true but MANUAL_REVIEW_REQUIRED is missing"
+            )
+        if ACTION_RERUN_SECURITY_SCAN not in _sg_action_codes:
+            raise RepairPlanSerializationError(
+                "groups_truncated is true but RERUN_SECURITY_SCAN is missing"
+            )
+
+    # related_files_truncated in any safe group: semantic validation
+    for g in safe_groups:
+        if g.get("related_files_truncated") is True:
+            if plan_status != "partial":
+                raise RepairPlanSerializationError(
+                    "related_files_truncated is true but plan_status is not partial"
+                )
+            _sg_action_codes = {g["action_code"] for g in safe_groups}
+            if ACTION_MANUAL_REVIEW_REQUIRED not in _sg_action_codes:
+                raise RepairPlanSerializationError(
+                    "related_files_truncated is true but MANUAL_REVIEW_REQUIRED is missing"
+                )
+            if ACTION_RERUN_SECURITY_SCAN not in _sg_action_codes:
+                raise RepairPlanSerializationError(
+                    "related_files_truncated is true but RERUN_SECURITY_SCAN is missing"
+                )
+            break
+
     # --- Rebuild agent_prompt from safe_groups (NEVER trust input) ---
     max_prompt_chars = max(1, int(settings.repair_max_agent_prompt_chars))
     safe_agent_prompt = _generate_agent_prompt(
@@ -1683,7 +1730,7 @@ def serialize_repair_plan(
         "task_id": task_id,
         "plan_status": plan_status,
         "summary": _serialize_summary(
-            repair_plan.get("summary", {}), safe_groups
+            repair_plan.get("summary", {}), safe_groups, plan_status
         ),
         "repair_groups": safe_groups,
         "verification_steps": safe_verification_steps,
@@ -1888,14 +1935,41 @@ def _validate_persisted_repair_plan(
             "Repair plan top-level field set mismatch"
         )
 
-    # --- 2. Identity fields ---
-    if result["schema_version"] != REPAIR_SCHEMA_VERSION:
+    # --- 2. Identity fields (strict type + value validation) ---
+    # schema_version: must be strict int (reject bool, float, str, None)
+    schema_version = result["schema_version"]
+    if type(schema_version) is not int or isinstance(schema_version, bool):
+        raise RepairPlanInternalError(
+            "schema_version is not a strict int"
+        )
+    if schema_version != REPAIR_SCHEMA_VERSION:
         raise RepairPlanInternalError("schema_version mismatch")
-    if result["policy_version"] != POLICY_VERSION:
+
+    # policy_version: must be non-empty str
+    policy_version = result["policy_version"]
+    if not isinstance(policy_version, str) or not policy_version:
+        raise RepairPlanInternalError(
+            "policy_version is not a non-empty str"
+        )
+    if policy_version != POLICY_VERSION:
         raise RepairPlanInternalError("policy_version mismatch")
-    if result["repair_scope"] != REPAIR_SCOPE:
+
+    # repair_scope: must be non-empty str
+    repair_scope = result["repair_scope"]
+    if not isinstance(repair_scope, str) or not repair_scope:
+        raise RepairPlanInternalError(
+            "repair_scope is not a non-empty str"
+        )
+    if repair_scope != REPAIR_SCOPE:
         raise RepairPlanInternalError("repair_scope mismatch")
-    if not isinstance(result["task_id"], str) or result["task_id"] != task_id:
+
+    # task_id: must be non-empty str and match request task_id
+    result_task_id = result["task_id"]
+    if not isinstance(result_task_id, str) or not result_task_id:
+        raise RepairPlanInternalError(
+            "task_id is not a non-empty str"
+        )
+    if result_task_id != task_id:
         raise RepairPlanInternalError("task_id mismatch")
 
     # --- 3. plan_status ---
@@ -1948,6 +2022,12 @@ def _validate_persisted_repair_plan(
     coverage_warning = summary["coverage_warning"]
     if type(coverage_warning) is not bool:
         raise RepairPlanInternalError("coverage_warning is not a bool")
+
+    # coverage_warning must deterministically equal (plan_status == "partial")
+    if coverage_warning != (plan_status == "partial"):
+        raise RepairPlanInternalError(
+            "coverage_warning does not match plan_status"
+        )
 
     # groups_truncated: bool
     groups_truncated = summary["groups_truncated"]
@@ -2195,6 +2275,85 @@ def _validate_persisted_repair_plan(
                 "verification_steps do not match frozen policy"
             )
 
+    # --- 5b. Action-based partial consistency ---
+    # Compute action_codes set from repair_groups
+    action_codes = {g["action_code"] for g in repair_groups}
+
+    # If any partial-trigger action exists, plan_status must be "partial"
+    # and coverage_warning must be True
+    _partial_trigger_actions = {
+        ACTION_MANUAL_REVIEW_REQUIRED,
+        ACTION_REVIEW_SCAN_COVERAGE,
+        ACTION_RESOLVE_SCAN_ERROR,
+    }
+    if action_codes & _partial_trigger_actions:
+        if plan_status != "partial":
+            raise RepairPlanInternalError(
+                "partial-trigger action present but plan_status is not partial"
+            )
+        if not coverage_warning:
+            raise RepairPlanInternalError(
+                "partial-trigger action present but coverage_warning is false"
+            )
+
+    # manual_review_required must strictly equal
+    # (ACTION_MANUAL_REVIEW_REQUIRED in action_codes)
+    if manual_review_required != (
+        ACTION_MANUAL_REVIEW_REQUIRED in action_codes
+    ):
+        raise RepairPlanInternalError(
+            "manual_review_required does not match action_codes"
+        )
+
+    # --- 5c. Truncation semantics ---
+    # groups_truncated == True requires:
+    #   plan_status == "partial"
+    #   coverage_warning == True
+    #   MANUAL_REVIEW_REQUIRED present
+    #   RERUN_SECURITY_SCAN present
+    if groups_truncated:
+        if plan_status != "partial":
+            raise RepairPlanInternalError(
+                "groups_truncated is true but plan_status is not partial"
+            )
+        if not coverage_warning:
+            raise RepairPlanInternalError(
+                "groups_truncated is true but coverage_warning is false"
+            )
+        if ACTION_MANUAL_REVIEW_REQUIRED not in action_codes:
+            raise RepairPlanInternalError(
+                "groups_truncated is true but MANUAL_REVIEW_REQUIRED is missing"
+            )
+        if ACTION_RERUN_SECURITY_SCAN not in action_codes:
+            raise RepairPlanInternalError(
+                "groups_truncated is true but RERUN_SECURITY_SCAN is missing"
+            )
+
+    # related_files_truncated == True in any group requires:
+    #   plan_status == "partial"
+    #   coverage_warning == True
+    #   MANUAL_REVIEW_REQUIRED present
+    #   RERUN_SECURITY_SCAN present
+    for g in repair_groups:
+        if g.get("related_files_truncated") is True:
+            if plan_status != "partial":
+                raise RepairPlanInternalError(
+                    "related_files_truncated is true but plan_status is not partial"
+                )
+            if not coverage_warning:
+                raise RepairPlanInternalError(
+                    "related_files_truncated is true but coverage_warning is false"
+                )
+            if ACTION_MANUAL_REVIEW_REQUIRED not in action_codes:
+                raise RepairPlanInternalError(
+                    "related_files_truncated is true but MANUAL_REVIEW_REQUIRED is missing"
+                )
+            if ACTION_RERUN_SECURITY_SCAN not in action_codes:
+                raise RepairPlanInternalError(
+                    "related_files_truncated is true but RERUN_SECURITY_SCAN is missing"
+                )
+            break
+
     # --- 6. verification_steps (strict equality with rebuilt value) ---
     verification_steps = result["verification_steps"]
     if not isinstance(verification_steps, list):
@@ -2263,43 +2422,116 @@ def _validate_persisted_repair_plan(
                 "agent_prompt contains forbidden pattern"
             )
 
-    # --- 8. source_assessment_policy_version must be supported ---
-    source_policy = result["source_assessment_policy_version"]
-    if not isinstance(source_policy, str):
+    # --- 8. Source version chain fields (strict type + value validation) ---
+    source_scan_updated_at = result["source_scan_updated_at"]
+    if not isinstance(source_scan_updated_at, str) or not source_scan_updated_at:
         raise RepairPlanInternalError(
-            "source_assessment_policy_version is not a string"
+            "source_scan_updated_at is not a non-empty str"
+        )
+
+    source_assessment_updated_at = result["source_assessment_updated_at"]
+    if not isinstance(source_assessment_updated_at, str) or not source_assessment_updated_at:
+        raise RepairPlanInternalError(
+            "source_assessment_updated_at is not a non-empty str"
+        )
+
+    source_policy = result["source_assessment_policy_version"]
+    if not isinstance(source_policy, str) or not source_policy:
+        raise RepairPlanInternalError(
+            "source_assessment_policy_version is not a non-empty str"
         )
     if not is_supported_assessment_policy(source_policy):
         raise RepairPlanInternalError(
             "source_assessment_policy_version is not supported"
         )
 
-    # --- 9. JSON and DB redundant column consistency ---
-    if total_repair_groups != db_columns["total_repair_groups"]:
+    # --- 8b. Time fields (strict non-empty str, reject int/bool/float/list/dict/None) ---
+    created_at = result["created_at"]
+    if not isinstance(created_at, str) or not created_at:
+        raise RepairPlanInternalError(
+            "created_at is not a non-empty str"
+        )
+
+    updated_at = result["updated_at"]
+    if not isinstance(updated_at, str) or not updated_at:
+        raise RepairPlanInternalError(
+            "updated_at is not a non-empty str"
+        )
+
+    # --- 9. JSON and DB redundant column consistency (with strict types) ---
+    # DB columns must also pass strict type validation
+    db_plan_status = db_columns["plan_status"]
+    if not isinstance(db_plan_status, str) or not db_plan_status:
+        raise RepairPlanInternalError(
+            "DB plan_status is not a non-empty str"
+        )
+
+    db_total = db_columns["total_repair_groups"]
+    if type(db_total) is not int or isinstance(db_total, bool):
+        raise RepairPlanInternalError(
+            "DB total_repair_groups is not a strict int"
+        )
+
+    db_blocking = db_columns["blocking_repair_groups"]
+    if type(db_blocking) is not int or isinstance(db_blocking, bool):
+        raise RepairPlanInternalError(
+            "DB blocking_repair_groups is not a strict int"
+        )
+
+    db_scan_updated = db_columns["source_scan_updated_at"]
+    if not isinstance(db_scan_updated, str) or not db_scan_updated:
+        raise RepairPlanInternalError(
+            "DB source_scan_updated_at is not a non-empty str"
+        )
+
+    db_assess_updated = db_columns["source_assessment_updated_at"]
+    if not isinstance(db_assess_updated, str) or not db_assess_updated:
+        raise RepairPlanInternalError(
+            "DB source_assessment_updated_at is not a non-empty str"
+        )
+
+    db_assess_pv = db_columns["source_assessment_policy_version"]
+    if not isinstance(db_assess_pv, str) or not db_assess_pv:
+        raise RepairPlanInternalError(
+            "DB source_assessment_policy_version is not a non-empty str"
+        )
+
+    db_created = db_columns["created_at"]
+    if not isinstance(db_created, str) or not db_created:
+        raise RepairPlanInternalError(
+            "DB created_at is not a non-empty str"
+        )
+
+    db_updated = db_columns["updated_at"]
+    if not isinstance(db_updated, str) or not db_updated:
+        raise RepairPlanInternalError(
+            "DB updated_at is not a non-empty str"
+        )
+
+    # Value consistency between JSON and DB
+    if total_repair_groups != db_total:
         raise RepairPlanInternalError(
             "total_repair_groups JSON/DB mismatch"
         )
-    if blocking_repair_groups != db_columns["blocking_repair_groups"]:
+    if blocking_repair_groups != db_blocking:
         raise RepairPlanInternalError(
             "blocking_repair_groups JSON/DB mismatch"
         )
-    if result["source_scan_updated_at"] != db_columns["source_scan_updated_at"]:
+    if source_scan_updated_at != db_scan_updated:
         raise RepairPlanInternalError(
             "source_scan_updated_at JSON/DB mismatch"
         )
-    if result["source_assessment_updated_at"] != db_columns[
-        "source_assessment_updated_at"
-    ]:
+    if source_assessment_updated_at != db_assess_updated:
         raise RepairPlanInternalError(
             "source_assessment_updated_at JSON/DB mismatch"
         )
-    if source_policy != db_columns["source_assessment_policy_version"]:
+    if source_policy != db_assess_pv:
         raise RepairPlanInternalError(
             "source_assessment_policy_version JSON/DB mismatch"
         )
-    if result["created_at"] != db_columns["created_at"]:
+    if created_at != db_created:
         raise RepairPlanInternalError("created_at JSON/DB mismatch")
-    if result["updated_at"] != db_columns["updated_at"]:
+    if updated_at != db_updated:
         raise RepairPlanInternalError("updated_at JSON/DB mismatch")
 
     return result
