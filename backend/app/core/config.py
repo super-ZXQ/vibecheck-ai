@@ -74,6 +74,20 @@ class Settings(BaseSettings):
     assessment_max_blocking_reasons: int = Field(default=100, ge=1)
     assessment_max_json_bytes: int = Field(default=2 * 1024 * 1024, ge=1)
 
+    # --- Repair plan limits (P0-7) ---
+    # Technical size limits for repair plan results. These are NOT policy
+    # values — they do not affect action mapping, action priority, fixed
+    # safety texts, blocking repair order, or agent prompt safety
+    # constraints. They prevent unbounded repair_json from consuming
+    # database space.
+    # Runtime clamping via max(1, int(value)) ensures that even if the
+    # config object is erroneously modified to 0 or negative at runtime,
+    # the engine still functions correctly.
+    repair_max_groups: int = Field(default=200, ge=1)
+    repair_max_related_files_per_group: int = Field(default=100, ge=1)
+    repair_max_agent_prompt_chars: int = Field(default=65536, ge=1)
+    repair_max_json_bytes: int = Field(default=2 * 1024 * 1024, ge=1)
+
     scan_binary_extensions: list[str] = [
         ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp",
         ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar",
