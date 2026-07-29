@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from typing import Any, Optional
 
 from app.core.config import settings
@@ -173,6 +174,8 @@ def _safe_masked_str(value: Any) -> str:
 # --- Safe file path display (reuse from assessment_service pattern) ---
 
 _REDACTED_PATH = "<redacted-path>"
+_REDACTED_METADATA = "<redacted-metadata>"
+_UNKNOWN_RULE = "<unknown-rule>"
 
 _POSIX_ABSOLUTE_RE = re.compile(r'^/')
 _WINDOWS_DRIVE_RE = re.compile(r'^[A-Za-z]:[/\\]')
@@ -180,17 +183,76 @@ _UNC_RE = re.compile(r'^(?:\\\\|//)')
 _WINDOWS_ROOTED_RE = re.compile(r'^\\')
 _USER_HOME_RE = re.compile(r'^~[/\\]')
 
-# Control characters that must NEVER appear in a file path:
-# - \x00 (NUL) through \x1f (C0 controls: \n, \r, \t, etc.)
-# - \x7f (DEL)
-# - \x80-\x9f (C1 controls)
-# - Unicode bidirectional/format controls (LRE, RLE, PDF, LRO, RLO, LRM, RLM,
-#   ZWSP, ZWJ, ZWNJ, WJ, BOM, etc.)
-_CONTROL_CHAR_RE = re.compile(
-    r'[\x00-\x1f\x7f\x80-\x9f'
-    r'\u200b-\u200f\u2028-\u202f\u2060-\u206f'
-    r'\ufeff]'
-)
+# Unicode categories that must NEVER appear in file paths or prompt metadata:
+# - Cc: Control characters (\n, \r, \t, NUL, etc.)
+# - Cf: Format characters (U+061C ARABIC LETTER MARK, U+00AD SOFT HYPHEN,
+#        U+202E RIGHT-TO-LEFT OVERRIDE, U+2066 LTR ISOLATE, ZWSP, etc.)
+# - Zl: Line separator (U+2028)
+# - Zp: Paragraph separator (U+2029)
+_FORBIDDEN_UNICODE_CATEGORIES: frozenset[str] = frozenset({
+    "Cc", "Cf", "Zl", "Zp",
+})
+
+# Safe single-line metadata pattern: A-Z, a-z, 0-9, _, -, ., :
+_SAFE_METADATA_RE = re.compile(r'^[A-Za-z0-9_\-.:]+$')
+
+
+def _has_forbidden_unicode(s: str) -> bool:
+    """Check if a string contains any forbidden Unicode category characters.
+
+    Uses unicodedata.category for per-character checking, covering:
+    - Cc (control): newline, carriage return, tab, NUL, DEL, C1 controls
+    - Cf (format): U+061C, U+00AD, U+202E, U+2066, ZWSP, ZWJ, ZWNJ, BOM, etc.
+    - Zl (line separator): U+2028
+    - Zp (paragraph separator): U+2029
+    """
+    for ch in s:
+        if unicodedata.category(ch) in _FORBIDDEN_UNICODE_CATEGORIES:
+            return True
+    return False
+
+
+def sanitize_prompt_metadata(value: Any, field_name: str) -> str:
+    """Sanitize metadata before it enters repair groups and agent prompts.
+
+    This is the UNIFIED sanitization function for all metadata fields.
+
+    - rule_id: only known R001-R011 values allowed; unknown → <unknown-rule>
+    - secret_type, repair_template_key: only safe single-line chars
+      (A-Z, a-z, 0-9, _, -, ., :); otherwise → <redacted-metadata>
+    - file_path: delegates to _sanitize_file_path
+
+    All fields reject Unicode categories Cc, Cf, Zl, Zp via
+    unicodedata.category per-character checking.
+
+    This function is called on the PRODUCTION PATH (in _extract_finding_fields)
+    to ensure no injection can reach repair groups or agent prompts.
+    """
+    s = _strict_str(value)
+
+    if field_name == "rule_id":
+        if not s:
+            return ""
+        if is_known_rule_id(s):
+            return s
+        return _UNKNOWN_RULE
+
+    if field_name in ("secret_type", "repair_template_key"):
+        if not s:
+            return ""
+        if _has_forbidden_unicode(s):
+            return _REDACTED_METADATA
+        if not _SAFE_METADATA_RE.match(s):
+            return _REDACTED_METADATA
+        return s
+
+    if field_name == "file_path":
+        return _sanitize_file_path(s)
+
+    # Default: check for forbidden Unicode categories
+    if _has_forbidden_unicode(s):
+        return _REDACTED_METADATA
+    return s
 
 
 def _sanitize_file_path(value: Any) -> str:
@@ -201,19 +263,23 @@ def _sanitize_file_path(value: Any) -> str:
     - Path traversal (..)
     - User home paths (~)
     - NUL bytes
-    - Control characters (\\n, \\r, \\t, C0/C1, Unicode bidirectional)
-    
-    Any control character causes the path to be replaced with
-    <redacted-path> to prevent prompt injection via newlines or
-    text direction manipulation.
+    - Control characters via unicodedata.category (Cc, Cf, Zl, Zp)
+    - Backticks (prevent Markdown code-span injection)
+
+    Any control character or backtick causes the path to be replaced
+    with <redacted-path> to prevent prompt injection via newlines,
+    text direction manipulation, or Markdown escaping.
     """
     s = _strict_str(value)
     s = mask_untrusted_text(s)
     # Reject NUL bytes
     if '\x00' in s:
         return _REDACTED_PATH
-    # Reject any control character (newline, tab, C0/C1, Unicode bidi, etc.)
-    if _CONTROL_CHAR_RE.search(s):
+    # Reject any forbidden Unicode category character (Cc, Cf, Zl, Zp)
+    if _has_forbidden_unicode(s):
+        return _REDACTED_PATH
+    # Reject backticks — Markdown code-span escaping is unreliable
+    if '`' in s:
         return _REDACTED_PATH
     if _POSIX_ABSOLUTE_RE.match(s):
         return _REDACTED_PATH
@@ -448,6 +514,11 @@ def _extract_finding_fields(finding: dict) -> dict:
 
     All fields are strictly type-validated. Non-str/non-int/non-bool
     values raise RepairPlanInternalError.
+
+    Metadata fields (rule_id, secret_type, repair_template_key,
+    file_path) are sanitized via sanitize_prompt_metadata BEFORE
+    entering repair groups or agent prompts. This prevents injection
+    via newlines, control characters, or Unicode bidi overrides.
     """
     if not isinstance(finding, dict):
         raise RepairPlanInternalError("Finding is not a dict")
@@ -499,6 +570,18 @@ def _extract_finding_fields(finding: dict) -> dict:
             raise RepairPlanInternalError(
                 f"Finding {_int_field} is not an integer"
             )
+
+    # --- Sanitize metadata BEFORE it enters repair groups or prompts ---
+    # rule_id: only known R001-R011 values; unknown → <unknown-rule>
+    # secret_type, repair_template_key: only safe single-line chars
+    # file_path: sanitized via _sanitize_file_path (rejects Cc/Cf/Zl/Zp,
+    #   backticks, absolute paths, path traversal)
+    rule_id = sanitize_prompt_metadata(rule_id, "rule_id")
+    secret_type = sanitize_prompt_metadata(secret_type, "secret_type")
+    repair_template_key = sanitize_prompt_metadata(
+        repair_template_key, "repair_template_key"
+    )
+    file_path = sanitize_prompt_metadata(file_path, "file_path")
 
     return {
         "rule_id": rule_id,
@@ -1012,6 +1095,61 @@ def _detect_partial_conditions(
 # --- Agent prompt generation ---
 # ---------------------------------------------------------------------------
 
+def _validate_agent_prompt(prompt: str) -> str:
+    """Validate the final agent_prompt against forbidden content.
+
+    Checks the VARIABLE portion of the prompt (everything after the
+    fixed safety header and requirements) for:
+    - Forbidden field names (repo_url, owner, snippet, etc.)
+    - URLs, credential patterns, absolute paths
+    - Format/bidi Unicode characters (Cf, Zl, Zp)
+
+    Note: Cc (control) is NOT checked on the full prompt because
+    newlines (\n) are legitimate prompt formatting. Cc is already
+    checked on metadata fields via sanitize_prompt_metadata.
+
+    If any forbidden content is found, raises RepairPlanInternalError.
+    This ensures AGENT_PROMPT_FORBIDDEN_FIELDS and
+    AGENT_PROMPT_FORBIDDEN_PATTERNS are used on the PRODUCTION path,
+    not just imported in tests.
+    """
+    # Check for format/bidi characters (Cf, Zl, Zp) in the entire prompt.
+    # These should NEVER appear — not even newlines justify them.
+    # Cc is excluded because \n is a legitimate Cc character in prompts.
+    _prompt_forbidden = frozenset({"Cf", "Zl", "Zp"})
+    for ch in prompt:
+        if unicodedata.category(ch) in _prompt_forbidden:
+            raise RepairPlanInternalError(
+                "Agent prompt contains forbidden Unicode format character"
+            )
+
+    # Extract the variable portion (after fixed content)
+    # The fixed content ends before "## 修复动作摘要"
+    marker = "## 修复动作摘要"
+    marker_idx = prompt.find(marker)
+    if marker_idx < 0:
+        # No variable content — only fixed content, which is safe
+        variable_part = ""
+    else:
+        variable_part = prompt[marker_idx + len(marker):]
+
+    # Check for forbidden field names in the variable portion
+    for field in AGENT_PROMPT_FORBIDDEN_FIELDS:
+        if field in variable_part:
+            raise RepairPlanInternalError(
+                f"Agent prompt contains forbidden field: {field}"
+            )
+
+    # Check for forbidden patterns in the variable portion
+    for pattern in AGENT_PROMPT_FORBIDDEN_PATTERNS:
+        if re.search(pattern, variable_part):
+            raise RepairPlanInternalError(
+                "Agent prompt contains forbidden pattern"
+            )
+
+    return prompt
+
+
 def _generate_agent_prompt(
     repair_groups: list[dict],
     plan_status: str,
@@ -1030,13 +1168,16 @@ def _generate_agent_prompt(
     safety requirements.
 
     The prompt contains ONLY:
-    - rule_id, secret_type, repair_template_key (with limits)
-    - relative file_path (sanitized, single-line)
+    - rule_id, secret_type, repair_template_key (sanitized, single-line)
+    - relative file_path (sanitized, no backticks, JSON-quoted)
     - Finding count
     - Repair action summary
 
     It does NOT contain: repo_url, owner, repo_name, snippet,
     snippet_masked, raw secrets, database paths, or temp paths.
+
+    The final prompt is validated against AGENT_PROMPT_FORBIDDEN_FIELDS
+    and AGENT_PROMPT_FORBIDDEN_PATTERNS before returning.
     """
     # --- Build fixed content (always complete) ---
     fixed_lines: list[str] = []
@@ -1062,7 +1203,8 @@ def _generate_agent_prompt(
 
     if not repair_groups:
         # Empty prompt — just fixed content
-        return fixed_content
+        prompt = fixed_content
+        return _validate_agent_prompt(prompt)
 
     # --- Build variable content (action summary, can be truncated) ---
     # Build line by line, checking size after each complete line/group.
@@ -1070,7 +1212,8 @@ def _generate_agent_prompt(
     remaining_chars = max_chars - len(fixed_content) - len(variable_header)
     if remaining_chars <= 0:
         # No room for any variable content — return fixed + header
-        return fixed_content + variable_header.rstrip()
+        prompt = fixed_content + variable_header.rstrip()
+        return _validate_agent_prompt(prompt)
 
     variable_lines: list[str] = []
     current_len = 0
@@ -1099,14 +1242,14 @@ def _generate_agent_prompt(
         current_len += len(line_with_nl)
 
         # Add related files line if present
+        # Use JSON string representation instead of Markdown backticks
+        # to prevent injection via backtick escaping
         if related_files:
-            # Sanitize each file path and escape backticks
-            safe_files = []
-            for fp in related_files[:10]:
-                # Escape backticks to prevent Markdown injection
-                safe_fp = fp.replace("`", "\\`")
-                safe_files.append(safe_fp)
-            files_line = f"  相关文件: {' '.join(f'`{sf}`' for sf in safe_files)}"
+            safe_files = [
+                json.dumps(fp, ensure_ascii=False)
+                for fp in related_files[:10]
+            ]
+            files_line = f"  相关文件: {' '.join(safe_files)}"
             files_with_nl = files_line + "\n"
             if current_len + len(files_with_nl) > remaining_chars:
                 break  # Stop adding — don't cut mid-line
@@ -1119,7 +1262,8 @@ def _generate_agent_prompt(
     else:
         prompt = fixed_content
 
-    return prompt
+    # --- Final validation: ensure no forbidden content leaked in ---
+    return _validate_agent_prompt(prompt)
 
 
 # ---------------------------------------------------------------------------
