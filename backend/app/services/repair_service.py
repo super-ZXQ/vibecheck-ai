@@ -773,32 +773,53 @@ def _build_group_dict(
 # --- Sorting and group_id assignment ---
 # ---------------------------------------------------------------------------
 
+def _make_synthetic_group_data(action_code: str) -> dict:
+    """Create a synthetic group_data dict for a safety action.
+
+    Used when truncation requires adding MANUAL_REVIEW_REQUIRED or
+    RERUN_SECURITY_SCAN that were not already present.
+    """
+    return {
+        "action_code": action_code,
+        "repair_template_key": "",
+        "rule_id": "",
+        "secret_type": "",
+        "blocking": False,
+        "findings": [],
+        "related_files": set(),
+        "related_rule_ids": set(),
+        "highest_severity": "info",
+        "highest_confidence": "low",
+    }
+
+
 def _sort_and_assign_ids(
     mandatory_groups: list[dict],
     optional_groups: list[dict],
     max_groups: int,
 ) -> tuple[list[dict], bool, bool]:
-    """Sort all groups deterministically and assign group_ids.
+    """Sort groups deterministically and assign group_ids.
 
     Mandatory groups are ALWAYS preserved. Optional groups fill the
     remaining space up to max_groups.
 
-    If mandatory groups alone exceed max_groups, raises
-    RepairPlanTooLargeError — mandatory safety actions must never
-    be silently dropped.
+    Algorithm:
+    1. Sort mandatory and optional SEPARATELY.
+    2. If mandatory alone exceeds max_groups → raise RepairPlanTooLargeError.
+    3. Select all mandatory, then fill remaining slots with optional.
+    4. If optional groups or related_files are truncated, add
+       MANUAL_REVIEW_REQUIRED + RERUN_SECURITY_SCAN to mandatory
+       (if not already present). If that makes mandatory exceed
+       max_groups → raise RepairPlanTooLargeError.
+    5. Combine selected mandatory + selected optional.
+    6. Final deterministic sort — NO re-slicing after this point.
+    7. Assign group_ids only after the final set is determined.
 
     Returns:
         (sorted_groups, groups_truncated, any_files_truncated)
         groups_truncated: True only if optional groups were omitted
     """
-    # Check if mandatory groups alone exceed the limit
-    if len(mandatory_groups) > max_groups:
-        raise RepairPlanTooLargeError(
-            "Mandatory repair groups exceed repair_max_groups"
-        )
-
-    # Combine mandatory + optional, sort deterministically
-    all_group_data = list(mandatory_groups) + list(optional_groups)
+    max_related_files = max(1, int(settings.repair_max_related_files_per_group))
 
     # Compute sort key for each group
     def _sort_key(gd: dict) -> tuple:
@@ -819,20 +840,59 @@ def _sort_and_assign_ids(
             related_files_first=first_file,
         )
 
-    all_group_data.sort(key=_sort_key)
+    # 1. Sort mandatory and optional separately
+    mandatory_sorted = sorted(mandatory_groups, key=_sort_key)
+    optional_sorted = sorted(optional_groups, key=_sort_key)
 
-    # Apply max_groups limit — mandatory groups are guaranteed to fit
-    # because we checked above. Only optional groups can be truncated.
-    groups_truncated = len(all_group_data) > max_groups
-    if groups_truncated:
-        all_group_data = all_group_data[:max_groups]
+    # 2. Check if mandatory alone exceeds limit
+    if len(mandatory_sorted) > max_groups:
+        raise RepairPlanTooLargeError(
+            "Mandatory repair groups exceed repair_max_groups"
+        )
 
-    # Assign group_ids and build final dicts
-    max_related_files = max(1, int(settings.repair_max_related_files_per_group))
+    # 3. Select optional groups to fill remaining slots
+    remaining = max_groups - len(mandatory_sorted)
+    selected_optional = optional_sorted[:remaining]
+    groups_truncated = len(optional_sorted) > remaining
+
+    # 4. Check for related_files truncation in the selected set
+    any_files_truncated = any(
+        len(gd["related_files"]) > max_related_files
+        for gd in mandatory_sorted + selected_optional
+    )
+
+    # 5. If truncation occurred, ensure safety actions are in mandatory
+    if groups_truncated or any_files_truncated:
+        existing_actions = {gd["action_code"] for gd in mandatory_sorted}
+        added = False
+        for ac in (ACTION_MANUAL_REVIEW_REQUIRED, ACTION_RERUN_SECURITY_SCAN):
+            if ac not in existing_actions:
+                mandatory_sorted.append(_make_synthetic_group_data(ac))
+                added = True
+
+        if added:
+            # Re-sort mandatory after adding
+            mandatory_sorted = sorted(mandatory_sorted, key=_sort_key)
+
+            # Re-check if mandatory now exceeds limit
+            if len(mandatory_sorted) > max_groups:
+                raise RepairPlanTooLargeError(
+                    "Mandatory repair groups with safety actions "
+                    "exceed repair_max_groups"
+                )
+
+            # Recalculate remaining and selected_optional
+            remaining = max_groups - len(mandatory_sorted)
+            selected_optional = optional_sorted[:remaining]
+            groups_truncated = len(optional_sorted) > remaining
+
+    # 6. Combine and final sort — NO re-slicing after this
+    selected = mandatory_sorted + selected_optional
+    selected.sort(key=_sort_key)
+
+    # 7. Assign group_ids and build final dicts
     sorted_groups: list[dict] = []
-    any_files_truncated = False
-
-    for idx, gd in enumerate(all_group_data):
+    for idx, gd in enumerate(selected):
         group_id = f"RG{idx + 1:03d}"
         group_dict, files_truncated = _build_group_dict(
             gd, group_id, max_related_files
@@ -1191,10 +1251,17 @@ def generate_repair_plan(
     regular_groups, singleton_groups = _aggregate_groups(all_pairs)
 
     # 8. Split into mandatory and optional groups
-    #    Mandatory = global singleton actions (safety-critical)
-    #    Optional = regular finding-based groups
-    mandatory_group_data: list[dict] = list(singleton_groups.values())
-    optional_group_data: list[dict] = list(regular_groups.values())
+    #    Mandatory = global singleton actions (safety-critical) +
+    #                regular groups from blocking findings
+    #    Optional = regular groups from non-blocking findings only
+    #    blocking Finding's complete fixed action sequence must NEVER
+    #    be treated as optional — it is always mandatory.
+    mandatory_group_data: list[dict] = list(singleton_groups.values()) + [
+        g for g in regular_groups.values() if g["blocking"]
+    ]
+    optional_group_data: list[dict] = [
+        g for g in regular_groups.values() if not g["blocking"]
+    ]
 
     # 9. Sort and assign group IDs (single pass, mandatory preserved)
     max_groups = max(1, int(settings.repair_max_groups))
