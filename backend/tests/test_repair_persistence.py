@@ -90,7 +90,7 @@ def _make_repair_plan(task_id="test-task", plan_status="complete"):
         "repair_groups": [{"group_id": "RG001", "action_code": "REVOKE_OR_ROTATE_SECRET",
                            "priority": 1, "blocking": True, "highest_severity": "critical",
                            "highest_confidence": "high", "title": "Test", "description": "Test",
-                           "related_rule_ids": ["R001"], "related_files": ["config.py"],
+                           "related_rule_ids": ["R001_GITHUB_TOKEN"], "related_files": ["config.py"],
                            "total_related_files": 1, "returned_related_files": 1,
                            "related_files_truncated": False, "finding_count": 1,
                            "steps": ["step1"], "commands": [], "safety_notes": ["note"],
@@ -563,15 +563,17 @@ class TestRepairPersistence:
                 None, "2026-01-01T00:00:00Z",
             )
 
-        # 非列表的 verification_steps 也应被拒绝
+        # verification_steps is now REBUILT from policy — non-list input
+        # is simply ignored (not trusted). Verify it gets rebuilt correctly.
         plan3 = _make_repair_plan(task_id="task-1")
         plan3["verification_steps"] = "not-a-list"
-        with pytest.raises(RepairPlanSerializationError):
-            serialize_repair_plan(
-                "task-1", plan3,
-                "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "p0-6-v1",
-                None, "2026-01-01T00:00:00Z",
-            )
+        safe = serialize_repair_plan(
+            "task-1", plan3,
+            "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "p0-6-v1",
+            None, "2026-01-01T00:00:00Z",
+        )
+        assert isinstance(safe["verification_steps"], list)
+        assert all(isinstance(s, str) for s in safe["verification_steps"])
 
     # --- 20. Serialize boundary masks string fields via mask_untrusted_text ---
     def test_serialize_masks_string_fields(self):
