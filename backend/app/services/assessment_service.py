@@ -693,38 +693,42 @@ def _finding_sort_key(f: dict[str, Any]) -> tuple:
     blocking_reasons truncation always selects the same subset.
 
     SECURITY: All sort field values are explicitly type-normalized
-    via _normalize_sort_value before entering the canonical JSON
-    tiebreaker. json.dumps is called WITHOUT default=str so that
-    __str__ is never called on unknown objects.
+    via _normalize_sort_value BEFORE any Python operator (``or``,
+    ``if``) can invoke ``__bool__``, ``__str__``, or ``__int__`` on
+    unknown objects. json.dumps is called WITHOUT default=str.
     """
-    severity = f.get("severity") or ""
-    confidence = f.get("confidence") or ""
+    # Step 1: Normalize ALL sort fields FIRST.
+    # This ensures __str__, __bool__, __int__ are NEVER called on
+    # unknown objects — _normalize_sort_value rejects them before
+    # any Python operator can invoke their dunder methods.
+    normalized: dict[str, Any] = {}
+    for k in _FINDING_SORT_FIELDS:
+        normalized[k] = _normalize_sort_value(f.get(k))
 
-    # Build canonical JSON tiebreaker from known public fields only.
-    # Explicitly normalize each value — reject unknown objects.
-    canonical = json.dumps(
-        {k: _normalize_sort_value(f.get(k)) for k in _FINDING_SORT_FIELDS},
-        ensure_ascii=False, sort_keys=True,
-    )
+    # Step 2: Build canonical JSON tiebreaker from normalized values.
+    canonical = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
 
+    # Step 3: Build tuple key using ONLY normalized values.
+    # ``or`` operators now operate only on already-validated types
+    # (str, int, bool, None) — never on unknown objects.
     return (
-        0 if f.get("is_blocking", False) else 1,
-        _SEVERITY_ORDER.get(severity, 99),
-        _CONFIDENCE_ORDER.get(confidence, 99),
-        f.get("file_path") or "",
-        f.get("line_start") or 0,
-        f.get("line_end") or 0,
-        f.get("column_start") or 0,
-        f.get("column_end") or 0,
-        f.get("rule_id") or "",
-        f.get("rule_name") or "",
-        f.get("category") or "",
-        f.get("finding_type") or "",
-        f.get("secret_type") or "",
-        f.get("description") or "",
-        f.get("message") or "",
-        f.get("repair_template_key") or "",
-        f.get("snippet_masked") or "",
+        0 if normalized.get("is_blocking") else 1,
+        _SEVERITY_ORDER.get(normalized.get("severity") or "", 99),
+        _CONFIDENCE_ORDER.get(normalized.get("confidence") or "", 99),
+        normalized.get("file_path") or "",
+        normalized.get("line_start") or 0,
+        normalized.get("line_end") or 0,
+        normalized.get("column_start") or 0,
+        normalized.get("column_end") or 0,
+        normalized.get("rule_id") or "",
+        normalized.get("rule_name") or "",
+        normalized.get("category") or "",
+        normalized.get("finding_type") or "",
+        normalized.get("secret_type") or "",
+        normalized.get("description") or "",
+        normalized.get("message") or "",
+        normalized.get("repair_template_key") or "",
+        normalized.get("snippet_masked") or "",
         canonical,
     )
 
@@ -737,10 +741,16 @@ def _group_findings_by_rule(
     Returns a dict mapping rule_id → sorted list of finding dicts.
     The dict keys are NOT sorted here — the caller sorts the final
     score_breakdown by rule_id.
+
+    SECURITY: rule_id is normalized via _normalize_sort_value before
+    being used as a dict key, so __str__, __bool__, __int__ are never
+    called on unknown objects during grouping.
     """
     groups: dict[str, list[dict[str, Any]]] = {}
     for f in findings:
-        rule_id = f.get("rule_id", "")
+        rule_id = _normalize_sort_value(f.get("rule_id", ""))
+        if rule_id is None:
+            rule_id = ""
         if rule_id not in groups:
             groups[rule_id] = []
         groups[rule_id].append(f)

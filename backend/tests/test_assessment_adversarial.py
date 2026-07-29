@@ -755,7 +755,7 @@ class TestDefensiveDesensitization:
         for val in masked_values:
             safe = serialize_assessment_result(
                 "test-task",
-                {"score": 100, "score_breakdown": [{"description": val}]},
+                {"score": 100, "verdict": "pass", "score_breakdown": [{"description": val}]},
                 None, "now",
             )
             # 重复处理后值不变

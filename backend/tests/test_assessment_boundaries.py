@@ -6,12 +6,17 @@ B. Absolute paths in description fields
 C. Internal objects must not be stringified
 D. Corrupted assessment_json (invalid JSON, wrong types, identity mismatch)
 E. Runner fallback error classification
+F. Strict int/bool type validation in serialization
+G. Extended path sanitization (all POSIX absolute, Windows rooted, ~)
+H. Database error boundary in get_assessment_result
+I. Finding sort rejects unknown objects (no default=str)
 
 All test strings are SYNTHETIC — format-correct but NOT real credentials.
 """
 
 import copy
 import json
+import sqlite3
 import time
 from unittest.mock import patch
 
@@ -31,6 +36,14 @@ from app.services.assessment_service import (
     AssessmentInternalError,
     AssessmentSerializationError,
     sanitize_assessment_file_path,
+    _clean_path_from_text,
+    _strict_int,
+    _strict_bool,
+)
+from app.services.assessment_policy import (
+    ASSESSMENT_SCHEMA_VERSION,
+    ASSESSMENT_SCOPE,
+    POLICY_VERSION,
 )
 from app.services.scan_result_service import save_scan_result
 from app.scanner.base import (
@@ -160,7 +173,12 @@ def _read_db_row(task_id):
 
 
 def _insert_assessment_json(task_id, raw_json, score=0, verdict="blocked"):
-    """Directly insert/update assessment_results row with raw JSON."""
+    """Directly insert/update assessment_results row with raw JSON.
+
+    Uses REAL policy constants for schema_version, policy_version,
+    and assessment_scope so that identity validation reaches the
+    intended branch (not an early scope mismatch).
+    """
     conn = _get_connection()
     try:
         conn.execute(
@@ -168,17 +186,59 @@ def _insert_assessment_json(task_id, raw_json, score=0, verdict="blocked"):
                (task_id, schema_version, policy_version, assessment_scope,
                 assessment_json, score, verdict, source_scan_updated_at,
                 created_at, updated_at)
-               VALUES (?, 1, 'p0-6-v1', 'repository', ?, ?, ?, 'sync',
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'sync',
                        '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
                ON CONFLICT(task_id) DO UPDATE SET
                    assessment_json=excluded.assessment_json,
                    score=excluded.score,
                    verdict=excluded.verdict""",
-            (task_id, raw_json, score, verdict),
+            (task_id, ASSESSMENT_SCHEMA_VERSION, POLICY_VERSION,
+             ASSESSMENT_SCOPE, raw_json, score, verdict),
         )
         conn.commit()
     finally:
         conn.close()
+
+
+def _make_valid_assessment_json(default_task_id, **overrides):
+    """Build a fully valid assessment JSON dict with real policy constants.
+
+    All fields use correct values by default. Pass overrides to
+    corrupt exactly ONE field for targeted branch testing.
+
+    The first parameter is named ``default_task_id`` (not ``task_id``)
+    so that callers can override the ``task_id`` field via
+    ``**overrides`` without a Python TypeError.
+    """
+    base = {
+        "schema_version": ASSESSMENT_SCHEMA_VERSION,
+        "policy_version": POLICY_VERSION,
+        "assessment_scope": ASSESSMENT_SCOPE,
+        "task_id": default_task_id,
+        "score": 50,
+        "score_before_caps": 60,
+        "verdict": "warning",
+        "score_breakdown": [],
+        "score_caps": [],
+        "blocking_reasons": [],
+        "coverage": {
+            "status": "complete",
+            "reasons": [],
+            "total_findings": 0,
+            "scored_findings": 0,
+            "findings_truncated": False,
+            "total_blocking_findings": 0,
+            "returned_blocking_reasons": 0,
+            "blocking_reasons_truncated": False,
+            "total_scan_errors": 0,
+            "total_files_scanned": 10,
+            "total_skipped_files": 0,
+        },
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+    }
+    base.update(overrides)
+    return base
 
 
 # ============================================================
@@ -666,23 +726,16 @@ class TestCorruptedAssessmentJson:
         assert detail["error_code"] == ASSESSMENT_INTERNAL_ERROR
 
     def test_task_id_mismatch(self, client):
-        """task_id in JSON doesn't match DB task_id → 500."""
+        """task_id in JSON doesn't match DB task_id → 500.
+
+        Only task_id is corrupted; all other fields are valid so the
+        validation reaches the task_id check branch.
+        """
         task_id = self._setup_completed_task_with_assessment(client)
-        bad = {
-            "schema_version": 1,
-            "policy_version": "p0-6-v1",
-            "assessment_scope": "repository",
-            "task_id": "wrong-task-id",
-            "score": 50,
-            "verdict": "warning",
-            "score_breakdown": [],
-            "score_caps": [],
-            "blocking_reasons": [],
-            "coverage": {"status": "complete", "reasons": []},
-            "created_at": "2026-01-01T00:00:00Z",
-            "updated_at": "2026-01-01T00:00:00Z",
-        }
-        _insert_assessment_json(task_id, json.dumps(bad), score=50, verdict="warning")
+        bad = _make_valid_assessment_json(task_id, task_id="wrong-task-id")
+        _insert_assessment_json(
+            task_id, json.dumps(bad), score=50, verdict="warning"
+        )
 
         response = client.get(f"/api/check/{task_id}/assessment")
         assert response.status_code == 500
@@ -690,23 +743,17 @@ class TestCorruptedAssessmentJson:
         assert detail["error_code"] == ASSESSMENT_INTERNAL_ERROR
 
     def test_policy_version_mismatch(self, client):
-        """policy_version mismatch → 500."""
+        """policy_version mismatch → 500.
+
+        Only policy_version is corrupted; all other fields are valid.
+        """
         task_id = self._setup_completed_task_with_assessment(client)
-        bad = {
-            "schema_version": 1,
-            "policy_version": "wrong-version",
-            "assessment_scope": "repository",
-            "task_id": task_id,
-            "score": 50,
-            "verdict": "warning",
-            "score_breakdown": [],
-            "score_caps": [],
-            "blocking_reasons": [],
-            "coverage": {"status": "complete", "reasons": []},
-            "created_at": "2026-01-01T00:00:00Z",
-            "updated_at": "2026-01-01T00:00:00Z",
-        }
-        _insert_assessment_json(task_id, json.dumps(bad), score=50, verdict="warning")
+        bad = _make_valid_assessment_json(
+            task_id, policy_version="wrong-version"
+        )
+        _insert_assessment_json(
+            task_id, json.dumps(bad), score=50, verdict="warning"
+        )
 
         response = client.get(f"/api/check/{task_id}/assessment")
         assert response.status_code == 500
@@ -714,23 +761,33 @@ class TestCorruptedAssessmentJson:
         assert detail["error_code"] == ASSESSMENT_INTERNAL_ERROR
 
     def test_score_out_of_range(self, client):
-        """score > 100 → 500."""
+        """score > 100 → 500.
+
+        Only score is corrupted; all other fields are valid so the
+        validation reaches the score check branch.
+        """
         task_id = self._setup_completed_task_with_assessment(client)
-        bad = {
-            "schema_version": 1,
-            "policy_version": "p0-6-v1",
-            "assessment_scope": "repository",
-            "task_id": task_id,
-            "score": 999,
-            "verdict": "pass",
-            "score_breakdown": [],
-            "score_caps": [],
-            "blocking_reasons": [],
-            "coverage": {"status": "complete", "reasons": []},
-            "created_at": "2026-01-01T00:00:00Z",
-            "updated_at": "2026-01-01T00:00:00Z",
-        }
-        _insert_assessment_json(task_id, json.dumps(bad), score=999, verdict="pass")
+        bad = _make_valid_assessment_json(task_id, score=101)
+        _insert_assessment_json(
+            task_id, json.dumps(bad), score=101, verdict="warning"
+        )
+
+        response = client.get(f"/api/check/{task_id}/assessment")
+        assert response.status_code == 500
+        detail = response.json()["detail"]
+        assert detail["error_code"] == ASSESSMENT_INTERNAL_ERROR
+
+    def test_score_is_bool(self, client):
+        """score=True (bool) → 500.
+
+        bool is a subclass of int but must be rejected by strict
+        type validation. Only score is corrupted.
+        """
+        task_id = self._setup_completed_task_with_assessment(client)
+        bad = _make_valid_assessment_json(task_id, score=True)
+        _insert_assessment_json(
+            task_id, json.dumps(bad), score=1, verdict="warning"
+        )
 
         response = client.get(f"/api/check/{task_id}/assessment")
         assert response.status_code == 500
@@ -738,23 +795,16 @@ class TestCorruptedAssessmentJson:
         assert detail["error_code"] == ASSESSMENT_INTERNAL_ERROR
 
     def test_invalid_verdict(self, client):
-        """Invalid verdict → 500."""
+        """Invalid verdict → 500.
+
+        Only verdict is corrupted; all other fields are valid so the
+        validation reaches the verdict check branch.
+        """
         task_id = self._setup_completed_task_with_assessment(client)
-        bad = {
-            "schema_version": 1,
-            "policy_version": "p0-6-v1",
-            "assessment_scope": "repository",
-            "task_id": task_id,
-            "score": 50,
-            "verdict": "invalid",
-            "score_breakdown": [],
-            "score_caps": [],
-            "blocking_reasons": [],
-            "coverage": {"status": "complete", "reasons": []},
-            "created_at": "2026-01-01T00:00:00Z",
-            "updated_at": "2026-01-01T00:00:00Z",
-        }
-        _insert_assessment_json(task_id, json.dumps(bad), score=50, verdict="invalid")
+        bad = _make_valid_assessment_json(task_id, verdict="invalid")
+        _insert_assessment_json(
+            task_id, json.dumps(bad), score=50, verdict="invalid"
+        )
 
         response = client.get(f"/api/check/{task_id}/assessment")
         assert response.status_code == 500
@@ -762,23 +812,15 @@ class TestCorruptedAssessmentJson:
         assert detail["error_code"] == ASSESSMENT_INTERNAL_ERROR
 
     def test_schema_version_mismatch(self, client):
-        """schema_version mismatch → 500."""
+        """schema_version mismatch → 500.
+
+        Only schema_version is corrupted; all other fields are valid.
+        """
         task_id = self._setup_completed_task_with_assessment(client)
-        bad = {
-            "schema_version": 99,
-            "policy_version": "p0-6-v1",
-            "assessment_scope": "repository",
-            "task_id": task_id,
-            "score": 50,
-            "verdict": "warning",
-            "score_breakdown": [],
-            "score_caps": [],
-            "blocking_reasons": [],
-            "coverage": {"status": "complete", "reasons": []},
-            "created_at": "2026-01-01T00:00:00Z",
-            "updated_at": "2026-01-01T00:00:00Z",
-        }
-        _insert_assessment_json(task_id, json.dumps(bad), score=50, verdict="warning")
+        bad = _make_valid_assessment_json(task_id, schema_version=99)
+        _insert_assessment_json(
+            task_id, json.dumps(bad), score=50, verdict="warning"
+        )
 
         response = client.get(f"/api/check/{task_id}/assessment")
         assert response.status_code == 500
@@ -872,3 +914,377 @@ class TestRunnerFallbackError:
         assert result.error_code != ASSESSMENT_PERSIST_FAILED
 
         reset_runner_state()
+
+
+# ============================================================
+# F. Strict int/bool type validation in serialization
+# ============================================================
+
+class TestStrictTypeValidation:
+    """Strict type checking rejects bool-as-int, str-as-int, etc."""
+
+    def test_strict_int_rejects_bool(self):
+        """_strict_int rejects bool (which is int subclass)."""
+        with pytest.raises(AssessmentSerializationError):
+            _strict_int(True)
+        with pytest.raises(AssessmentSerializationError):
+            _strict_int(False)
+
+    def test_strict_int_rejects_str(self):
+        """_strict_int rejects string values."""
+        with pytest.raises(AssessmentSerializationError):
+            _strict_int("99")
+
+    def test_strict_int_rejects_float(self):
+        """_strict_int rejects float values."""
+        with pytest.raises(AssessmentSerializationError):
+            _strict_int(99.0)
+
+    def test_strict_int_range_check(self):
+        """_strict_int rejects out-of-range values (no clamping)."""
+        with pytest.raises(AssessmentSerializationError):
+            _strict_int(101, minimum=0, maximum=100)
+        with pytest.raises(AssessmentSerializationError):
+            _strict_int(-1, minimum=0, maximum=100)
+
+    def test_strict_bool_rejects_int(self):
+        """_strict_bool rejects int 0 and 1."""
+        with pytest.raises(AssessmentSerializationError):
+            _strict_bool(0)
+        with pytest.raises(AssessmentSerializationError):
+            _strict_bool(1)
+
+    def test_strict_bool_rejects_str(self):
+        """_strict_bool rejects string values."""
+        with pytest.raises(AssessmentSerializationError):
+            _strict_bool("false")
+
+    def test_score_true_rejected_in_serialize(self, test_db):
+        """score=True (bool) is rejected by serialize_assessment_result."""
+        task_id, scan_dict, scan_updated = _setup_task_with_scan(test_db)
+        assessment = assess_scan_result(task_id, scan_dict)
+        assessment["score"] = True
+        with pytest.raises(AssessmentSerializationError):
+            save_assessment_result(task_id, assessment, scan_updated)
+        row = _read_db_row(task_id)
+        assert row is None
+
+    def test_score_string_rejected_in_serialize(self, test_db):
+        """score='99' (str) is rejected."""
+        task_id, scan_dict, scan_updated = _setup_task_with_scan(test_db)
+        assessment = assess_scan_result(task_id, scan_dict)
+        assessment["score"] = "99"
+        with pytest.raises(AssessmentSerializationError):
+            save_assessment_result(task_id, assessment, scan_updated)
+        row = _read_db_row(task_id)
+        assert row is None
+
+    def test_score_over_100_rejected_no_clamp(self, test_db):
+        """score=101 is rejected (no clamping to 100)."""
+        task_id, scan_dict, scan_updated = _setup_task_with_scan(test_db)
+        assessment = assess_scan_result(task_id, scan_dict)
+        assessment["score"] = 101
+        with pytest.raises(AssessmentSerializationError):
+            save_assessment_result(task_id, assessment, scan_updated)
+        row = _read_db_row(task_id)
+        assert row is None
+
+    def test_score_before_caps_negative_rejected(self, test_db):
+        """score_before_caps=-1 is rejected (no clamping to 0)."""
+        task_id, scan_dict, scan_updated = _setup_task_with_scan(test_db)
+        assessment = assess_scan_result(task_id, scan_dict)
+        assessment["score_before_caps"] = -1
+        with pytest.raises(AssessmentSerializationError):
+            save_assessment_result(task_id, assessment, scan_updated)
+        row = _read_db_row(task_id)
+        assert row is None
+
+    def test_applied_int_rejected_as_bool(self, test_db):
+        """applied=1 (int, not bool) is rejected in score_caps."""
+        task_id, scan_dict, scan_updated = _setup_task_with_scan(
+            test_db, files_scanned=0
+        )
+        assessment = assess_scan_result(task_id, scan_dict)
+        for cap in assessment["score_caps"]:
+            cap["applied"] = 1
+        with pytest.raises(AssessmentSerializationError):
+            save_assessment_result(task_id, assessment, scan_updated)
+        row = _read_db_row(task_id)
+        assert row is None
+
+    def test_findings_truncated_string_rejected(self, test_db):
+        """findings_truncated='false' (str) is rejected in coverage."""
+        task_id, scan_dict, scan_updated = _setup_task_with_scan(test_db)
+        assessment = assess_scan_result(task_id, scan_dict)
+        assessment["coverage"]["findings_truncated"] = "false"
+        with pytest.raises(AssessmentSerializationError):
+            save_assessment_result(task_id, assessment, scan_updated)
+        row = _read_db_row(task_id)
+        assert row is None
+
+    def test_occurrence_deductions_mixed_types_rejected(self, test_db):
+        """occurrence_deductions=[1, '2'] is rejected."""
+        task_id, scan_dict, scan_updated = _setup_task_with_scan(
+            test_db,
+            findings=[Finding(
+                rule_id="R_MIXED",
+                rule_name="Test",
+                severity=Severity.CRITICAL,
+                confidence=Confidence.HIGH,
+                file_path="config.py",
+                line_start=1, line_end=1,
+                column_start=1, column_end=20,
+                snippet_masked="ghp_****",
+                is_blocking=False,
+                finding_type=FindingType.CONTENT,
+                description="Found",
+                category="token",
+                secret_type="github_token",
+                message="Remove",
+                repair_template_key="remove_secret",
+            )],
+        )
+        assessment = assess_scan_result(task_id, scan_dict)
+        assert len(assessment["score_breakdown"]) > 0
+        assessment["score_breakdown"][0]["occurrence_deductions"] = [1, "2"]
+        with pytest.raises(AssessmentSerializationError):
+            save_assessment_result(task_id, assessment, scan_updated)
+        row = _read_db_row(task_id)
+        assert row is None
+
+    def test_verdict_invalid_rejected_not_defaulted(self, test_db):
+        """Invalid verdict is rejected, not silently changed to 'blocked'."""
+        task_id, scan_dict, scan_updated = _setup_task_with_scan(test_db)
+        assessment = assess_scan_result(task_id, scan_dict)
+        assessment["verdict"] = "invalid"
+        with pytest.raises(AssessmentSerializationError):
+            save_assessment_result(task_id, assessment, scan_updated)
+        row = _read_db_row(task_id)
+        assert row is None
+
+    def test_finding_count_bool_rejected(self, test_db):
+        """finding_count=True is rejected (bool is not int)."""
+        task_id, scan_dict, scan_updated = _setup_task_with_scan(
+            test_db,
+            findings=[Finding(
+                rule_id="R_FC_BOOL",
+                rule_name="Test",
+                severity=Severity.CRITICAL,
+                confidence=Confidence.HIGH,
+                file_path="config.py",
+                line_start=1, line_end=1,
+                column_start=1, column_end=20,
+                snippet_masked="ghp_****",
+                is_blocking=False,
+                finding_type=FindingType.CONTENT,
+                description="Found",
+                category="token",
+                secret_type="github_token",
+                message="Remove",
+                repair_template_key="remove_secret",
+            )],
+        )
+        assessment = assess_scan_result(task_id, scan_dict)
+        assert len(assessment["score_breakdown"]) > 0
+        assessment["score_breakdown"][0]["finding_count"] = True
+        with pytest.raises(AssessmentSerializationError):
+            save_assessment_result(task_id, assessment, scan_updated)
+        row = _read_db_row(task_id)
+        assert row is None
+
+
+# ============================================================
+# G. Extended path sanitization
+# ============================================================
+
+class TestExtendedPathSanitization:
+    """All non-repo-relative paths are redacted."""
+
+    @pytest.mark.parametrize("dangerous_path", [
+        "/etc/passwd",
+        "/root/.ssh/id_rsa",
+        "/opt/app/config",
+        "\\rooted\\secret",
+        "~/private/.env",
+        "~\\private\\.env",
+    ])
+    def test_extended_dangerous_paths_redacted(self, dangerous_path):
+        """Paths that were previously allowed are now redacted."""
+        assert sanitize_assessment_file_path(dangerous_path) == "<redacted-path>"
+
+    def test_normal_paths_still_preserved(self):
+        """Normal repo-relative paths are not affected."""
+        assert sanitize_assessment_file_path("src/config.py") == "src/config.py"
+        assert sanitize_assessment_file_path(".env") == ".env"
+        assert sanitize_assessment_file_path("packages/api/settings.py") == "packages/api/settings.py"
+
+    def test_var_tmp_text_cleaning_exact(self):
+        """_clean_path_from_text replaces /var/tmp/... completely."""
+        result = _clean_path_from_text(
+            "err /var/tmp/task-secret/repo/.env done"
+        )
+        assert result == "err <redacted-path> done"
+
+    def test_forward_slash_unc_in_text(self):
+        """Forward-slash UNC paths are cleaned from text."""
+        result = _clean_path_from_text(
+            "scan at //server/share/temp/repo/data.db"
+        )
+        assert "//server" not in result
+        assert "<redacted-path>" in result
+
+    def test_no_residue_in_var_tmp(self):
+        """No /var, username, task ID, or basename residue after cleaning."""
+        result = _clean_path_from_text(
+            "Error at /var/tmp/task-secret/repo/.env"
+        )
+        assert "/var" not in result
+        assert "task-secret" not in result
+        assert "repo" not in result
+        assert ".env" not in result
+
+
+# ============================================================
+# H. Database error boundary in get_assessment_result
+# ============================================================
+
+class TestDatabaseErrorBoundary:
+    """All database operations are inside the try boundary."""
+
+    def test_init_db_error_raises_internal_error(self, test_db, monkeypatch):
+        """init_db raising sqlite3.Error → AssessmentInternalError."""
+        def _boom():
+            raise sqlite3.Error("init failed")
+        monkeypatch.setattr(
+            "app.services.assessment_service.init_db", _boom
+        )
+        with pytest.raises(AssessmentInternalError):
+            get_assessment_result("any-task-id")
+
+    def test_get_connection_error_raises_internal_error(self, test_db, monkeypatch):
+        """_get_connection raising sqlite3.Error → AssessmentInternalError."""
+        def _boom():
+            raise sqlite3.Error("connection failed")
+        monkeypatch.setattr(
+            "app.services.assessment_service._get_connection", _boom
+        )
+        with pytest.raises(AssessmentInternalError):
+            get_assessment_result("any-task-id")
+
+    def test_execute_error_raises_internal_error(self, test_db, monkeypatch):
+        """execute raising sqlite3.Error → AssessmentInternalError."""
+        class _BadConn:
+            def execute(self, *args, **kwargs):
+                raise sqlite3.Error("execute failed")
+            def close(self):
+                pass
+        monkeypatch.setattr(
+            "app.services.assessment_service._get_connection",
+            lambda: _BadConn(),
+        )
+        with pytest.raises(AssessmentInternalError):
+            get_assessment_result("any-task-id")
+
+
+# ============================================================
+# I. Finding sort rejects unknown objects (no default=str)
+# ============================================================
+
+class TestFindingSortNoDefaultStr:
+    """Finding sort must not call __str__ on unknown objects."""
+
+    def test_custom_object_in_sort_field_rejected(self, test_db):
+        """A finding with a custom __str__ object in a sort field
+        must raise AssessmentInternalError, not call __str__.
+
+        The __str__ returns a synthetic token that must NOT appear
+        in any output.
+        """
+        class MaliciousObject:
+            def __str__(self):
+                return SYNTH_TOKEN_GHP
+            def __repr__(self):
+                return "MaliciousObject()"
+
+        task_id, scan_dict, scan_updated = _setup_task_with_scan(
+            test_db,
+            findings=[Finding(
+                rule_id="R_SORT_OBJ",
+                rule_name="Test",
+                severity=Severity.CRITICAL,
+                confidence=Confidence.HIGH,
+                file_path="config.py",
+                line_start=1, line_end=1,
+                column_start=1, column_end=20,
+                snippet_masked="ghp_****",
+                is_blocking=False,
+                finding_type=FindingType.CONTENT,
+                description="Found",
+                category="token",
+                secret_type="github_token",
+                message="Remove",
+                repair_template_key="remove_secret",
+            )],
+        )
+
+        # Inject malicious object into a sort field BEFORE assessment.
+        # assess_scan_result calls _finding_sort_key which must reject it.
+        scan_dict["findings"][0]["description"] = MaliciousObject()
+
+        with pytest.raises(AssessmentInternalError):
+            assess_scan_result(task_id, scan_dict)
+
+        # Token must not appear in any database row.
+        row = _read_db_row(task_id)
+        assert row is None
+
+    def test_sort_deterministic_with_valid_types(self, test_db):
+        """Sorting still works correctly with valid type fields."""
+        findings = [
+            Finding(
+                rule_id="R_SORT_A",
+                rule_name="Rule A",
+                severity=Severity.HIGH,
+                confidence=Confidence.MEDIUM,
+                file_path="z.py",
+                line_start=5, line_end=5,
+                column_start=1, column_end=10,
+                snippet_masked="***",
+                is_blocking=False,
+                finding_type=FindingType.CONTENT,
+                description="A",
+                category="token",
+                secret_type="github_token",
+                message="Remove",
+                repair_template_key="remove_secret",
+            ),
+            Finding(
+                rule_id="R_SORT_A",
+                rule_name="Rule A",
+                severity=Severity.CRITICAL,
+                confidence=Confidence.HIGH,
+                file_path="a.py",
+                line_start=1, line_end=1,
+                column_start=1, column_end=10,
+                snippet_masked="***",
+                is_blocking=True,
+                finding_type=FindingType.CONTENT,
+                description="B",
+                category="token",
+                secret_type="github_token",
+                message="Remove",
+                repair_template_key="remove_secret",
+            ),
+        ]
+        task_id, scan_dict, scan_updated = _setup_task_with_scan(
+            test_db, findings=findings
+        )
+        # Should not raise — all fields are valid types.
+        assessment = assess_scan_result(task_id, scan_dict)
+        save_assessment_result(task_id, assessment, scan_updated)
+
+        retrieved = get_assessment_result(task_id)
+        assert retrieved is not None
+        # Critical blocking finding should be first in blocking_reasons.
+        if retrieved["blocking_reasons"]:
+            assert retrieved["blocking_reasons"][0]["severity"] == "critical"
