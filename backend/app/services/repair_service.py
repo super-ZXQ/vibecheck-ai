@@ -1812,24 +1812,442 @@ def save_repair_result(
     return safe_plan
 
 
+def _validate_persisted_repair_plan(
+    result: dict,
+    task_id: str,
+    db_columns: dict,
+) -> dict:
+    """Strictly validate a persisted repair plan read from SQLite.
+
+    Validates ALL top-level fields, summary fields, each repair_group,
+    agent_prompt, and JSON/DB column consistency.
+
+    Any field corruption raises RepairPlanInternalError.
+    The API layer maps this to REPAIR_PLAN_INTERNAL_ERROR (HTTP 500).
+
+    Args:
+        result: The parsed repair plan JSON dict.
+        task_id: The task_id from the request path.
+        db_columns: Dict of database column values:
+            plan_status, total_repair_groups, blocking_repair_groups,
+            source_scan_updated_at, source_assessment_updated_at,
+            source_assessment_policy_version, created_at, updated_at
+
+    Returns:
+        The validated result dict.
+
+    Raises:
+        RepairPlanInternalError: If ANY validation check fails.
+    """
+    # --- 1. Top-level field set and types ---
+    _expected_top_fields = {
+        "schema_version", "policy_version", "repair_scope", "task_id",
+        "plan_status", "summary", "repair_groups", "verification_steps",
+        "agent_prompt", "source_scan_updated_at",
+        "source_assessment_updated_at", "source_assessment_policy_version",
+        "created_at", "updated_at",
+    }
+    _actual_top_fields = set(result.keys())
+    if _actual_top_fields != _expected_top_fields:
+        raise RepairPlanInternalError(
+            "Repair plan top-level field set mismatch"
+        )
+
+    # --- 2. Identity fields ---
+    if result["schema_version"] != REPAIR_SCHEMA_VERSION:
+        raise RepairPlanInternalError("schema_version mismatch")
+    if result["policy_version"] != POLICY_VERSION:
+        raise RepairPlanInternalError("policy_version mismatch")
+    if result["repair_scope"] != REPAIR_SCOPE:
+        raise RepairPlanInternalError("repair_scope mismatch")
+    if not isinstance(result["task_id"], str) or result["task_id"] != task_id:
+        raise RepairPlanInternalError("task_id mismatch")
+
+    # --- 3. plan_status ---
+    plan_status = result["plan_status"]
+    if not isinstance(plan_status, str) or plan_status not in (
+        "complete", "partial"
+    ):
+        raise RepairPlanInternalError("Invalid plan_status")
+    if plan_status != db_columns["plan_status"]:
+        raise RepairPlanInternalError("plan_status JSON/DB mismatch")
+
+    # --- 4. Summary validation ---
+    summary = result["summary"]
+    if not isinstance(summary, dict):
+        raise RepairPlanInternalError("summary is not a dict")
+
+    _expected_summary_fields = {
+        "total_repair_groups", "blocking_repair_groups",
+        "manual_review_required", "coverage_warning", "groups_truncated",
+    }
+    if set(summary.keys()) != _expected_summary_fields:
+        raise RepairPlanInternalError("summary field set mismatch")
+
+    # total_repair_groups: int, reject bool
+    total_repair_groups = summary["total_repair_groups"]
+    if type(total_repair_groups) is not int or isinstance(
+        total_repair_groups, bool
+    ):
+        raise RepairPlanInternalError(
+            "total_repair_groups is not a strict int"
+        )
+
+    # blocking_repair_groups: int, reject bool
+    blocking_repair_groups = summary["blocking_repair_groups"]
+    if type(blocking_repair_groups) is not int or isinstance(
+        blocking_repair_groups, bool
+    ):
+        raise RepairPlanInternalError(
+            "blocking_repair_groups is not a strict int"
+        )
+
+    # manual_review_required: bool
+    manual_review_required = summary["manual_review_required"]
+    if type(manual_review_required) is not bool:
+        raise RepairPlanInternalError(
+            "manual_review_required is not a bool"
+        )
+
+    # coverage_warning: bool
+    coverage_warning = summary["coverage_warning"]
+    if type(coverage_warning) is not bool:
+        raise RepairPlanInternalError("coverage_warning is not a bool")
+
+    # groups_truncated: bool
+    groups_truncated = summary["groups_truncated"]
+    if type(groups_truncated) is not bool:
+        raise RepairPlanInternalError("groups_truncated is not a bool")
+
+    # --- 5. repair_groups validation ---
+    repair_groups = result["repair_groups"]
+    if not isinstance(repair_groups, list):
+        raise RepairPlanInternalError("repair_groups is not a list")
+
+    # Recalculate summary from groups
+    actual_total = len(repair_groups)
+    actual_blocking = sum(
+        1 for g in repair_groups if g.get("blocking") is True
+    )
+    actual_manual = any(
+        g.get("action_code") == ACTION_MANUAL_REVIEW_REQUIRED
+        for g in repair_groups
+    )
+
+    if total_repair_groups != actual_total:
+        raise RepairPlanInternalError(
+            "total_repair_groups does not match len(repair_groups)"
+        )
+    if blocking_repair_groups != actual_blocking:
+        raise RepairPlanInternalError(
+            "blocking_repair_groups does not match actual blocking groups"
+        )
+    if manual_review_required != actual_manual:
+        raise RepairPlanInternalError(
+            "manual_review_required does not match actual groups"
+        )
+
+    # Validate each repair_group
+    _expected_group_fields = {
+        "group_id", "action_code", "priority", "blocking",
+        "highest_severity", "highest_confidence", "title", "description",
+        "related_rule_ids", "related_files", "total_related_files",
+        "returned_related_files", "related_files_truncated",
+        "finding_count", "steps", "commands", "safety_notes",
+        "verification_steps",
+    }
+
+    for idx, g in enumerate(repair_groups):
+        if not isinstance(g, dict):
+            raise RepairPlanInternalError("repair_group is not a dict")
+        if set(g.keys()) != _expected_group_fields:
+            raise RepairPlanInternalError(
+                "repair_group field set mismatch"
+            )
+
+        # group_id: format RG001, RG002, continuous, matches position
+        group_id = g["group_id"]
+        if not isinstance(group_id, str):
+            raise RepairPlanInternalError("group_id is not a string")
+        expected_gid = f"RG{idx + 1:03d}"
+        if group_id != expected_gid:
+            raise RepairPlanInternalError(
+                f"group_id mismatch: expected {expected_gid}, got {group_id}"
+            )
+
+        # action_code: valid
+        action_code = g["action_code"]
+        if not isinstance(action_code, str) or not is_valid_action_code(
+            action_code
+        ):
+            raise RepairPlanInternalError("Invalid action_code")
+
+        action = get_action(action_code)
+
+        # priority: strictly equals frozen policy
+        priority = g["priority"]
+        if type(priority) is not int or isinstance(priority, bool):
+            raise RepairPlanInternalError("priority is not a strict int")
+        if priority != action.priority:
+            raise RepairPlanInternalError(
+                "priority does not match frozen policy"
+            )
+
+        # blocking: bool
+        blocking = g["blocking"]
+        if type(blocking) is not bool:
+            raise RepairPlanInternalError("blocking is not a bool")
+
+        # highest_severity: in fixed enum
+        highest_severity = g["highest_severity"]
+        if not isinstance(highest_severity, str):
+            raise RepairPlanInternalError("highest_severity is not a string")
+        if highest_severity not in SEVERITY_ORDER:
+            raise RepairPlanInternalError(
+                "highest_severity not in fixed enum"
+            )
+
+        # highest_confidence: in fixed enum
+        highest_confidence = g["highest_confidence"]
+        if not isinstance(highest_confidence, str):
+            raise RepairPlanInternalError("highest_confidence is not a string")
+        if highest_confidence not in CONFIDENCE_ORDER:
+            raise RepairPlanInternalError(
+                "highest_confidence not in fixed enum"
+            )
+
+        # title: strictly equals frozen policy
+        if g["title"] != action.title:
+            raise RepairPlanInternalError("title does not match frozen policy")
+
+        # description: strictly equals frozen policy safe result
+        expected_desc = _safe_masked_desc(action.description)
+        if g["description"] != expected_desc:
+            raise RepairPlanInternalError(
+                "description does not match frozen policy"
+            )
+
+        # related_rule_ids: safe string list
+        related_rule_ids = g["related_rule_ids"]
+        if not isinstance(related_rule_ids, list):
+            raise RepairPlanInternalError("related_rule_ids is not a list")
+        for rid in related_rule_ids:
+            if not isinstance(rid, str):
+                raise RepairPlanInternalError(
+                    "related_rule_ids contains non-string"
+                )
+            if _has_forbidden_unicode(rid):
+                raise RepairPlanInternalError(
+                    "related_rule_ids contains control characters"
+                )
+
+        # related_files: safe repo-relative path list
+        related_files = g["related_files"]
+        if not isinstance(related_files, list):
+            raise RepairPlanInternalError("related_files is not a list")
+        for fp in related_files:
+            if not isinstance(fp, str):
+                raise RepairPlanInternalError(
+                    "related_files contains non-string"
+                )
+            # Re-validate each path — must pass _sanitize_file_path unchanged
+            if _sanitize_file_path(fp) != fp:
+                raise RepairPlanInternalError(
+                    "related_files contains unsafe path"
+                )
+
+        # total_related_files: non-negative int, reject bool
+        total_related_files = g["total_related_files"]
+        if type(total_related_files) is not int or isinstance(
+            total_related_files, bool
+        ):
+            raise RepairPlanInternalError(
+                "total_related_files is not a strict int"
+            )
+        if total_related_files < 0:
+            raise RepairPlanInternalError(
+                "total_related_files is negative"
+            )
+
+        # returned_related_files == len(related_files)
+        returned_related_files = g["returned_related_files"]
+        if type(returned_related_files) is not int or isinstance(
+            returned_related_files, bool
+        ):
+            raise RepairPlanInternalError(
+                "returned_related_files is not a strict int"
+            )
+        if returned_related_files != len(related_files):
+            raise RepairPlanInternalError(
+                "returned_related_files does not match len(related_files)"
+            )
+
+        # related_files_truncated: consistent with counts
+        related_files_truncated = g["related_files_truncated"]
+        if type(related_files_truncated) is not bool:
+            raise RepairPlanInternalError(
+                "related_files_truncated is not a bool"
+            )
+        if related_files_truncated != (
+            total_related_files > returned_related_files
+        ):
+            raise RepairPlanInternalError(
+                "related_files_truncated inconsistent with counts"
+            )
+
+        # finding_count: non-negative int, reject bool
+        finding_count = g["finding_count"]
+        if type(finding_count) is not int or isinstance(finding_count, bool):
+            raise RepairPlanInternalError(
+                "finding_count is not a strict int"
+            )
+        if finding_count < 0:
+            raise RepairPlanInternalError("finding_count is negative")
+
+        # steps: strictly equals frozen policy
+        expected_steps = [_safe_masked_desc(s) for s in action.steps]
+        if g["steps"] != expected_steps:
+            raise RepairPlanInternalError(
+                "steps do not match frozen policy"
+            )
+
+        # commands: strictly equals get_allowed_commands(action_code)
+        expected_commands = list(get_allowed_commands(action_code))
+        if g["commands"] != expected_commands:
+            raise RepairPlanInternalError(
+                "commands do not match get_allowed_commands for this action"
+            )
+
+        # safety_notes: strictly equals frozen policy
+        expected_safety = [_safe_masked_desc(s) for s in action.safety_notes]
+        if g["safety_notes"] != expected_safety:
+            raise RepairPlanInternalError(
+                "safety_notes do not match frozen policy"
+            )
+
+        # verification_steps: strictly equals frozen policy
+        expected_verify = [
+            _safe_masked_desc(s) for s in action.verification_steps
+        ]
+        if g["verification_steps"] != expected_verify:
+            raise RepairPlanInternalError(
+                "verification_steps do not match frozen policy"
+            )
+
+    # --- 6. verification_steps ---
+    verification_steps = result["verification_steps"]
+    if not isinstance(verification_steps, list):
+        raise RepairPlanInternalError("verification_steps is not a list")
+    for vs in verification_steps:
+        if not isinstance(vs, str):
+            raise RepairPlanInternalError(
+                "verification_steps contains non-string"
+            )
+
+    # --- 7. agent_prompt validation ---
+    agent_prompt = result["agent_prompt"]
+    if not isinstance(agent_prompt, str):
+        raise RepairPlanInternalError("agent_prompt is not a string")
+
+    max_prompt_chars = max(1, int(settings.repair_max_agent_prompt_chars))
+    if len(agent_prompt) > max_prompt_chars:
+        raise RepairPlanInternalError(
+            "agent_prompt exceeds repair_max_agent_prompt_chars"
+        )
+
+    # All 11 AGENT_PROMPT_REQUIREMENTS must be present
+    for req in AGENT_PROMPT_REQUIREMENTS:
+        if req not in agent_prompt:
+            raise RepairPlanInternalError(
+                "agent_prompt missing a required safety requirement"
+            )
+
+    # Partial plan must contain PARTIAL_DECLARATION
+    if plan_status == "partial":
+        if PARTIAL_DECLARATION not in agent_prompt:
+            raise RepairPlanInternalError(
+                "Partial plan agent_prompt missing PARTIAL_DECLARATION"
+            )
+
+    # No forbidden content in agent_prompt
+    # Check for Cf, Zl, Zp (not Cc — newlines are legitimate in prompts)
+    _prompt_forbidden = frozenset({"Cf", "Zl", "Zp"})
+    for ch in agent_prompt:
+        if unicodedata.category(ch) in _prompt_forbidden:
+            raise RepairPlanInternalError(
+                "agent_prompt contains forbidden Unicode format character"
+            )
+    # Check variable portion for forbidden fields and patterns
+    marker = "## 修复动作摘要"
+    marker_idx = agent_prompt.find(marker)
+    variable_part = ""
+    if marker_idx >= 0:
+        variable_part = agent_prompt[marker_idx + len(marker):]
+    for field in AGENT_PROMPT_FORBIDDEN_FIELDS:
+        if field in variable_part:
+            raise RepairPlanInternalError(
+                "agent_prompt contains forbidden field"
+            )
+    for pattern in AGENT_PROMPT_FORBIDDEN_PATTERNS:
+        if re.search(pattern, variable_part):
+            raise RepairPlanInternalError(
+                "agent_prompt contains forbidden pattern"
+            )
+
+    # --- 8. source_assessment_policy_version must be supported ---
+    source_policy = result["source_assessment_policy_version"]
+    if not isinstance(source_policy, str):
+        raise RepairPlanInternalError(
+            "source_assessment_policy_version is not a string"
+        )
+    if not is_supported_assessment_policy(source_policy):
+        raise RepairPlanInternalError(
+            "source_assessment_policy_version is not supported"
+        )
+
+    # --- 9. JSON and DB redundant column consistency ---
+    if total_repair_groups != db_columns["total_repair_groups"]:
+        raise RepairPlanInternalError(
+            "total_repair_groups JSON/DB mismatch"
+        )
+    if blocking_repair_groups != db_columns["blocking_repair_groups"]:
+        raise RepairPlanInternalError(
+            "blocking_repair_groups JSON/DB mismatch"
+        )
+    if result["source_scan_updated_at"] != db_columns["source_scan_updated_at"]:
+        raise RepairPlanInternalError(
+            "source_scan_updated_at JSON/DB mismatch"
+        )
+    if result["source_assessment_updated_at"] != db_columns[
+        "source_assessment_updated_at"
+    ]:
+        raise RepairPlanInternalError(
+            "source_assessment_updated_at JSON/DB mismatch"
+        )
+    if source_policy != db_columns["source_assessment_policy_version"]:
+        raise RepairPlanInternalError(
+            "source_assessment_policy_version JSON/DB mismatch"
+        )
+    if result["created_at"] != db_columns["created_at"]:
+        raise RepairPlanInternalError("created_at JSON/DB mismatch")
+    if result["updated_at"] != db_columns["updated_at"]:
+        raise RepairPlanInternalError("updated_at JSON/DB mismatch")
+
+    return result
+
+
 def get_repair_result(task_id: str) -> Optional[dict]:
     """Read the full persisted repair plan for a task.
 
     Returns None if no repair plan has been persisted.
 
-    Validates the parsed JSON against:
-    - Identity fields (schema_version, policy_version, repair_scope, task_id)
-    - plan_status (must be complete/partial)
-    - Summary structure and types
-    - repair_groups is a list with valid structure
-    - commands all come from the allowlist
-    - JSON source fields match database columns
-    - JSON plan_status matches database column
-    - JSON group counts match database redundant columns
-    - JSON timestamps match database columns
+    Validates the parsed JSON via _validate_persisted_repair_plan,
+    which checks ALL fields, types, frozen policy consistency,
+    agent_prompt safety, and JSON/DB column consistency.
 
     Raises:
         RepairPlanInternalError: If any validation fails.
+            The API layer maps this to REPAIR_PLAN_INTERNAL_ERROR.
     """
     conn = None
     _db_error = False
@@ -1848,14 +2266,20 @@ def get_repair_result(task_id: str) -> Optional[dict]:
         if row is None:
             return None
         raw_json = row["repair_json"]
-        db_plan_status = row["plan_status"]
-        db_total_groups = row["total_repair_groups"]
-        db_blocking_groups = row["blocking_repair_groups"]
-        db_source_scan = row["source_scan_updated_at"]
-        db_source_assessment = row["source_assessment_updated_at"]
-        db_source_policy = row["source_assessment_policy_version"]
-        db_created_at = row["created_at"]
-        db_updated_at = row["updated_at"]
+        db_columns = {
+            "plan_status": row["plan_status"],
+            "total_repair_groups": row["total_repair_groups"],
+            "blocking_repair_groups": row["blocking_repair_groups"],
+            "source_scan_updated_at": row["source_scan_updated_at"],
+            "source_assessment_updated_at": row[
+                "source_assessment_updated_at"
+            ],
+            "source_assessment_policy_version": row[
+                "source_assessment_policy_version"
+            ],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
     except RepairPlanInternalError:
         _db_error = True
         raise
@@ -1883,85 +2307,8 @@ def get_repair_result(task_id: str) -> Optional[dict]:
     if not isinstance(result, dict):
         raise RepairPlanInternalError("Repair plan JSON is not a dict")
 
-    # --- Identity validation ---
-    if result.get("schema_version") != REPAIR_SCHEMA_VERSION:
-        raise RepairPlanInternalError("Repair plan schema_version mismatch")
-    if result.get("policy_version") != POLICY_VERSION:
-        raise RepairPlanInternalError("Repair plan policy_version mismatch")
-    if result.get("repair_scope") != REPAIR_SCOPE:
-        raise RepairPlanInternalError("Repair plan scope mismatch")
-    if result.get("task_id") != task_id:
-        raise RepairPlanInternalError("Repair plan task_id mismatch")
-
-    # --- plan_status validation ---
-    json_plan_status = result.get("plan_status")
-    if json_plan_status not in ("complete", "partial"):
-        raise RepairPlanInternalError("Invalid plan_status in repair JSON")
-    if json_plan_status != db_plan_status:
-        raise RepairPlanInternalError("plan_status JSON/DB mismatch")
-
-    # --- Summary validation ---
-    json_summary = result.get("summary", {})
-    if not isinstance(json_summary, dict):
-        raise RepairPlanInternalError("summary is not a dict")
-
-    # --- repair_groups validation ---
-    json_groups = result.get("repair_groups", [])
-    if not isinstance(json_groups, list):
-        raise RepairPlanInternalError("repair_groups is not a list")
-
-    # Validate each group has valid structure and commands
-    for g in json_groups:
-        if not isinstance(g, dict):
-            raise RepairPlanInternalError("repair_group is not a dict")
-        ac = g.get("action_code", "")
-        if not isinstance(ac, str) or not is_valid_action_code(ac):
-            raise RepairPlanInternalError("Invalid action_code in repair JSON")
-        cmds = g.get("commands", [])
-        if not isinstance(cmds, list):
-            raise RepairPlanInternalError("commands is not a list")
-        for cmd in cmds:
-            if not isinstance(cmd, str) or not is_command_allowed(cmd):
-                raise RepairPlanInternalError(
-                    "Disallowed command in repair JSON"
-                )
-
-    # --- Count consistency ---
-    json_total = json_summary.get("total_repair_groups", 0)
-    if not isinstance(json_total, int) or json_total != len(json_groups):
-        raise RepairPlanInternalError("total_repair_groups mismatch")
-    if json_total != db_total_groups:
-        raise RepairPlanInternalError("total_repair_groups JSON/DB mismatch")
-
-    json_blocking = json_summary.get("blocking_repair_groups", 0)
-    if not isinstance(json_blocking, int):
-        raise RepairPlanInternalError("blocking_repair_groups not int")
-    if json_blocking != db_blocking_groups:
-        raise RepairPlanInternalError(
-            "blocking_repair_groups JSON/DB mismatch"
-        )
-
-    # --- Source field consistency ---
-    if result.get("source_scan_updated_at") != db_source_scan:
-        raise RepairPlanInternalError(
-            "source_scan_updated_at JSON/DB mismatch"
-        )
-    if result.get("source_assessment_updated_at") != db_source_assessment:
-        raise RepairPlanInternalError(
-            "source_assessment_updated_at JSON/DB mismatch"
-        )
-    if result.get("source_assessment_policy_version") != db_source_policy:
-        raise RepairPlanInternalError(
-            "source_assessment_policy_version JSON/DB mismatch"
-        )
-
-    # --- Timestamp consistency ---
-    if result.get("created_at") != db_created_at:
-        raise RepairPlanInternalError("created_at JSON/DB mismatch")
-    if result.get("updated_at") != db_updated_at:
-        raise RepairPlanInternalError("updated_at JSON/DB mismatch")
-
-    return result
+    # --- Strict validation of all fields ---
+    return _validate_persisted_repair_plan(result, task_id, db_columns)
 
 
 def get_repair_plan_available(task_id: str) -> bool:
