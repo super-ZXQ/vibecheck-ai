@@ -460,8 +460,9 @@ class TestRepairDeterminism:
         for g in revoke_groups:
             assert g["finding_count"] == 1
         # 两个分组的 related_rule_ids 不同
+        # R099_CUSTOM_TOKEN is unknown → sanitized to <unknown-rule>
         rule_ids = {g["related_rule_ids"][0] for g in revoke_groups}
-        assert rule_ids == {"R001_GITHUB_TOKEN", "R099_CUSTOM_TOKEN"}
+        assert rule_ids == {"R001_GITHUB_TOKEN", "<unknown-rule>"}
 
     # --- 15. Global singleton stability ---
 

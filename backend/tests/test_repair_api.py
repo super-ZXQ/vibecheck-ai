@@ -29,9 +29,14 @@ from fastapi.testclient import TestClient
 
 from app.db import database
 from app.services import background_runner, task_manager
-from app.services.repair_policy import POLICY_VERSION, REPAIR_SCHEMA_VERSION, REPAIR_SCOPE
+from app.services.repair_policy import (
+    POLICY_VERSION, REPAIR_SCHEMA_VERSION, REPAIR_SCOPE,
+    AGENT_PROMPT_REQUIREMENTS, PARTIAL_DECLARATION,
+    ACTION_REVOKE_OR_ROTATE_SECRET,
+)
 from app.services.repair_service import (
-    save_repair_result, get_repair_result, RepairPlanInternalError,
+    save_repair_result, get_repair_result, serialize_repair_plan,
+    RepairPlanInternalError,
 )
 from app.core.error_codes import (
     REPAIR_PLAN_NOT_READY, REPAIR_PLAN_NOT_AVAILABLE, REPAIR_PLAN_INTERNAL_ERROR,
@@ -98,39 +103,89 @@ def _create_running_task():
     return task.id
 
 
+def _make_valid_agent_prompt(plan_status="complete"):
+    """Build a minimal valid agent_prompt containing all 11 requirements."""
+    lines = [
+        "# VibeCheck 安全修复指引",
+        "",
+    ]
+    if plan_status == "partial":
+        lines.append(PARTIAL_DECLARATION)
+        lines.append("")
+    lines.append("## 安全要求")
+    lines.append("")
+    for req in AGENT_PROMPT_REQUIREMENTS:
+        lines.append(req)
+    return "\n".join(lines)
+
+
 def _insert_repair_plan(task_id, plan_status="complete"):
-    """直接向 repair_results 表插入一条修复计划记录。
+    """直接向 repair_results 表插入一条完整有效的修复计划记录。
 
-    绕过 save_repair_result 的序列化边界，用于快速设置测试前置条件。
+    使用 serialize_repair_plan 构建符合冻结策略的安全计划，
+    确保 get_repair_result 的严格验证能够通过。
     返回插入的 plan dict。
-
-    注意: repair_groups 必须与 summary 中的 total_repair_groups /
-    blocking_repair_groups 计数保持一致，因为 get_repair_result 会校验
-    JSON 内部计数与 DB 冗余列之间的一致性。
     """
     from app.db.database import _get_connection, now_iso
     now = now_iso()
-    plan = {
+
+    # Build a minimal plan dict — serialize_repair_plan will rebuild
+    # all policy fields (title, description, steps, commands, etc.)
+    # from the frozen RepairAction definition.
+    raw_plan = {
         "schema_version": REPAIR_SCHEMA_VERSION,
         "policy_version": POLICY_VERSION,
         "repair_scope": REPAIR_SCOPE,
         "task_id": task_id,
         "plan_status": plan_status,
-        "summary": {"total_repair_groups": 1, "blocking_repair_groups": 1,
-                     "manual_review_required": False, "coverage_warning": False,
-                     "groups_truncated": False},
+        "summary": {
+            "total_repair_groups": 1,
+            "blocking_repair_groups": 1,
+            "manual_review_required": False,
+            "coverage_warning": False,
+            "groups_truncated": False,
+        },
         "repair_groups": [{
             "group_id": "RG001",
-            "action_code": "REVOKE_OR_ROTATE_SECRET",
+            "action_code": ACTION_REVOKE_OR_ROTATE_SECRET,
+            "priority": 1,
+            "blocking": True,
+            "highest_severity": "critical",
+            "highest_confidence": "high",
+            "title": "placeholder",
+            "description": "placeholder",
+            "related_rule_ids": ["R001_GITHUB_TOKEN"],
+            "related_files": ["config.py"],
+            "total_related_files": 1,
+            "returned_related_files": 1,
+            "related_files_truncated": False,
+            "finding_count": 1,
+            "steps": ["placeholder"],
             "commands": [],
+            "safety_notes": ["placeholder"],
+            "verification_steps": ["placeholder"],
         }],
-        "verification_steps": [],
-        "agent_prompt": "",
+        "verification_steps": ["placeholder"],
+        "agent_prompt": _make_valid_agent_prompt(plan_status),
         "source_scan_updated_at": "2026-01-01T00:00:00Z",
         "source_assessment_updated_at": "2026-01-01T00:00:00Z",
         "source_assessment_policy_version": "p0-6-v1",
-        "created_at": now, "updated_at": now,
+        "created_at": now,
+        "updated_at": now,
     }
+
+    # Serialize to get a safe plan with all policy fields rebuilt
+    safe_plan = serialize_repair_plan(
+        task_id=task_id,
+        repair_plan=raw_plan,
+        source_scan_updated_at="2026-01-01T00:00:00Z",
+        source_assessment_updated_at="2026-01-01T00:00:00Z",
+        source_assessment_policy_version="p0-6-v1",
+        created_at=now,
+        updated_at=now,
+    )
+    repair_json_str = json.dumps(safe_plan, ensure_ascii=False, sort_keys=True)
+
     conn = _get_connection()
     try:
         conn.execute(
@@ -142,14 +197,16 @@ def _insert_repair_plan(task_id, plan_status="complete"):
                 created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (task_id, REPAIR_SCHEMA_VERSION, POLICY_VERSION, REPAIR_SCOPE,
-             json.dumps(plan), plan_status, 1, 1,
+             repair_json_str, plan_status,
+             safe_plan["summary"]["total_repair_groups"],
+             safe_plan["summary"]["blocking_repair_groups"],
              "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "p0-6-v1",
              now, now),
         )
         conn.commit()
     finally:
         conn.close()
-    return plan
+    return safe_plan
 
 
 def _set_task_status(task_id, status):

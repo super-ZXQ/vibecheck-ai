@@ -30,7 +30,10 @@ import pytest
 
 from app.db import database
 from app.db.database import _get_connection, init_db, reset_db, now_iso
-from app.services.repair_policy import POLICY_VERSION, REPAIR_SCHEMA_VERSION, REPAIR_SCOPE
+from app.services.repair_policy import (
+    POLICY_VERSION, REPAIR_SCHEMA_VERSION, REPAIR_SCOPE,
+    AGENT_PROMPT_REQUIREMENTS, PARTIAL_DECLARATION,
+)
 from app.services.repair_service import (
     save_repair_result, get_repair_result, get_repair_plan_available,
     serialize_repair_plan, generate_repair_plan,
@@ -58,6 +61,22 @@ def test_db(tmp_path, monkeypatch):
 # --- Helpers ---
 # ---------------------------------------------------------------------------
 
+def _make_valid_agent_prompt(plan_status="complete"):
+    """Build a minimal valid agent_prompt containing all 11 requirements."""
+    lines = [
+        "# VibeCheck 安全修复指引",
+        "",
+    ]
+    if plan_status == "partial":
+        lines.append(PARTIAL_DECLARATION)
+        lines.append("")
+    lines.append("## 安全要求")
+    lines.append("")
+    for req in AGENT_PROMPT_REQUIREMENTS:
+        lines.append(req)
+    return "\n".join(lines)
+
+
 def _make_repair_plan(task_id="test-task", plan_status="complete"):
     return {
         "schema_version": REPAIR_SCHEMA_VERSION,
@@ -77,7 +96,7 @@ def _make_repair_plan(task_id="test-task", plan_status="complete"):
                            "steps": ["step1"], "commands": [], "safety_notes": ["note"],
                            "verification_steps": ["verify1"]}],
         "verification_steps": ["step1"],
-        "agent_prompt": "test prompt",
+        "agent_prompt": _make_valid_agent_prompt(plan_status),
         "source_scan_updated_at": "2026-01-01T00:00:00Z",
         "source_assessment_updated_at": "2026-01-01T00:00:00Z",
         "source_assessment_policy_version": "p0-6-v1",
@@ -285,25 +304,27 @@ class TestRepairPersistence:
         # Part A: 恶意字符串存入 source_* 列与计划字符串字段。
         # 注意：列值来自 save_repair_result 参数，JSON 值来自 plan dict，
         # 两者都设为 malicious 以确保一致。
+        # source_assessment_policy_version 必须是受支持版本，
+        # 因此使用有效值而非恶意字符串。
         task_id = _make_task()
         plan = _make_repair_plan(task_id=task_id)
         plan["repair_groups"][0]["title"] = malicious
         plan["repair_groups"][0]["description"] = malicious
         plan["source_scan_updated_at"] = malicious
         plan["source_assessment_updated_at"] = malicious
-        plan["source_assessment_policy_version"] = malicious
+        # source_assessment_policy_version 保持有效值
         _save_minimal_plan(
             task_id, plan=plan,
             source_scan_updated_at=malicious,
             source_assessment_updated_at=malicious,
-            source_assessment_policy_version=malicious,
+            source_assessment_policy_version="p0-6-v1",
         )
 
         # 表仍然存在，值被正确存储
         row = _read_db_row(task_id)
         assert row is not None
         assert row["source_scan_updated_at"] == malicious
-        assert row["source_assessment_policy_version"] == malicious
+        assert row["source_assessment_policy_version"] == "p0-6-v1"
 
         retrieved = get_repair_result(task_id)
         assert retrieved["source_scan_updated_at"] == malicious
