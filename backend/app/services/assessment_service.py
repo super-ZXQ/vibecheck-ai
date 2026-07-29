@@ -203,10 +203,17 @@ def _safe_masked_desc(value: Any) -> str:
 
 _REDACTED_PATH = "<redacted-path>"
 
-# Dangerous path patterns (checked at start of string after masking).
-_POSIX_ABSOLUTE_RE = re.compile(r'^/(?:tmp|var/tmp|home|Users)(?:/|$)')
+# Any path starting with / is a POSIX absolute path — reject all of them,
+# not just /tmp, /var/tmp, /home, /Users.
+_POSIX_ABSOLUTE_RE = re.compile(r'^/')
+# Windows drive paths: C:\... or C:/...
 _WINDOWS_DRIVE_RE = re.compile(r'^[A-Za-z]:[/\\]')
+# UNC paths: \\server\share or //server/share
 _UNC_RE = re.compile(r'^(?:\\\\|//)')
+# Windows rooted paths without drive: \rooted\secret
+_WINDOWS_ROOTED_RE = re.compile(r'^\\')
+# User home paths: ~/... or ~\...
+_USER_HOME_RE = re.compile(r'^~[/\\]')
 
 
 def sanitize_assessment_file_path(value: str | None) -> str:
@@ -216,11 +223,13 @@ def sanitize_assessment_file_path(value: str | None) -> str:
     2. mask_untrusted_text for secret masking.
     3. Only allow repo-relative paths.
 
-    Detects and redacts:
-    - POSIX absolute paths: /tmp/..., /var/tmp/..., /home/..., /Users/...
+    Detects and redacts ALL non-repo-relative paths:
+    - Any POSIX absolute path: /etc/passwd, /root/.ssh, /opt/app, /tmp/...
     - Windows drive paths: C:\\..., C:/...
     - UNC paths: \\\\server\\share\\..., //server/share/...
-    - Path traversal: ../, ..\\, any path component equal to ..
+    - Windows rooted paths without drive: \\rooted\\secret
+    - User home paths: ~/..., ~\\...
+    - Path traversal: any component equal to ..
     - NUL character
 
     Returns "<redacted-path>" for dangerous paths.
@@ -245,6 +254,10 @@ def sanitize_assessment_file_path(value: str | None) -> str:
         return _REDACTED_PATH
     if _UNC_RE.match(s):
         return _REDACTED_PATH
+    if _WINDOWS_ROOTED_RE.match(s):
+        return _REDACTED_PATH
+    if _USER_HOME_RE.match(s):
+        return _REDACTED_PATH
 
     # Step 5: Check for path traversal (any component equals ..)
     # Normalize separators to / for consistent checking.
@@ -258,17 +271,20 @@ def sanitize_assessment_file_path(value: str | None) -> str:
 
 # --- Absolute path removal from text ---
 
-# Patterns for absolute paths embedded in text (descriptions, reasons).
-# Each pattern matches a path prefix followed by non-whitespace chars.
-# Stop at quotes and angle brackets to avoid over-matching in JSON-like text.
-_PATH_TEXT_PATTERNS: list[re.Pattern] = [
-    re.compile(r'/tmp/[^\s"\'<>]*'),
-    re.compile(r'/var/tmp/[^\s"\'<>]*'),
-    re.compile(r'/home/[^\s"\'<>]*'),
-    re.compile(r'/Users/[^\s"\'<>]*'),
-    re.compile(r'[A-Za-z]:[/\\][^\s"\'<>]*'),
-    re.compile(r'\\\\[^\s"\'<>]*'),  # UNC backslash: \\server\share...
-]
+# Single unified regex with longest-prefix-first alternation.
+# /var/tmp/ MUST come before /tmp/ to prevent partial matching
+# that leaves "/var" as a residual.
+# Stop at whitespace, quotes, and angle brackets to avoid over-matching.
+_PATH_TEXT_RE = re.compile(
+    r'/var/tmp/[^\s"\'<>]*'      # /var/tmp/... (longest prefix first)
+    r'|/tmp/[^\s"\'<>]*'          # /tmp/...
+    r'|/home/[^\s"\'<>]*'         # /home/...
+    r'|/Users/[^\s"\'<>]*'        # /Users/...
+    r'|/[A-Za-z][^\s"\'<>]*'      # Any other POSIX absolute: /etc/..., /root/..., /opt/...
+    r'|[A-Za-z]:[/\\][^\s"\'<>]*' # Windows drive: C:\..., C:/...
+    r'|\\\\[^\s"\'<>]*'           # UNC backslash: \\server\share...
+    r'|//[^\s"\'<>]*'             # UNC forward slash: //server/share...
+)
 
 
 def _clean_path_from_text(text: str) -> str:
@@ -277,14 +293,16 @@ def _clean_path_from_text(text: str) -> str:
     Replaces detected absolute paths with "<redacted-path>".
     Does not preserve basename, parent dir, or task ID.
 
+    Uses a single unified regex with longest-prefix-first alternation
+    so that /var/tmp/... is matched as a whole, not partially as
+    /tmp/... leaving /var as residue.
+
     Detects:
-    - /tmp/..., /var/tmp/..., /home/..., /Users/...
+    - /var/tmp/..., /tmp/..., /home/..., /Users/..., /etc/..., /root/..., etc.
     - Windows drive absolute paths: C:\\..., C:/...
-    - UNC paths: \\\\server\\share\\...
+    - UNC paths: \\\\server\\share\\..., //server/share\\...
     """
-    for pattern in _PATH_TEXT_PATTERNS:
-        text = pattern.sub(_REDACTED_PATH, text)
-    return text
+    return _PATH_TEXT_RE.sub(_REDACTED_PATH, text)
 
 
 # --- Per-field whitelist serializers ---
