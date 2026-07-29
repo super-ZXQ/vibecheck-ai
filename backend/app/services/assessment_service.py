@@ -636,29 +636,83 @@ _FINDING_SORT_FIELDS: tuple[str, ...] = (
 )
 
 
-def _normalize_sort_value(value: Any) -> Any:
-    """Normalize a finding sort field value for deterministic ordering.
+def _normalize_sort_str(value: Any) -> str:
+    """Normalize a finding sort field that must be a string.
 
-    Only allows expected JSON-public types:
-    - str, int, bool, None
+    Only ``str`` and ``None`` are accepted. ``None`` is normalized
+    to an empty string. int, bool, list, dict, and all other types
+    are rejected — their ``__str__``, ``__bool__``, ``__int__`` are
+    NEVER called.
 
-    Calls to __str__, __int__, __bool__ on unknown objects are NOT
-    performed. Unknown types raise AssessmentInternalError.
-
-    This prevents a malicious finding with a custom __str__ returning
-    a synthetic token from entering sort keys, logs, or the database.
+    Raises AssessmentInternalError for illegal types.
     """
     if value is None:
-        return None
+        return ""
     if type(value) is str:
         return value
+    raise AssessmentInternalError(
+        "Non-string finding sort field rejected"
+    )
+
+
+def _normalize_sort_int(value: Any) -> int:
+    """Normalize a finding sort field that must be an int.
+
+    Only ``int`` (strict, NOT bool) and ``None`` are accepted.
+    ``None`` is normalized to 0. bool (which is an int subclass) is
+    rejected because ``type(True) is bool``, not ``int``.
+
+    Raises AssessmentInternalError for illegal types.
+    """
+    if value is None:
+        return 0
     if type(value) is int:
         return value
+    raise AssessmentInternalError(
+        "Non-integer finding sort field rejected"
+    )
+
+
+def _normalize_sort_bool(value: Any) -> bool:
+    """Normalize a finding sort field that must be a bool.
+
+    Only ``bool`` (strict) and ``None`` are accepted. ``None`` is
+    normalized to ``False``. int 0/1 is rejected because it is not
+    a strict bool.
+
+    Raises AssessmentInternalError for illegal types.
+    """
+    if value is None:
+        return False
     if type(value) is bool:
         return value
     raise AssessmentInternalError(
-        "Unknown type in finding sort field rejected"
+        "Non-boolean finding sort field rejected"
     )
+
+
+# Field-specific normalizers: each sort field has a FIXED expected type.
+# This prevents heterogeneous types (e.g. str vs int) from ever being
+# compared, which would cause TypeError during sorting.
+_SORT_FIELD_NORMALIZERS: dict[str, Any] = {
+    "is_blocking": _normalize_sort_bool,
+    "severity": _normalize_sort_str,
+    "confidence": _normalize_sort_str,
+    "file_path": _normalize_sort_str,
+    "line_start": _normalize_sort_int,
+    "line_end": _normalize_sort_int,
+    "column_start": _normalize_sort_int,
+    "column_end": _normalize_sort_int,
+    "rule_id": _normalize_sort_str,
+    "rule_name": _normalize_sort_str,
+    "category": _normalize_sort_str,
+    "finding_type": _normalize_sort_str,
+    "secret_type": _normalize_sort_str,
+    "description": _normalize_sort_str,
+    "message": _normalize_sort_str,
+    "repair_template_key": _normalize_sort_str,
+    "snippet_masked": _normalize_sort_str,
+}
 
 
 def _finding_sort_key(f: dict[str, Any]) -> tuple:
@@ -693,42 +747,44 @@ def _finding_sort_key(f: dict[str, Any]) -> tuple:
     blocking_reasons truncation always selects the same subset.
 
     SECURITY: All sort field values are explicitly type-normalized
-    via _normalize_sort_value BEFORE any Python operator (``or``,
-    ``if``) can invoke ``__bool__``, ``__str__``, or ``__int__`` on
-    unknown objects. json.dumps is called WITHOUT default=str.
+    via FIELD-SPECIFIC normalizers (not a generic accept-all-types
+    function) BEFORE any Python operator can invoke ``__bool__``,
+    ``__str__``, or ``__int__`` on unknown objects. Each tuple
+    position always has a FIXED type, preventing TypeError from
+    heterogeneous comparisons. json.dumps is called WITHOUT default=str.
     """
-    # Step 1: Normalize ALL sort fields FIRST.
-    # This ensures __str__, __bool__, __int__ are NEVER called on
-    # unknown objects — _normalize_sort_value rejects them before
-    # any Python operator can invoke their dunder methods.
+    # Step 1: Normalize ALL sort fields FIRST using field-specific
+    # normalizers. This ensures each field has its expected type
+    # (str, int, or bool) and __str__/__bool__/__int__ are NEVER
+    # called on unknown objects.
     normalized: dict[str, Any] = {}
-    for k in _FINDING_SORT_FIELDS:
-        normalized[k] = _normalize_sort_value(f.get(k))
+    for field_name, normalizer in _SORT_FIELD_NORMALIZERS.items():
+        normalized[field_name] = normalizer(f.get(field_name))
 
     # Step 2: Build canonical JSON tiebreaker from normalized values.
     canonical = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
 
     # Step 3: Build tuple key using ONLY normalized values.
-    # ``or`` operators now operate only on already-validated types
-    # (str, int, bool, None) — never on unknown objects.
+    # All str positions are guaranteed str, all int positions are
+    # guaranteed int, and is_blocking is guaranteed bool.
     return (
-        0 if normalized.get("is_blocking") else 1,
-        _SEVERITY_ORDER.get(normalized.get("severity") or "", 99),
-        _CONFIDENCE_ORDER.get(normalized.get("confidence") or "", 99),
-        normalized.get("file_path") or "",
-        normalized.get("line_start") or 0,
-        normalized.get("line_end") or 0,
-        normalized.get("column_start") or 0,
-        normalized.get("column_end") or 0,
-        normalized.get("rule_id") or "",
-        normalized.get("rule_name") or "",
-        normalized.get("category") or "",
-        normalized.get("finding_type") or "",
-        normalized.get("secret_type") or "",
-        normalized.get("description") or "",
-        normalized.get("message") or "",
-        normalized.get("repair_template_key") or "",
-        normalized.get("snippet_masked") or "",
+        0 if normalized["is_blocking"] else 1,
+        _SEVERITY_ORDER.get(normalized["severity"], 99),
+        _CONFIDENCE_ORDER.get(normalized["confidence"], 99),
+        normalized["file_path"],
+        normalized["line_start"],
+        normalized["line_end"],
+        normalized["column_start"],
+        normalized["column_end"],
+        normalized["rule_id"],
+        normalized["rule_name"],
+        normalized["category"],
+        normalized["finding_type"],
+        normalized["secret_type"],
+        normalized["description"],
+        normalized["message"],
+        normalized["repair_template_key"],
+        normalized["snippet_masked"],
         canonical,
     )
 
@@ -742,15 +798,14 @@ def _group_findings_by_rule(
     The dict keys are NOT sorted here — the caller sorts the final
     score_breakdown by rule_id.
 
-    SECURITY: rule_id is normalized via _normalize_sort_value before
+    SECURITY: rule_id is normalized via _normalize_sort_str before
     being used as a dict key, so __str__, __bool__, __int__ are never
-    called on unknown objects during grouping.
+    called on unknown objects during grouping. Only str and None
+    are accepted; None becomes "". int, bool, list, dict are rejected.
     """
     groups: dict[str, list[dict[str, Any]]] = {}
     for f in findings:
-        rule_id = _normalize_sort_value(f.get("rule_id", ""))
-        if rule_id is None:
-            rule_id = ""
+        rule_id = _normalize_sort_str(f.get("rule_id", ""))
         if rule_id not in groups:
             groups[rule_id] = []
         groups[rule_id].append(f)
