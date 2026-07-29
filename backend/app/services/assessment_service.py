@@ -44,6 +44,7 @@ ASYNC:
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Optional
 
 from app.core.config import settings
@@ -114,6 +115,22 @@ class AssessmentPersistError(Exception):
     pass
 
 
+class AssessmentSerializationError(AssessmentInternalError):
+    """Raised when a value cannot be safely serialized for persistence.
+
+    This is a subclass of AssessmentInternalError so that callers
+    catching AssessmentInternalError will also catch this.
+
+    The exception message NEVER contains:
+    - The original value
+    - repr(value) or str(value)
+    - Type module paths
+    - Database information
+    - Temp absolute paths
+    """
+    pass
+
+
 # ---------------------------------------------------------------------------
 # --- Explicit serialization boundary ---
 # ---------------------------------------------------------------------------
@@ -125,22 +142,152 @@ class AssessmentPersistError(Exception):
 #    assessment_scope, and task_id (never trusts the input dict).
 # 3. Type validation for score, score_before_caps, and verdict.
 # 4. Per-field whitelist for all nested structures.
-# 5. Defensive desensitization via mask_untrusted_text on all string
+# 5. Strict string type enforcement — only str and None are accepted.
+#    Non-str/non-None values raise AssessmentSerializationError.
+# 6. Defensive desensitization via mask_untrusted_text on all string
 #    fields that could carry untrusted content.
-# 6. No vars(), __dict__, asdict, or recursive serialization of unknown
+# 7. Safe file path display via sanitize_assessment_file_path.
+# 8. Absolute path removal from description text via _clean_path_from_text.
+# 9. No vars(), __dict__, asdict, or recursive serialization of unknown
 #    objects — every field is explicitly constructed.
 
 
-def _safe_masked_str(value: Any) -> str:
-    """Convert a value to str and apply defensive desensitization.
+def _strict_str(value: Any) -> str:
+    """Convert a value to str with strict type checking.
 
-    mask_untrusted_text is idempotent: re-processing an already-masked
-    string produces the same output. None is converted to empty string.
+    Only str and None are accepted. None is converted to empty string.
+    Non-str and non-None values raise AssessmentSerializationError.
+
+    The exception message does NOT contain:
+    - The original value
+    - repr(value) or str(value)
+    - Type module paths
+    - Database information
+    - Temp paths
     """
     if value is None:
         return ""
-    return mask_untrusted_text(str(value))
+    if isinstance(value, str):
+        return value
+    raise AssessmentSerializationError(
+        "Non-string value rejected by strict serialization boundary"
+    )
 
+
+def _safe_masked_str(value: Any) -> str:
+    """Strict string conversion + defensive desensitization.
+
+    Only accepts str or None. Applies mask_untrusted_text after
+    strict type validation.
+
+    mask_untrusted_text is idempotent: re-processing an already-masked
+    string produces the same output.
+    """
+    return mask_untrusted_text(_strict_str(value))
+
+
+def _safe_masked_desc(value: Any) -> str:
+    """Strict string + mask_untrusted_text + absolute path removal.
+
+    For description and reason fields that may contain injected
+    absolute temp paths. After masking secrets, removes any remaining
+    absolute path patterns and replaces them with "<redacted-path>".
+    """
+    s = _strict_str(value)
+    s = mask_untrusted_text(s)
+    s = _clean_path_from_text(s)
+    return s
+
+
+# --- Safe file path display ---
+
+_REDACTED_PATH = "<redacted-path>"
+
+# Dangerous path patterns (checked at start of string after masking).
+_POSIX_ABSOLUTE_RE = re.compile(r'^/(?:tmp|var/tmp|home|Users)(?:/|$)')
+_WINDOWS_DRIVE_RE = re.compile(r'^[A-Za-z]:[/\\]')
+_UNC_RE = re.compile(r'^(?:\\\\|//)')
+
+
+def sanitize_assessment_file_path(value: str | None) -> str:
+    """Sanitize a file path for safe display.
+
+    1. Strict string type check (only str and None accepted).
+    2. mask_untrusted_text for secret masking.
+    3. Only allow repo-relative paths.
+
+    Detects and redacts:
+    - POSIX absolute paths: /tmp/..., /var/tmp/..., /home/..., /Users/...
+    - Windows drive paths: C:\\..., C:/...
+    - UNC paths: \\\\server\\share\\..., //server/share/...
+    - Path traversal: ../, ..\\, any path component equal to ..
+    - NUL character
+
+    Returns "<redacted-path>" for dangerous paths.
+    Does not preserve basename, parent directory, or task ID.
+
+    Idempotent: re-processing an already-redacted value is stable.
+    """
+    # Step 1: Strict string type check
+    s = _strict_str(value)
+
+    # Step 2: Mask secrets in the path
+    s = mask_untrusted_text(s)
+
+    # Step 3: Check for NUL character
+    if '\x00' in s:
+        return _REDACTED_PATH
+
+    # Step 4: Check for dangerous path forms
+    if _POSIX_ABSOLUTE_RE.match(s):
+        return _REDACTED_PATH
+    if _WINDOWS_DRIVE_RE.match(s):
+        return _REDACTED_PATH
+    if _UNC_RE.match(s):
+        return _REDACTED_PATH
+
+    # Step 5: Check for path traversal (any component equals ..)
+    # Normalize separators to / for consistent checking.
+    normalized = s.replace('\\', '/')
+    parts = normalized.split('/')
+    if '..' in parts:
+        return _REDACTED_PATH
+
+    return s
+
+
+# --- Absolute path removal from text ---
+
+# Patterns for absolute paths embedded in text (descriptions, reasons).
+# Each pattern matches a path prefix followed by non-whitespace chars.
+# Stop at quotes and angle brackets to avoid over-matching in JSON-like text.
+_PATH_TEXT_PATTERNS: list[re.Pattern] = [
+    re.compile(r'/tmp/[^\s"\'<>]*'),
+    re.compile(r'/var/tmp/[^\s"\'<>]*'),
+    re.compile(r'/home/[^\s"\'<>]*'),
+    re.compile(r'/Users/[^\s"\'<>]*'),
+    re.compile(r'[A-Za-z]:[/\\][^\s"\'<>]*'),
+    re.compile(r'\\\\[^\s"\'<>]*'),  # UNC backslash: \\server\share...
+]
+
+
+def _clean_path_from_text(text: str) -> str:
+    """Remove absolute temp paths from text.
+
+    Replaces detected absolute paths with "<redacted-path>".
+    Does not preserve basename, parent dir, or task ID.
+
+    Detects:
+    - /tmp/..., /var/tmp/..., /home/..., /Users/...
+    - Windows drive absolute paths: C:\\..., C:/...
+    - UNC paths: \\\\server\\share\\...
+    """
+    for pattern in _PATH_TEXT_PATTERNS:
+        text = pattern.sub(_REDACTED_PATH, text)
+    return text
+
+
+# --- Per-field whitelist serializers ---
 
 def _serialize_score_breakdown_entry(entry: dict[str, Any]) -> dict[str, Any]:
     """Whitelist and mask a single score_breakdown entry.
@@ -150,23 +297,38 @@ def _serialize_score_breakdown_entry(entry: dict[str, Any]) -> dict[str, Any]:
     - finding_count, deduction_before_rule_cap, rule_cap,
       applied_deduction (ints)
     - occurrence_deductions (list of ints)
-    - description (masked string)
+    - description (masked string with path cleaning)
     """
+    if not isinstance(entry, dict):
+        raise AssessmentSerializationError(
+            "score_breakdown entry must be a dict"
+        )
+
+    _occurrence_deductions = entry.get("occurrence_deductions", [])
+    if not isinstance(_occurrence_deductions, list):
+        raise AssessmentSerializationError(
+            "occurrence_deductions must be a list"
+        )
+    try:
+        occurrence_deductions = [int(d) for d in _occurrence_deductions]
+    except (TypeError, ValueError):
+        raise AssessmentSerializationError(
+            "occurrence_deductions contains non-integer value"
+        )
+
     return {
         "reason_code": _safe_masked_str(entry.get("reason_code")),
         "rule_id": _safe_masked_str(entry.get("rule_id")),
         "category": _safe_masked_str(entry.get("category")),
         "severity": _safe_masked_str(entry.get("severity")),
         "finding_count": int(entry.get("finding_count", 0)),
-        "occurrence_deductions": [
-            int(d) for d in entry.get("occurrence_deductions", [])
-        ],
+        "occurrence_deductions": occurrence_deductions,
         "deduction_before_rule_cap": int(
             entry.get("deduction_before_rule_cap", 0)
         ),
         "rule_cap": int(entry.get("rule_cap", 0)),
         "applied_deduction": int(entry.get("applied_deduction", 0)),
-        "description": _safe_masked_str(entry.get("description")),
+        "description": _safe_masked_desc(entry.get("description")),
     }
 
 
@@ -174,17 +336,21 @@ def _serialize_score_cap_entry(cap: dict[str, Any]) -> dict[str, Any]:
     """Whitelist and mask a single score_caps entry.
 
     Allowed fields:
-    - reason_code, description (masked strings)
+    - reason_code, description (masked strings with path cleaning)
     - cap_value, score_before_cap, score_after_cap (ints)
     - applied (bool)
     """
+    if not isinstance(cap, dict):
+        raise AssessmentSerializationError(
+            "score_caps entry must be a dict"
+        )
     return {
         "reason_code": _safe_masked_str(cap.get("reason_code")),
         "cap_value": int(cap.get("cap_value", 0)),
         "score_before_cap": int(cap.get("score_before_cap", 0)),
         "score_after_cap": int(cap.get("score_after_cap", 0)),
         "applied": bool(cap.get("applied", False)),
-        "description": _safe_masked_str(cap.get("description")),
+        "description": _safe_masked_desc(cap.get("description")),
     }
 
 
@@ -192,17 +358,20 @@ def _serialize_blocking_reason_entry(reason: dict[str, Any]) -> dict[str, Any]:
     """Whitelist and mask a single blocking_reasons entry.
 
     Allowed fields:
-    - rule_id, rule_name, severity, file_path, description (masked strings)
-
-    file_path uses mask_untrusted_text (the existing path desensitization
-    capability) which masks format-correct tokens embedded in paths.
+    - rule_id, rule_name, severity (masked strings)
+    - file_path (sanitized via sanitize_assessment_file_path)
+    - description (masked string with path cleaning)
     """
+    if not isinstance(reason, dict):
+        raise AssessmentSerializationError(
+            "blocking_reasons entry must be a dict"
+        )
     return {
         "rule_id": _safe_masked_str(reason.get("rule_id")),
         "rule_name": _safe_masked_str(reason.get("rule_name")),
         "severity": _safe_masked_str(reason.get("severity")),
-        "file_path": _safe_masked_str(reason.get("file_path")),
-        "description": _safe_masked_str(reason.get("description")),
+        "file_path": sanitize_assessment_file_path(reason.get("file_path")),
+        "description": _safe_masked_desc(reason.get("description")),
     }
 
 
@@ -211,17 +380,26 @@ def _serialize_coverage(coverage: dict[str, Any]) -> dict[str, Any]:
 
     Allowed fields:
     - status (string)
-    - reasons (list of masked strings)
+    - reasons (list of masked strings with path cleaning)
     - total_findings, scored_findings, total_blocking_findings,
       returned_blocking_reasons, total_scan_errors,
       total_files_scanned, total_skipped_files (ints)
     - findings_truncated, blocking_reasons_truncated (bools)
     """
+    if not isinstance(coverage, dict):
+        raise AssessmentSerializationError(
+            "coverage must be a dict"
+        )
+
+    _reasons = coverage.get("reasons", [])
+    if not isinstance(_reasons, list):
+        raise AssessmentSerializationError(
+            "coverage.reasons must be a list"
+        )
+
     return {
         "status": _safe_masked_str(coverage.get("status")),
-        "reasons": [
-            _safe_masked_str(r) for r in coverage.get("reasons", [])
-        ],
+        "reasons": [_safe_masked_desc(r) for r in _reasons],
         "total_findings": int(coverage.get("total_findings", 0)),
         "scored_findings": int(coverage.get("scored_findings", 0)),
         "findings_truncated": bool(coverage.get("findings_truncated", False)),
@@ -276,7 +454,43 @@ def serialize_assessment_result(
 
     Returns:
         A safe, explicitly-constructed dict with only whitelisted fields.
+
+    Raises:
+        AssessmentSerializationError: If any top-level or nested value
+            has an illegal type (e.g. assessment is not a dict,
+            score_breakdown is not a list, a list element is not a dict,
+            or a string field contains a non-str/non-None value).
     """
+    # --- Type validation for top-level structures ---
+    if not isinstance(assessment, dict):
+        raise AssessmentSerializationError(
+            "Assessment must be a dict"
+        )
+
+    _score_breakdown = assessment.get("score_breakdown", [])
+    if not isinstance(_score_breakdown, list):
+        raise AssessmentSerializationError(
+            "score_breakdown must be a list"
+        )
+
+    _score_caps = assessment.get("score_caps", [])
+    if not isinstance(_score_caps, list):
+        raise AssessmentSerializationError(
+            "score_caps must be a list"
+        )
+
+    _blocking_reasons = assessment.get("blocking_reasons", [])
+    if not isinstance(_blocking_reasons, list):
+        raise AssessmentSerializationError(
+            "blocking_reasons must be a list"
+        )
+
+    _coverage = assessment.get("coverage", {})
+    if not isinstance(_coverage, dict):
+        raise AssessmentSerializationError(
+            "coverage must be a dict"
+        )
+
     # --- Force canonical identity fields from policy ---
     # Never trust the input dict for these — they are policy constants.
     # --- Type-validate score ---
@@ -312,17 +526,17 @@ def serialize_assessment_result(
         "verdict": verdict,
         "score_breakdown": [
             _serialize_score_breakdown_entry(e)
-            for e in assessment.get("score_breakdown", [])
+            for e in _score_breakdown
         ],
         "score_caps": [
             _serialize_score_cap_entry(c)
-            for c in assessment.get("score_caps", [])
+            for c in _score_caps
         ],
         "blocking_reasons": [
             _serialize_blocking_reason_entry(r)
-            for r in assessment.get("blocking_reasons", [])
+            for r in _blocking_reasons
         ],
-        "coverage": _serialize_coverage(assessment.get("coverage", {})),
+        "coverage": _serialize_coverage(_coverage),
         "created_at": created_at,
         "updated_at": updated_at,
     }
@@ -927,7 +1141,10 @@ def save_assessment_result(
             ),
         )
         conn.commit()
-    except AssessmentResultTooLargeError:
+    except (AssessmentResultTooLargeError, AssessmentInternalError):
+        # Serialization errors (AssessmentSerializationError extends
+        # AssessmentInternalError) and size limit errors must NOT be
+        # wrapped as AssessmentPersistError — they are internal errors.
         raise
     except Exception as exc:
         # Wrap unexpected DB errors in AssessmentPersistError.
@@ -946,14 +1163,33 @@ def get_assessment_result(task_id: str) -> Optional[dict[str, Any]]:
     The returned dict has the same structure as the AssessmentResult
     produced by assess_scan_result().
 
+    Validates the parsed JSON to ensure identity consistency:
+    - schema_version == ASSESSMENT_SCHEMA_VERSION
+    - policy_version == POLICY_VERSION
+    - assessment_scope == ASSESSMENT_SCOPE
+    - task_id matches the requested task_id
+    - score is an int in [0, 100]
+    - verdict is one of pass, warning, blocked
+
     Args:
         task_id: The task ID to look up.
 
     Returns:
         The AssessmentResult dict, or None if not found.
+
+    Raises:
+        AssessmentInternalError: If the database read fails, JSON parsing
+            fails, the top-level is not a dict, or any identity/schema
+            validation fails. The exception message never contains the
+            raw JSON, database errors, str(exc), or repr(exc).
     """
     init_db()
-    conn = _get_connection()
+    try:
+        conn = _get_connection()
+    except Exception:
+        raise AssessmentInternalError(
+            "Failed to read assessment from database"
+        )
     try:
         row = conn.execute(
             "SELECT assessment_json FROM assessment_results WHERE task_id = ?",
@@ -961,9 +1197,45 @@ def get_assessment_result(task_id: str) -> Optional[dict[str, Any]]:
         ).fetchone()
         if row is None:
             return None
-        return json.loads(row["assessment_json"])
+        raw_json = row["assessment_json"]
+    except Exception:
+        raise AssessmentInternalError(
+            "Failed to read assessment from database"
+        )
     finally:
         conn.close()
+
+    # --- Parse JSON ---
+    try:
+        result = json.loads(raw_json)
+    except (json.JSONDecodeError, TypeError):
+        raise AssessmentInternalError("Failed to parse assessment JSON")
+
+    # --- Validate top-level structure ---
+    if not isinstance(result, dict):
+        raise AssessmentInternalError("Assessment JSON is not a dict")
+
+    # --- Validate identity fields ---
+    if result.get("schema_version") != ASSESSMENT_SCHEMA_VERSION:
+        raise AssessmentInternalError("Assessment schema_version mismatch")
+    if result.get("policy_version") != POLICY_VERSION:
+        raise AssessmentInternalError("Assessment policy_version mismatch")
+    if result.get("assessment_scope") != ASSESSMENT_SCOPE:
+        raise AssessmentInternalError("Assessment scope mismatch")
+    if result.get("task_id") != task_id:
+        raise AssessmentInternalError("Assessment task_id mismatch")
+
+    # --- Validate score ---
+    score = result.get("score")
+    if not isinstance(score, int) or score < 0 or score > 100:
+        raise AssessmentInternalError("Assessment score invalid")
+
+    # --- Validate verdict ---
+    verdict = result.get("verdict")
+    if verdict not in ("pass", "warning", "blocked"):
+        raise AssessmentInternalError("Assessment verdict invalid")
+
+    return result
 
 
 def get_assessment_score_verdict(

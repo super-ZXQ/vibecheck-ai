@@ -289,14 +289,18 @@ async def _process_task(task_id: str) -> None:
             return
         except Exception as e:
             # Catch-all for any unexpected error not covered above.
+            # This is an internal error, NOT a persistence error.
+            # SQLite save failures are already caught by
+            # AssessmentPersistError above. Other unknown exceptions
+            # belong to internal computation or orchestration.
             # Log only the exception type — never str(exc) or DB errors.
             logger.error(
                 "Assessment failed for task %s: %s",
                 task_id, type(e).__name__,
             )
             mark_failed(
-                task_id, ASSESSMENT_PERSIST_FAILED,
-                get_error_message(ASSESSMENT_PERSIST_FAILED),
+                task_id, ASSESSMENT_INTERNAL_ERROR,
+                get_error_message(ASSESSMENT_INTERNAL_ERROR),
             )
             return
 

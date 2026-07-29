@@ -35,7 +35,10 @@ from app.services.assessment_policy import (
     ASSESSMENT_SCOPE,
     POLICY_VERSION,
 )
-from app.services.assessment_service import get_assessment_result
+from app.services.assessment_service import (
+    get_assessment_result,
+    AssessmentInternalError,
+)
 from app.services.task_manager import (
     STATUS_COMPLETED,
     STATUS_FAILED,
@@ -150,7 +153,17 @@ async def get_assessment(task_id: str):
 
     # --- Case 4: completed → read assessment via asyncio.to_thread ---
     if task.status == STATUS_COMPLETED:
-        result = await asyncio.to_thread(get_assessment_result, task_id)
+        try:
+            result = await asyncio.to_thread(get_assessment_result, task_id)
+        except AssessmentInternalError:
+            # Corrupted or invalid assessment JSON — return fixed 500.
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "error_code": ASSESSMENT_INTERNAL_ERROR,
+                    "error_message": get_error_message(ASSESSMENT_INTERNAL_ERROR),
+                },
+            )
         if result is not None:
             return result
         # Assessment missing — legacy P0-5 task or data integrity issue.
