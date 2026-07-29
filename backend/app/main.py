@@ -15,6 +15,7 @@ from fastapi import FastAPI
 
 from app.api.check import router as check_router
 from app.api.assessment import router as assessment_router
+from app.api.repair import router as repair_router
 from app.db.database import init_db
 from app.services.task_manager import mark_stale_tasks_as_failed
 
@@ -29,6 +30,7 @@ app = FastAPI(
 # Include API routes
 app.include_router(check_router)
 app.include_router(assessment_router)
+app.include_router(repair_router)
 
 
 @app.on_event("startup")
