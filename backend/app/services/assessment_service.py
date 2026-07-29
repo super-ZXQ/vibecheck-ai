@@ -174,6 +174,52 @@ def _strict_str(value: Any) -> str:
     )
 
 
+def _strict_int(value: Any, minimum: int | None = None,
+                maximum: int | None = None) -> int:
+    """Validate that a value is a strict int (not bool, not str).
+
+    Uses type(value) is int — NOT isinstance — because bool is a
+    subclass of int in Python and must be rejected.
+
+    If minimum or maximum is provided, the value must be within
+    the inclusive range. Out-of-range values raise
+    AssessmentSerializationError — they are NOT clamped.
+
+    The exception message never contains the original value.
+    """
+    if type(value) is not int:
+        raise AssessmentSerializationError(
+            "Non-integer value rejected by strict serialization boundary"
+        )
+    if minimum is not None and value < minimum:
+        raise AssessmentSerializationError(
+            "Integer value below minimum rejected"
+        )
+    if maximum is not None and value > maximum:
+        raise AssessmentSerializationError(
+            "Integer value above maximum rejected"
+        )
+    return value
+
+
+def _strict_bool(value: Any) -> bool:
+    """Validate that a value is a strict bool.
+
+    Uses type(value) is bool — NOT isinstance — because int values
+    like 0 and 1 must NOT be silently converted to bool.
+
+    The exception message never contains the original value.
+    """
+    if type(value) is not bool:
+        raise AssessmentSerializationError(
+            "Non-boolean value rejected by strict serialization boundary"
+        )
+    return value
+
+
+_VALID_VERDICTS = ("pass", "warning", "blocked")
+
+
 def _safe_masked_str(value: Any) -> str:
     """Strict string conversion + defensive desensitization.
 
@@ -327,25 +373,22 @@ def _serialize_score_breakdown_entry(entry: dict[str, Any]) -> dict[str, Any]:
         raise AssessmentSerializationError(
             "occurrence_deductions must be a list"
         )
-    try:
-        occurrence_deductions = [int(d) for d in _occurrence_deductions]
-    except (TypeError, ValueError):
-        raise AssessmentSerializationError(
-            "occurrence_deductions contains non-integer value"
-        )
+    occurrence_deductions = [
+        _strict_int(d) for d in _occurrence_deductions
+    ]
 
     return {
         "reason_code": _safe_masked_str(entry.get("reason_code")),
         "rule_id": _safe_masked_str(entry.get("rule_id")),
         "category": _safe_masked_str(entry.get("category")),
         "severity": _safe_masked_str(entry.get("severity")),
-        "finding_count": int(entry.get("finding_count", 0)),
+        "finding_count": _strict_int(entry.get("finding_count", 0)),
         "occurrence_deductions": occurrence_deductions,
-        "deduction_before_rule_cap": int(
+        "deduction_before_rule_cap": _strict_int(
             entry.get("deduction_before_rule_cap", 0)
         ),
-        "rule_cap": int(entry.get("rule_cap", 0)),
-        "applied_deduction": int(entry.get("applied_deduction", 0)),
+        "rule_cap": _strict_int(entry.get("rule_cap", 0)),
+        "applied_deduction": _strict_int(entry.get("applied_deduction", 0)),
         "description": _safe_masked_desc(entry.get("description")),
     }
 
@@ -364,10 +407,10 @@ def _serialize_score_cap_entry(cap: dict[str, Any]) -> dict[str, Any]:
         )
     return {
         "reason_code": _safe_masked_str(cap.get("reason_code")),
-        "cap_value": int(cap.get("cap_value", 0)),
-        "score_before_cap": int(cap.get("score_before_cap", 0)),
-        "score_after_cap": int(cap.get("score_after_cap", 0)),
-        "applied": bool(cap.get("applied", False)),
+        "cap_value": _strict_int(cap.get("cap_value", 0)),
+        "score_before_cap": _strict_int(cap.get("score_before_cap", 0)),
+        "score_after_cap": _strict_int(cap.get("score_after_cap", 0)),
+        "applied": _strict_bool(cap.get("applied", False)),
         "description": _safe_masked_desc(cap.get("description")),
     }
 
@@ -418,21 +461,29 @@ def _serialize_coverage(coverage: dict[str, Any]) -> dict[str, Any]:
     return {
         "status": _safe_masked_str(coverage.get("status")),
         "reasons": [_safe_masked_desc(r) for r in _reasons],
-        "total_findings": int(coverage.get("total_findings", 0)),
-        "scored_findings": int(coverage.get("scored_findings", 0)),
-        "findings_truncated": bool(coverage.get("findings_truncated", False)),
-        "total_blocking_findings": int(
+        "total_findings": _strict_int(coverage.get("total_findings", 0)),
+        "scored_findings": _strict_int(coverage.get("scored_findings", 0)),
+        "findings_truncated": _strict_bool(
+            coverage.get("findings_truncated", False)
+        ),
+        "total_blocking_findings": _strict_int(
             coverage.get("total_blocking_findings", 0)
         ),
-        "returned_blocking_reasons": int(
+        "returned_blocking_reasons": _strict_int(
             coverage.get("returned_blocking_reasons", 0)
         ),
-        "blocking_reasons_truncated": bool(
+        "blocking_reasons_truncated": _strict_bool(
             coverage.get("blocking_reasons_truncated", False)
         ),
-        "total_scan_errors": int(coverage.get("total_scan_errors", 0)),
-        "total_files_scanned": int(coverage.get("total_files_scanned", 0)),
-        "total_skipped_files": int(coverage.get("total_skipped_files", 0)),
+        "total_scan_errors": _strict_int(
+            coverage.get("total_scan_errors", 0)
+        ),
+        "total_files_scanned": _strict_int(
+            coverage.get("total_files_scanned", 0)
+        ),
+        "total_skipped_files": _strict_int(
+            coverage.get("total_skipped_files", 0)
+        ),
     }
 
 
@@ -511,25 +562,20 @@ def serialize_assessment_result(
 
     # --- Force canonical identity fields from policy ---
     # Never trust the input dict for these — they are policy constants.
-    # --- Type-validate score ---
-    raw_score = assessment.get("score", 0)
-    try:
-        score = int(raw_score)
-    except (TypeError, ValueError):
-        score = 0
-    score = max(0, min(100, score))
+    # --- Strict type-validate score (no clamp, no silent conversion) ---
+    score = _strict_int(assessment.get("score", 0), minimum=0, maximum=100)
 
-    raw_score_before_caps = assessment.get("score_before_caps", 0)
-    try:
-        score_before_caps = int(raw_score_before_caps)
-    except (TypeError, ValueError):
-        score_before_caps = 0
-    score_before_caps = max(0, min(100, score_before_caps))
+    # --- Strict type-validate score_before_caps (no clamp) ---
+    score_before_caps = _strict_int(
+        assessment.get("score_before_caps", 0), minimum=0, maximum=100
+    )
 
-    # --- Validate verdict ---
-    verdict = assessment.get("verdict", "blocked")
-    if verdict not in ("pass", "warning", "blocked"):
-        verdict = "blocked"
+    # --- Validate verdict (reject invalid, do NOT default to blocked) ---
+    verdict = assessment.get("verdict")
+    if not isinstance(verdict, str) or verdict not in _VALID_VERDICTS:
+        raise AssessmentSerializationError(
+            "Invalid verdict rejected by strict serialization boundary"
+        )
 
     # --- Explicitly construct the safe dict ---
     # Every field is whitelisted and constructed by hand.
@@ -590,6 +636,31 @@ _FINDING_SORT_FIELDS: tuple[str, ...] = (
 )
 
 
+def _normalize_sort_value(value: Any) -> Any:
+    """Normalize a finding sort field value for deterministic ordering.
+
+    Only allows expected JSON-public types:
+    - str, int, bool, None
+
+    Calls to __str__, __int__, __bool__ on unknown objects are NOT
+    performed. Unknown types raise AssessmentInternalError.
+
+    This prevents a malicious finding with a custom __str__ returning
+    a synthetic token from entering sort keys, logs, or the database.
+    """
+    if value is None:
+        return None
+    if type(value) is str:
+        return value
+    if type(value) is int:
+        return value
+    if type(value) is bool:
+        return value
+    raise AssessmentInternalError(
+        "Unknown type in finding sort field rejected"
+    )
+
+
 def _finding_sort_key(f: dict[str, Any]) -> tuple:
     """Complete deterministic sort key for findings.
 
@@ -620,17 +691,20 @@ def _finding_sort_key(f: dict[str, Any]) -> tuple:
     This ensures the repeat multiplier (100/75/50/25) is applied in
     a consistent order regardless of input finding order, and that
     blocking_reasons truncation always selects the same subset.
+
+    SECURITY: All sort field values are explicitly type-normalized
+    via _normalize_sort_value before entering the canonical JSON
+    tiebreaker. json.dumps is called WITHOUT default=str so that
+    __str__ is never called on unknown objects.
     """
     severity = f.get("severity") or ""
     confidence = f.get("confidence") or ""
 
     # Build canonical JSON tiebreaker from known public fields only.
-    # json.dumps with sort_keys ensures field order in the JSON string
-    # is always the same regardless of dict insertion order.
-    # default=str converts any unexpected type to str for safety.
+    # Explicitly normalize each value — reject unknown objects.
     canonical = json.dumps(
-        {k: f.get(k) for k in _FINDING_SORT_FIELDS},
-        ensure_ascii=False, sort_keys=True, default=str,
+        {k: _normalize_sort_value(f.get(k)) for k in _FINDING_SORT_FIELDS},
+        ensure_ascii=False, sort_keys=True,
     )
 
     return (
@@ -1201,19 +1275,22 @@ def get_assessment_result(task_id: str) -> Optional[dict[str, Any]]:
             validation fails. The exception message never contains the
             raw JSON, database errors, str(exc), or repr(exc).
     """
-    init_db()
+    # --- Full database error boundary: init_db, connection, execute,
+    # fetchone, row field reading, and connection close are ALL inside
+    # the try block. Any database exception is caught and mapped to
+    # AssessmentInternalError with a fixed safe message.
+    conn = None
+    raw_json = None
     try:
+        init_db()
         conn = _get_connection()
-    except Exception:
-        raise AssessmentInternalError(
-            "Failed to read assessment from database"
-        )
-    try:
         row = conn.execute(
             "SELECT assessment_json FROM assessment_results WHERE task_id = ?",
             (task_id,),
         ).fetchone()
         if row is None:
+            # Close before returning — conn is guaranteed non-None here.
+            conn.close()
             return None
         raw_json = row["assessment_json"]
     except Exception:
@@ -1221,7 +1298,11 @@ def get_assessment_result(task_id: str) -> Optional[dict[str, Any]]:
             "Failed to read assessment from database"
         )
     finally:
-        conn.close()
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass  # Already raising or returning; ignore close error.
 
     # --- Parse JSON ---
     try:
@@ -1243,14 +1324,14 @@ def get_assessment_result(task_id: str) -> Optional[dict[str, Any]]:
     if result.get("task_id") != task_id:
         raise AssessmentInternalError("Assessment task_id mismatch")
 
-    # --- Validate score ---
+    # --- Validate score (strict type: bool is NOT accepted) ---
     score = result.get("score")
-    if not isinstance(score, int) or score < 0 or score > 100:
+    if type(score) is not int or score < 0 or score > 100:
         raise AssessmentInternalError("Assessment score invalid")
 
     # --- Validate verdict ---
     verdict = result.get("verdict")
-    if verdict not in ("pass", "warning", "blocked"):
+    if verdict not in _VALID_VERDICTS:
         raise AssessmentInternalError("Assessment verdict invalid")
 
     return result
