@@ -43,7 +43,8 @@ from app.core.config import settings
 from app.core.security.desensitize import mask_untrusted_text
 from app.db.database import _get_connection, init_db, now_iso
 from app.services.repair_policy import (
-    AGENT_PROMPT_FORBIDDEN,
+    AGENT_PROMPT_FORBIDDEN_FIELDS,
+    AGENT_PROMPT_FORBIDDEN_PATTERNS,
     AGENT_PROMPT_REQUIREMENTS,
     BLOCKING_ACTION_SEQUENCE,
     GLOBAL_SINGLETON_ACTIONS,
@@ -61,11 +62,14 @@ from app.services.repair_policy import (
     compute_group_sort_key,
     get_action,
     get_allowed_commands,
+    get_allowed_template_keys_for_rule,
     get_template_actions,
     is_command_allowed,
+    is_known_rule_id,
     is_known_template_key,
     is_supported_assessment_policy,
     is_valid_action_code,
+    RULE_ALLOWED_TEMPLATE_KEYS,
     ACTION_MANUAL_REVIEW_REQUIRED,
     ACTION_RERUN_SECURITY_SCAN,
     ACTION_RESOLVE_SCAN_ERROR,
@@ -176,16 +180,40 @@ _UNC_RE = re.compile(r'^(?:\\\\|//)')
 _WINDOWS_ROOTED_RE = re.compile(r'^\\')
 _USER_HOME_RE = re.compile(r'^~[/\\]')
 
+# Control characters that must NEVER appear in a file path:
+# - \x00 (NUL) through \x1f (C0 controls: \n, \r, \t, etc.)
+# - \x7f (DEL)
+# - \x80-\x9f (C1 controls)
+# - Unicode bidirectional/format controls (LRE, RLE, PDF, LRO, RLO, LRM, RLM,
+#   ZWSP, ZWJ, ZWNJ, WJ, BOM, etc.)
+_CONTROL_CHAR_RE = re.compile(
+    r'[\x00-\x1f\x7f\x80-\x9f'
+    r'\u200b-\u200f\u2028-\u202f\u2060-\u206f'
+    r'\ufeff]'
+)
+
 
 def _sanitize_file_path(value: Any) -> str:
     """Sanitize a file path for safe display.
 
-    Only allows repo-relative paths. Rejects absolute paths, UNC paths,
-    path traversal, and user home paths.
+    Only allows repo-relative paths. Rejects:
+    - Absolute paths (POSIX, Windows drive, UNC, rooted)
+    - Path traversal (..)
+    - User home paths (~)
+    - NUL bytes
+    - Control characters (\\n, \\r, \\t, C0/C1, Unicode bidirectional)
+    
+    Any control character causes the path to be replaced with
+    <redacted-path> to prevent prompt injection via newlines or
+    text direction manipulation.
     """
     s = _strict_str(value)
     s = mask_untrusted_text(s)
+    # Reject NUL bytes
     if '\x00' in s:
+        return _REDACTED_PATH
+    # Reject any control character (newline, tab, C0/C1, Unicode bidi, etc.)
+    if _CONTROL_CHAR_RE.search(s):
         return _REDACTED_PATH
     if _POSIX_ABSOLUTE_RE.match(s):
         return _REDACTED_PATH
@@ -489,35 +517,82 @@ def _extract_finding_fields(finding: dict) -> dict:
 
 def _expand_finding_actions(
     finding_fields: dict,
-) -> tuple[list[tuple[str, dict]], bool]:
+) -> tuple[list[tuple[str, dict]], bool, bool]:
     """Expand a finding into (action_code, finding_fields) pairs.
 
     For blocking findings: uses BLOCKING_ACTION_SEQUENCE (9 actions).
     For non-blocking findings: uses template mapping.
-    For unknown/missing template: returns empty list and sets
-    needs_manual_review = True.
+    
+    Rule and template validation:
+    - Unknown rule_id → needs_manual_review = True
+    - Missing/unknown template_key → needs_manual_review = True
+    - Known rule_id but template not in allowed set → needs_manual_review = True
+    - Blocking findings still get the full blocking sequence, but
+      unknown template/rule still sets needs_manual_review = True.
 
     Returns:
-        (pairs, needs_manual_review)
+        (pairs, needs_manual_review, rule_template_mismatch)
         pairs: list of (action_code, finding_fields) tuples
-        needs_manual_review: True if the template key was unknown/missing
+        needs_manual_review: True if template key was unknown/missing
+        rule_template_mismatch: True if rule_id is unknown or template
+            doesn't match the rule's allowed set
     """
     is_blocking = finding_fields["is_blocking"]
     template_key = finding_fields["repair_template_key"]
+    rule_id = finding_fields["rule_id"]
+
+    needs_manual_review = False
+    rule_template_mismatch = False
+
+    # --- Rule ID validation ---
+    if not rule_id or not is_known_rule_id(rule_id):
+        # Unknown rule_id
+        rule_template_mismatch = True
+        needs_manual_review = True
+
+    # --- Template key validation ---
+    if not template_key:
+        # Missing template key
+        needs_manual_review = True
+        rule_template_mismatch = True
+    elif not is_known_template_key(template_key):
+        # Unknown template key
+        needs_manual_review = True
+        rule_template_mismatch = True
+    elif rule_id and is_known_rule_id(rule_id):
+        # Known rule_id and known template — check if template is
+        # allowed for this rule.
+        allowed = get_allowed_template_keys_for_rule(rule_id)
+        if allowed is not None and template_key not in allowed:
+            # Template doesn't match rule's allowed set
+            rule_template_mismatch = True
+            needs_manual_review = True
 
     if is_blocking:
         # Blocking findings ALWAYS use the full blocking sequence,
         # regardless of repair_template_key.
+        # But unknown template/rule still flags needs_manual_review.
         actions = BLOCKING_ACTION_SEQUENCE
-        return [(ac, finding_fields) for ac in actions], False
+        return (
+            [(ac, finding_fields) for ac in actions],
+            needs_manual_review,
+            rule_template_mismatch,
+        )
 
-    # Non-blocking: use template mapping
+    # Non-blocking: use template mapping if known
+    if needs_manual_review and not template_key:
+        # No valid template — no regular actions
+        return [], needs_manual_review, rule_template_mismatch
+
     template_actions = get_template_actions(template_key)
     if template_actions is None:
-        # Unknown or missing template key
-        return [], True
+        return [], needs_manual_review, rule_template_mismatch
 
-    return [(ac, finding_fields) for ac in template_actions], False
+    return (
+        [(ac, finding_fields) for ac in template_actions],
+        needs_manual_review,
+        rule_template_mismatch,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -543,6 +618,13 @@ def _aggregate_groups(
         findings (list of finding_fields),
         related_files (set), related_rule_ids (set),
         highest_severity, highest_confidence
+
+    BLOCKING SEMANTICS:
+    - For regular groups: blocking = the finding's is_blocking value.
+    - For singleton groups: blocking = OR of all source findings'
+      is_blocking values. If any source finding is blocking,
+      the singleton is blocking.
+    - Synthetic coverage/manual/error findings have is_blocking=False.
     """
     regular_groups: dict[tuple, dict] = {}
     singleton_groups: dict[str, dict] = {}
@@ -551,13 +633,13 @@ def _aggregate_groups(
         if action_code in GLOBAL_SINGLETON_ACTIONS:
             # Global singleton: aggregate by action_code only
             if action_code not in singleton_groups:
-                action = get_action(action_code)
                 singleton_groups[action_code] = {
                     "action_code": action_code,
                     "repair_template_key": ff["repair_template_key"],
                     "rule_id": ff["rule_id"],
                     "secret_type": ff["secret_type"],
-                    "blocking": action.blocking,
+                    # Singleton blocking = finding's is_blocking
+                    "blocking": ff["is_blocking"],
                     "findings": [],
                     "related_files": set(),
                     "related_rule_ids": set(),
@@ -565,6 +647,10 @@ def _aggregate_groups(
                     "highest_confidence": "low",
                 }
             group = singleton_groups[action_code]
+            # Merge: blocking = OR of existing and new finding
+            group["blocking"] = (
+                group["blocking"] or ff["is_blocking"]
+            )
         else:
             # Regular: aggregate by full key
             agg_key = compute_aggregation_key(
@@ -575,7 +661,6 @@ def _aggregate_groups(
                 blocking=ff["is_blocking"],
             )
             if agg_key not in regular_groups:
-                action = get_action(action_code)
                 regular_groups[agg_key] = {
                     "action_code": action_code,
                     "repair_template_key": ff["repair_template_key"],
@@ -689,18 +774,31 @@ def _build_group_dict(
 # ---------------------------------------------------------------------------
 
 def _sort_and_assign_ids(
-    regular_groups: dict[tuple, dict],
-    singleton_groups: dict[str, dict],
+    mandatory_groups: list[dict],
+    optional_groups: list[dict],
     max_groups: int,
 ) -> tuple[list[dict], bool, bool]:
     """Sort all groups deterministically and assign group_ids.
 
+    Mandatory groups are ALWAYS preserved. Optional groups fill the
+    remaining space up to max_groups.
+
+    If mandatory groups alone exceed max_groups, raises
+    RepairPlanTooLargeError — mandatory safety actions must never
+    be silently dropped.
+
     Returns:
         (sorted_groups, groups_truncated, any_files_truncated)
+        groups_truncated: True only if optional groups were omitted
     """
-    all_group_data: list[dict] = []
-    all_group_data.extend(regular_groups.values())
-    all_group_data.extend(singleton_groups.values())
+    # Check if mandatory groups alone exceed the limit
+    if len(mandatory_groups) > max_groups:
+        raise RepairPlanTooLargeError(
+            "Mandatory repair groups exceed repair_max_groups"
+        )
+
+    # Combine mandatory + optional, sort deterministically
+    all_group_data = list(mandatory_groups) + list(optional_groups)
 
     # Compute sort key for each group
     def _sort_key(gd: dict) -> tuple:
@@ -723,7 +821,8 @@ def _sort_and_assign_ids(
 
     all_group_data.sort(key=_sort_key)
 
-    # Apply max_groups limit
+    # Apply max_groups limit — mandatory groups are guaranteed to fit
+    # because we checked above. Only optional groups can be truncated.
     groups_truncated = len(all_group_data) > max_groups
     if groups_truncated:
         all_group_data = all_group_data[:max_groups]
@@ -753,81 +852,100 @@ def _detect_partial_conditions(
     summary: dict,
     assessment: dict,
     findings: list,
-    groups_truncated: bool,
-    any_files_truncated: bool,
     has_unknown_template: bool,
+    has_blocking: bool,
 ) -> tuple[bool, list[str]]:
-    """Detect partial plan conditions and determine which extra groups to add.
+    """Detect partial plan conditions and determine which MANDATORY
+    action groups must be added.
+
+    This function is called BEFORE truncation, so it does NOT depend
+    on groups_truncated or any_files_truncated. Those conditions are
+    checked separately after truncation.
 
     Returns:
-        (is_partial, extra_action_codes)
-        is_partial: True if any partial condition is met
-        extra_action_codes: list of action codes to add as extra groups
-            (MANUAL_REVIEW_REQUIRED, REVIEW_SCAN_COVERAGE,
-             RESOLVE_SCAN_ERROR, RERUN_SECURITY_SCAN)
+        (is_partial, mandatory_action_codes)
+        is_partial: True if any pre-truncation partial condition is met
+        mandatory_action_codes: action codes that MUST be added as
+            mandatory groups (global singletons)
     """
     is_partial = False
-    extra_actions: list[str] = []
+    mandatory_actions: list[str] = []
 
-    # Condition: scan summary findings_truncated
+    # --- Blocking findings → VERIFY_NO_SECRET_REMAINS + RERUN_SECURITY_SCAN ---
+    if has_blocking:
+        if ACTION_VERIFY_NO_SECRET_REMAINS not in mandatory_actions:
+            mandatory_actions.append(ACTION_VERIFY_NO_SECRET_REMAINS)
+        if ACTION_RERUN_SECURITY_SCAN not in mandatory_actions:
+            mandatory_actions.append(ACTION_RERUN_SECURITY_SCAN)
+
+    # --- findings_truncated → REVIEW_SCAN_COVERAGE + RERUN_SECURITY_SCAN ---
     if summary.get("findings_truncated", False):
         is_partial = True
-        if ACTION_REVIEW_SCAN_COVERAGE not in extra_actions:
-            extra_actions.append(ACTION_REVIEW_SCAN_COVERAGE)
+        if ACTION_REVIEW_SCAN_COVERAGE not in mandatory_actions:
+            mandatory_actions.append(ACTION_REVIEW_SCAN_COVERAGE)
+        if ACTION_RERUN_SECURITY_SCAN not in mandatory_actions:
+            mandatory_actions.append(ACTION_RERUN_SECURITY_SCAN)
 
-    # Condition: scan summary total_scan_errors > 0
-    if summary.get("total_scan_errors", 0) > 0:
+    # --- scan errors → RESOLVE_SCAN_ERROR + RERUN_SECURITY_SCAN ---
+    total_scan_errors = summary.get("total_scan_errors", 0)
+    if isinstance(total_scan_errors, bool) or not isinstance(total_scan_errors, int):
+        total_scan_errors = 0
+    if total_scan_errors > 0:
         is_partial = True
-        if ACTION_RESOLVE_SCAN_ERROR not in extra_actions:
-            extra_actions.append(ACTION_RESOLVE_SCAN_ERROR)
+        if ACTION_RESOLVE_SCAN_ERROR not in mandatory_actions:
+            mandatory_actions.append(ACTION_RESOLVE_SCAN_ERROR)
+        if ACTION_RERUN_SECURITY_SCAN not in mandatory_actions:
+            mandatory_actions.append(ACTION_RERUN_SECURITY_SCAN)
 
-    # Condition: scan summary total_files_scanned == 0
-    if summary.get("total_files_scanned", 0) == 0:
+    # --- no files scanned → REVIEW_SCAN_COVERAGE + RERUN_SECURITY_SCAN ---
+    total_files = summary.get("total_files_scanned", 0)
+    if isinstance(total_files, bool) or not isinstance(total_files, int):
+        total_files = 0
+    if total_files == 0:
         is_partial = True
-        if ACTION_REVIEW_SCAN_COVERAGE not in extra_actions:
-            extra_actions.append(ACTION_REVIEW_SCAN_COVERAGE)
+        if ACTION_REVIEW_SCAN_COVERAGE not in mandatory_actions:
+            mandatory_actions.append(ACTION_REVIEW_SCAN_COVERAGE)
+        if ACTION_RERUN_SECURITY_SCAN not in mandatory_actions:
+            mandatory_actions.append(ACTION_RERUN_SECURITY_SCAN)
 
-    # Condition: assessment coverage.status == "partial"
+    # --- assessment coverage partial → REVIEW_SCAN_COVERAGE + RERUN ---
     coverage = assessment.get("coverage", {})
     if isinstance(coverage, dict) and coverage.get("status") == "partial":
         is_partial = True
-        if ACTION_REVIEW_SCAN_COVERAGE not in extra_actions:
-            extra_actions.append(ACTION_REVIEW_SCAN_COVERAGE)
+        if ACTION_REVIEW_SCAN_COVERAGE not in mandatory_actions:
+            mandatory_actions.append(ACTION_REVIEW_SCAN_COVERAGE)
+        if ACTION_RERUN_SECURITY_SCAN not in mandatory_actions:
+            mandatory_actions.append(ACTION_RERUN_SECURITY_SCAN)
 
-    # Condition: assessment findings_truncated
+    # --- assessment findings_truncated → REVIEW_SCAN_COVERAGE + RERUN ---
     if isinstance(coverage, dict) and coverage.get("findings_truncated", False):
         is_partial = True
-        if ACTION_REVIEW_SCAN_COVERAGE not in extra_actions:
-            extra_actions.append(ACTION_REVIEW_SCAN_COVERAGE)
+        if ACTION_REVIEW_SCAN_COVERAGE not in mandatory_actions:
+            mandatory_actions.append(ACTION_REVIEW_SCAN_COVERAGE)
+        if ACTION_RERUN_SECURITY_SCAN not in mandatory_actions:
+            mandatory_actions.append(ACTION_RERUN_SECURITY_SCAN)
 
-    # Condition: summary.blocking_findings > actual returned blocking count
+    # --- blocking_findings count > actual → REVIEW_SCAN_COVERAGE + RERUN ---
     total_blocking = summary.get("blocking_findings", 0)
+    if isinstance(total_blocking, bool) or not isinstance(total_blocking, int):
+        total_blocking = 0
     actual_blocking = sum(1 for f in findings if f.get("is_blocking", False))
     if total_blocking > actual_blocking:
         is_partial = True
-        if ACTION_REVIEW_SCAN_COVERAGE not in extra_actions:
-            extra_actions.append(ACTION_REVIEW_SCAN_COVERAGE)
+        if ACTION_REVIEW_SCAN_COVERAGE not in mandatory_actions:
+            mandatory_actions.append(ACTION_REVIEW_SCAN_COVERAGE)
+        if ACTION_RERUN_SECURITY_SCAN not in mandatory_actions:
+            mandatory_actions.append(ACTION_RERUN_SECURITY_SCAN)
 
-    # Condition: repair groups truncated
-    if groups_truncated:
-        is_partial = True
-
-    # Condition: related_files truncated
-    if any_files_truncated:
-        is_partial = True
-
-    # Condition: repair_template_key unknown or missing
+    # --- unknown/missing template or rule → MANUAL_REVIEW + RERUN ---
     if has_unknown_template:
         is_partial = True
-        if ACTION_MANUAL_REVIEW_REQUIRED not in extra_actions:
-            extra_actions.append(ACTION_MANUAL_REVIEW_REQUIRED)
+        if ACTION_MANUAL_REVIEW_REQUIRED not in mandatory_actions:
+            mandatory_actions.append(ACTION_MANUAL_REVIEW_REQUIRED)
+        if ACTION_RERUN_SECURITY_SCAN not in mandatory_actions:
+            mandatory_actions.append(ACTION_RERUN_SECURITY_SCAN)
 
-    # Always add RERUN_SECURITY_SCAN for partial plans
-    if is_partial:
-        if ACTION_RERUN_SECURITY_SCAN not in extra_actions:
-            extra_actions.append(ACTION_RERUN_SECURITY_SCAN)
-
-    return is_partial, extra_actions
+    return is_partial, mandatory_actions
 
 
 # ---------------------------------------------------------------------------
@@ -841,66 +959,105 @@ def _generate_agent_prompt(
 ) -> str:
     """Generate a deterministic agent prompt from repair groups.
 
+    The prompt is split into:
+    1. Fixed safety header (always complete)
+    2. Partial declaration (if partial, always complete)
+    3. 11 fixed safety requirements (always complete)
+    4. Variable repair action summary (can be truncated)
+
+    If max_chars is too small for the fixed content, raises
+    RepairPlanTooLargeError — never returns a prompt missing
+    safety requirements.
+
     The prompt contains ONLY:
     - rule_id, secret_type, repair_template_key (with limits)
-    - relative file_path
+    - relative file_path (sanitized, single-line)
     - Finding count
     - Repair action summary
 
     It does NOT contain: repo_url, owner, repo_name, snippet,
     snippet_masked, raw secrets, database paths, or temp paths.
     """
-    if not repair_groups:
-        # Empty prompt for empty plans
-        if plan_status == "partial":
-            return PARTIAL_DECLARATION
-        return ""
-
-    lines: list[str] = []
-    lines.append("# VibeCheck 安全修复指引")
-    lines.append("")
+    # --- Build fixed content (always complete) ---
+    fixed_lines: list[str] = []
+    fixed_lines.append("# VibeCheck 安全修复指引")
+    fixed_lines.append("")
 
     if plan_status == "partial":
-        lines.append(PARTIAL_DECLARATION)
-        lines.append("")
+        fixed_lines.append(PARTIAL_DECLARATION)
+        fixed_lines.append("")
 
-    lines.append("## 修复动作摘要")
-    lines.append("")
+    fixed_lines.append("## 安全要求")
+    fixed_lines.append("")
+    for req in AGENT_PROMPT_REQUIREMENTS:
+        fixed_lines.append(req)
+
+    fixed_content = "\n".join(fixed_lines)
+
+    # Check if fixed content alone exceeds max_chars
+    if len(fixed_content) > max_chars:
+        raise RepairPlanTooLargeError(
+            "Agent prompt fixed content exceeds max_chars"
+        )
+
+    if not repair_groups:
+        # Empty prompt — just fixed content
+        return fixed_content
+
+    # --- Build variable content (action summary, can be truncated) ---
+    # Build line by line, checking size after each complete line/group.
+    variable_header = "\n\n## 修复动作摘要\n\n"
+    remaining_chars = max_chars - len(fixed_content) - len(variable_header)
+    if remaining_chars <= 0:
+        # No room for any variable content — return fixed + header
+        return fixed_content + variable_header.rstrip()
+
+    variable_lines: list[str] = []
+    current_len = 0
 
     for group in repair_groups:
         action_code = group.get("action_code", "")
         title = group.get("title", "")
         finding_count = group.get("finding_count", 0)
         rule_ids = group.get("related_rule_ids", [])
-        secret_type = group.get("secret_type", "") if "secret_type" in group else ""
         related_files = group.get("related_files", [])
 
-        # Action summary line — only safe fields
+        # Build action summary line — only safe fields
         line_parts = [f"- [{action_code}] {title}"]
         if finding_count > 0:
             line_parts.append(f"({finding_count}个发现)")
         if rule_ids:
-            # Limit rule_ids to avoid unbounded prompt
             rule_str = ", ".join(rule_ids[:10])
             line_parts.append(f"规则: {rule_str}")
-        lines.append(" ".join(line_parts))
+        action_line = " ".join(line_parts)
 
-        # Related files (relative paths only, limited count)
+        # Check if this line fits (including newline)
+        line_with_nl = action_line + "\n"
+        if current_len + len(line_with_nl) > remaining_chars:
+            break  # Stop adding — don't cut mid-line
+        variable_lines.append(action_line)
+        current_len += len(line_with_nl)
+
+        # Add related files line if present
         if related_files:
-            files_str = ", ".join(related_files[:10])
-            lines.append(f"  相关文件: {files_str}")
+            # Sanitize each file path and escape backticks
+            safe_files = []
+            for fp in related_files[:10]:
+                # Escape backticks to prevent Markdown injection
+                safe_fp = fp.replace("`", "\\`")
+                safe_files.append(safe_fp)
+            files_line = f"  相关文件: {' '.join(f'`{sf}`' for sf in safe_files)}"
+            files_with_nl = files_line + "\n"
+            if current_len + len(files_with_nl) > remaining_chars:
+                break  # Stop adding — don't cut mid-line
+            variable_lines.append(files_line)
+            current_len += len(files_with_nl)
 
-    lines.append("")
-    lines.append("## 安全要求")
-    lines.append("")
-    for req in AGENT_PROMPT_REQUIREMENTS:
-        lines.append(req)
-
-    prompt = "\n".join(lines)
-
-    # Truncate to max_chars
-    if len(prompt) > max_chars:
-        prompt = prompt[:max_chars]
+    # Assemble final prompt
+    if variable_lines:
+        prompt = fixed_content + variable_header + "\n".join(variable_lines)
+    else:
+        prompt = fixed_content
 
     return prompt
 
@@ -990,95 +1147,71 @@ def generate_repair_plan(
     has_unknown_template = False
     for raw_f in raw_findings:
         ff = _extract_finding_fields(raw_f)
+        # Sanitize file_path early — before aggregation and prompt
+        ff["file_path"] = _sanitize_file_path(ff["file_path"])
         findings.append(ff)
-        # Check for unknown template (only for non-blocking)
-        if not ff["is_blocking"]:
-            tk = ff["repair_template_key"]
-            if tk and not is_known_template_key(tk):
-                has_unknown_template = True
-            elif not tk:
-                # Missing template key
-                has_unknown_template = True
+
+    # Check for blocking findings
+    has_blocking = any(f["is_blocking"] for f in findings)
 
     # 4. Expand findings into (action_code, finding_fields) pairs
+    #    Also validates rule_id and template_key mappings
     all_pairs: list[tuple[str, dict]] = []
     for ff in findings:
-        pairs, needs_manual = _expand_finding_actions(ff)
+        pairs, needs_manual, _mismatch = _expand_finding_actions(ff)
         all_pairs.extend(pairs)
         if needs_manual:
             has_unknown_template = True
 
-    # 5. Add MANUAL_REVIEW_REQUIRED pair if unknown template
-    if has_unknown_template:
-        # Create a synthetic finding for manual review
-        manual_finding = {
-            "rule_id": "",
-            "secret_type": "",
-            "repair_template_key": "",
-            "is_blocking": False,
-            "severity": "info",
-            "confidence": "low",
-            "file_path": "",
-        }
-        all_pairs.append((ACTION_MANUAL_REVIEW_REQUIRED, manual_finding))
+    # 5. Detect partial conditions BEFORE any truncation
+    is_partial, mandatory_action_codes = _detect_partial_conditions(
+        summary, assessment, findings,
+        has_unknown_template, has_blocking,
+    )
 
-    # 6. Aggregate into groups
+    # 6. Add mandatory synthetic findings for partial conditions
+    for ac in mandatory_action_codes:
+        # Check if this action is already present from findings
+        already_present = any(
+            ac == pair[0] for pair in all_pairs
+        )
+        if not already_present:
+            synthetic_finding = {
+                "rule_id": "",
+                "secret_type": "",
+                "repair_template_key": "",
+                "is_blocking": False,
+                "severity": "info",
+                "confidence": "low",
+                "file_path": "",
+            }
+            all_pairs.append((ac, synthetic_finding))
+
+    # 7. Aggregate into groups
     regular_groups, singleton_groups = _aggregate_groups(all_pairs)
 
-    # 7. Sort and assign group IDs
+    # 8. Split into mandatory and optional groups
+    #    Mandatory = global singleton actions (safety-critical)
+    #    Optional = regular finding-based groups
+    mandatory_group_data: list[dict] = list(singleton_groups.values())
+    optional_group_data: list[dict] = list(regular_groups.values())
+
+    # 9. Sort and assign group IDs (single pass, mandatory preserved)
     max_groups = max(1, int(settings.repair_max_groups))
     sorted_groups, groups_truncated, any_files_truncated = (
-        _sort_and_assign_ids(regular_groups, singleton_groups, max_groups)
+        _sort_and_assign_ids(
+            mandatory_group_data, optional_group_data, max_groups,
+        )
     )
 
-    # 8. Detect partial conditions
-    is_partial, extra_actions = _detect_partial_conditions(
-        summary, assessment, findings,
-        groups_truncated, any_files_truncated, has_unknown_template,
-    )
+    # 10. Post-truncation partial conditions
+    if groups_truncated or any_files_truncated:
+        is_partial = True
 
-    # 9. Add extra action groups for partial conditions
-    if extra_actions:
-        extra_pairs = []
-        for ac in extra_actions:
-            # Only add if not already present
-            already_present = any(
-                g["action_code"] == ac for g in sorted_groups
-            )
-            if not already_present:
-                synthetic_finding = {
-                    "rule_id": "",
-                    "secret_type": "",
-                    "repair_template_key": "",
-                    "is_blocking": False,
-                    "severity": "info",
-                    "confidence": "low",
-                    "file_path": "",
-                }
-                extra_pairs.append((ac, synthetic_finding))
-
-        if extra_pairs:
-            extra_regular, extra_singleton = _aggregate_groups(extra_pairs)
-            # Merge extra groups into existing singleton_groups
-            for ac, gd in extra_singleton.items():
-                if ac not in singleton_groups:
-                    singleton_groups[ac] = gd
-            # Re-sort with the new groups
-            sorted_groups, groups_truncated, any_files_truncated = (
-                _sort_and_assign_ids(
-                    {**regular_groups, **extra_regular},
-                    singleton_groups,
-                    max_groups,
-                )
-            )
-            # Re-check partial (groups_truncated may have changed)
-            if groups_truncated or any_files_truncated:
-                is_partial = True
-
-    # 10. Determine plan_status
+    # 11. Determine plan_status
     plan_status = "partial" if is_partial else "complete"
 
-    # 11. Build summary
+    # 12. Build summary (recalculated from final sorted_groups)
     blocking_repair_groups = sum(1 for g in sorted_groups if g["blocking"])
     manual_review_required = any(
         g["action_code"] == ACTION_MANUAL_REVIEW_REQUIRED
@@ -1094,19 +1227,18 @@ def generate_repair_plan(
         "groups_truncated": groups_truncated,
     }
 
-    # 12. Generate verification steps
-    has_blocking = any(f["is_blocking"] for f in findings)
+    # 13. Generate verification steps
     verification_steps = _generate_verification_steps(
         plan_status, has_blocking
     )
 
-    # 13. Generate agent prompt
+    # 14. Generate agent prompt
     max_prompt_chars = max(1, int(settings.repair_max_agent_prompt_chars))
     agent_prompt = _generate_agent_prompt(
         sorted_groups, plan_status, max_prompt_chars
     )
 
-    # 14. Assemble RepairPlan
+    # 15. Assemble RepairPlan
     return {
         "schema_version": REPAIR_SCHEMA_VERSION,
         "policy_version": POLICY_VERSION,
@@ -1132,8 +1264,16 @@ def generate_repair_plan(
 def _serialize_repair_group(group: dict) -> dict:
     """Whitelist and mask a single repair group.
 
-    Only allows the fixed set of fields. All string fields are
-    defensively desensitized via mask_untrusted_text.
+    Rebuilds ALL policy fields from the frozen RepairAction definition.
+    Does NOT trust the input for:
+    - priority, title, description, steps, commands, safety_notes,
+      verification_steps
+    
+    These are ALWAYS rebuilt from get_action(action_code).
+    
+    Only group_id, blocking, severity, confidence, related_rule_ids,
+    related_files, and count fields are validated from input.
+    
     File paths are sanitized via _sanitize_file_path.
     """
     if not isinstance(group, dict):
@@ -1141,20 +1281,19 @@ def _serialize_repair_group(group: dict) -> dict:
             "Repair group must be a dict"
         )
 
-    _steps = group.get("steps", [])
-    if not isinstance(_steps, list):
-        raise RepairPlanSerializationError("steps must be a list")
-    _commands = group.get("commands", [])
-    if not isinstance(_commands, list):
-        raise RepairPlanSerializationError("commands must be a list")
-    _safety_notes = group.get("safety_notes", [])
-    if not isinstance(_safety_notes, list):
-        raise RepairPlanSerializationError("safety_notes must be a list")
-    _verification_steps = group.get("verification_steps", [])
-    if not isinstance(_verification_steps, list):
+    # --- Validate action_code and rebuild policy fields ---
+    action_code = _safe_masked_str(group.get("action_code"))
+    if not is_valid_action_code(action_code):
         raise RepairPlanSerializationError(
-            "group verification_steps must be a list"
+            "Invalid action_code rejected by serialization boundary"
         )
+    
+    # Rebuild from frozen policy — never trust input
+    action = get_action(action_code)
+    
+    # commands MUST come from the fixed allowlist only
+    safe_commands = list(get_allowed_commands(action_code))
+
     _related_rule_ids = group.get("related_rule_ids", [])
     if not isinstance(_related_rule_ids, list):
         raise RepairPlanSerializationError(
@@ -1166,52 +1305,76 @@ def _serialize_repair_group(group: dict) -> dict:
             "related_files must be a list"
         )
 
+    # Validate count consistency
+    total_related = _strict_int(
+        group.get("total_related_files", 0), minimum=0
+    )
+    returned_related = len(_related_files)
+    files_truncated = _strict_bool(
+        group.get("related_files_truncated", False)
+    )
+    
+    if returned_related != _strict_int(
+        group.get("returned_related_files", 0), minimum=0
+    ):
+        raise RepairPlanSerializationError(
+            "returned_related_files does not match len(related_files)"
+        )
+    if files_truncated != (total_related > returned_related):
+        raise RepairPlanSerializationError(
+            "related_files_truncated inconsistent with counts"
+        )
+
     return {
         "group_id": _safe_masked_str(group.get("group_id")),
-        "action_code": _safe_masked_str(group.get("action_code")),
-        "priority": _strict_int(group.get("priority", 0)),
+        "action_code": action_code,
+        "priority": action.priority,
         "blocking": _strict_bool(group.get("blocking", False)),
         "highest_severity": _safe_masked_str(group.get("highest_severity")),
         "highest_confidence": _safe_masked_str(group.get("highest_confidence")),
-        "title": _safe_masked_str(group.get("title")),
-        "description": _safe_masked_desc(group.get("description")),
+        # Rebuilt from frozen policy:
+        "title": action.title,
+        "description": _safe_masked_desc(action.description),
         "related_rule_ids": [_safe_masked_str(r) for r in _related_rule_ids],
         "related_files": [_sanitize_file_path(f) for f in _related_files],
-        "total_related_files": _strict_int(
-            group.get("total_related_files", 0), minimum=0
-        ),
-        "returned_related_files": _strict_int(
-            group.get("returned_related_files", 0), minimum=0
-        ),
-        "related_files_truncated": _strict_bool(
-            group.get("related_files_truncated", False)
-        ),
+        "total_related_files": total_related,
+        "returned_related_files": returned_related,
+        "related_files_truncated": files_truncated,
         "finding_count": _strict_int(
             group.get("finding_count", 0), minimum=0
         ),
-        "steps": [_safe_masked_desc(s) for s in _steps],
-        "commands": [_safe_masked_str(c) for c in _commands],
-        "safety_notes": [_safe_masked_desc(s) for s in _safety_notes],
+        # Rebuilt from frozen policy:
+        "steps": [_safe_masked_desc(s) for s in action.steps],
+        "commands": [_safe_masked_str(c) for c in safe_commands],
+        "safety_notes": [_safe_masked_desc(s) for s in action.safety_notes],
         "verification_steps": [
-            _safe_masked_desc(s) for s in _verification_steps
+            _safe_masked_desc(s) for s in action.verification_steps
         ],
     }
 
 
-def _serialize_summary(summary: dict) -> dict:
-    """Whitelist and mask the summary structure."""
+def _serialize_summary(summary: dict, repair_groups: list[dict]) -> dict:
+    """Whitelist and mask the summary structure.
+    
+    Recalculates total_repair_groups, blocking_repair_groups, and
+    manual_review_required from the final safe repair_groups list.
+    Does NOT trust the input summary for these computed fields.
+    """
     if not isinstance(summary, dict):
         raise RepairPlanSerializationError("summary must be a dict")
+    
+    # Recalculate from final safe groups
+    total = len(repair_groups)
+    blocking = sum(1 for g in repair_groups if g.get("blocking") is True)
+    manual = any(
+        g.get("action_code") == ACTION_MANUAL_REVIEW_REQUIRED
+        for g in repair_groups
+    )
+    
     return {
-        "total_repair_groups": _strict_int(
-            summary.get("total_repair_groups", 0), minimum=0
-        ),
-        "blocking_repair_groups": _strict_int(
-            summary.get("blocking_repair_groups", 0), minimum=0
-        ),
-        "manual_review_required": _strict_bool(
-            summary.get("manual_review_required", False)
-        ),
+        "total_repair_groups": total,
+        "blocking_repair_groups": blocking,
+        "manual_review_required": manual,
         "coverage_warning": _strict_bool(
             summary.get("coverage_warning", False)
         ),
@@ -1224,6 +1387,9 @@ def _serialize_summary(summary: dict) -> dict:
 def serialize_repair_plan(
     task_id: str,
     repair_plan: dict,
+    source_scan_updated_at: str,
+    source_assessment_updated_at: str,
+    source_assessment_policy_version: str,
     created_at: Optional[str],
     updated_at: str,
 ) -> dict:
@@ -1232,6 +1398,10 @@ def serialize_repair_plan(
     Constructs the safe dict that gets persisted as repair_json.
     Forces identity fields from policy constants. Enforces strict
     field whitelists and defensive desensitization.
+    
+    Source version chain fields are taken from AUTHORITATIVE parameters,
+    NOT from the repair_plan dict. This ensures JSON and database
+    columns always match.
     """
     if not isinstance(repair_plan, dict):
         raise RepairPlanSerializationError("Repair plan must be a dict")
@@ -1255,28 +1425,30 @@ def serialize_repair_plan(
             "Invalid plan_status rejected by strict serialization boundary"
         )
 
+    # Serialize groups first (rebuilt from policy)
+    safe_groups = [_serialize_repair_group(g) for g in _groups]
+
     return {
         "schema_version": REPAIR_SCHEMA_VERSION,
         "policy_version": POLICY_VERSION,
         "repair_scope": REPAIR_SCOPE,
         "task_id": task_id,
         "plan_status": plan_status,
-        "summary": _serialize_summary(repair_plan.get("summary", {})),
-        "repair_groups": [
-            _serialize_repair_group(g) for g in _groups
-        ],
+        "summary": _serialize_summary(
+            repair_plan.get("summary", {}), safe_groups
+        ),
+        "repair_groups": safe_groups,
         "verification_steps": [
             _safe_masked_desc(s) for s in _verification_steps
         ],
         "agent_prompt": _safe_masked_desc(repair_plan.get("agent_prompt")),
-        "source_scan_updated_at": _safe_masked_str(
-            repair_plan.get("source_scan_updated_at")
-        ),
+        # Source fields from AUTHORITATIVE parameters only
+        "source_scan_updated_at": _safe_masked_str(source_scan_updated_at),
         "source_assessment_updated_at": _safe_masked_str(
-            repair_plan.get("source_assessment_updated_at")
+            source_assessment_updated_at
         ),
         "source_assessment_policy_version": _safe_masked_str(
-            repair_plan.get("source_assessment_policy_version")
+            source_assessment_policy_version
         ),
         "created_at": created_at,
         "updated_at": updated_at,
@@ -1338,10 +1510,13 @@ def save_repair_result(
         else:
             created_at = now
 
-        # Explicit serialization
+        # Explicit serialization — source fields from authoritative params
         safe_plan = serialize_repair_plan(
             task_id=task_id,
             repair_plan=repair_plan,
+            source_scan_updated_at=source_scan_updated_at,
+            source_assessment_updated_at=source_assessment_updated_at,
+            source_assessment_policy_version=source_assessment_policy_version,
             created_at=created_at,
             updated_at=now,
         )
@@ -1431,29 +1606,48 @@ def get_repair_result(task_id: str) -> Optional[dict]:
 
     Returns None if no repair plan has been persisted.
 
-    Validates the parsed JSON to ensure identity consistency:
-    - schema_version == REPAIR_SCHEMA_VERSION
-    - policy_version == POLICY_VERSION
-    - repair_scope == REPAIR_SCOPE
-    - task_id matches the requested task_id
+    Validates the parsed JSON against:
+    - Identity fields (schema_version, policy_version, repair_scope, task_id)
+    - plan_status (must be complete/partial)
+    - Summary structure and types
+    - repair_groups is a list with valid structure
+    - commands all come from the allowlist
+    - JSON source fields match database columns
+    - JSON plan_status matches database column
+    - JSON group counts match database redundant columns
+    - JSON timestamps match database columns
 
     Raises:
-        RepairPlanInternalError: If the database read fails, JSON parsing
-            fails, or identity validation fails.
+        RepairPlanInternalError: If any validation fails.
     """
     conn = None
-    raw_json = None
     _db_error = False
     try:
         init_db()
         conn = _get_connection()
         row = conn.execute(
-            "SELECT repair_json FROM repair_results WHERE task_id = ?",
+            "SELECT repair_json, plan_status, total_repair_groups, "
+            "blocking_repair_groups, source_scan_updated_at, "
+            "source_assessment_updated_at, "
+            "source_assessment_policy_version, "
+            "created_at, updated_at "
+            "FROM repair_results WHERE task_id = ?",
             (task_id,),
         ).fetchone()
         if row is None:
             return None
         raw_json = row["repair_json"]
+        db_plan_status = row["plan_status"]
+        db_total_groups = row["total_repair_groups"]
+        db_blocking_groups = row["blocking_repair_groups"]
+        db_source_scan = row["source_scan_updated_at"]
+        db_source_assessment = row["source_assessment_updated_at"]
+        db_source_policy = row["source_assessment_policy_version"]
+        db_created_at = row["created_at"]
+        db_updated_at = row["updated_at"]
+    except RepairPlanInternalError:
+        _db_error = True
+        raise
     except Exception:
         _db_error = True
         raise RepairPlanInternalError(
@@ -1478,7 +1672,7 @@ def get_repair_result(task_id: str) -> Optional[dict]:
     if not isinstance(result, dict):
         raise RepairPlanInternalError("Repair plan JSON is not a dict")
 
-    # Validate identity fields
+    # --- Identity validation ---
     if result.get("schema_version") != REPAIR_SCHEMA_VERSION:
         raise RepairPlanInternalError("Repair plan schema_version mismatch")
     if result.get("policy_version") != POLICY_VERSION:
@@ -1487,6 +1681,74 @@ def get_repair_result(task_id: str) -> Optional[dict]:
         raise RepairPlanInternalError("Repair plan scope mismatch")
     if result.get("task_id") != task_id:
         raise RepairPlanInternalError("Repair plan task_id mismatch")
+
+    # --- plan_status validation ---
+    json_plan_status = result.get("plan_status")
+    if json_plan_status not in ("complete", "partial"):
+        raise RepairPlanInternalError("Invalid plan_status in repair JSON")
+    if json_plan_status != db_plan_status:
+        raise RepairPlanInternalError("plan_status JSON/DB mismatch")
+
+    # --- Summary validation ---
+    json_summary = result.get("summary", {})
+    if not isinstance(json_summary, dict):
+        raise RepairPlanInternalError("summary is not a dict")
+
+    # --- repair_groups validation ---
+    json_groups = result.get("repair_groups", [])
+    if not isinstance(json_groups, list):
+        raise RepairPlanInternalError("repair_groups is not a list")
+
+    # Validate each group has valid structure and commands
+    for g in json_groups:
+        if not isinstance(g, dict):
+            raise RepairPlanInternalError("repair_group is not a dict")
+        ac = g.get("action_code", "")
+        if not isinstance(ac, str) or not is_valid_action_code(ac):
+            raise RepairPlanInternalError("Invalid action_code in repair JSON")
+        cmds = g.get("commands", [])
+        if not isinstance(cmds, list):
+            raise RepairPlanInternalError("commands is not a list")
+        for cmd in cmds:
+            if not isinstance(cmd, str) or not is_command_allowed(cmd):
+                raise RepairPlanInternalError(
+                    "Disallowed command in repair JSON"
+                )
+
+    # --- Count consistency ---
+    json_total = json_summary.get("total_repair_groups", 0)
+    if not isinstance(json_total, int) or json_total != len(json_groups):
+        raise RepairPlanInternalError("total_repair_groups mismatch")
+    if json_total != db_total_groups:
+        raise RepairPlanInternalError("total_repair_groups JSON/DB mismatch")
+
+    json_blocking = json_summary.get("blocking_repair_groups", 0)
+    if not isinstance(json_blocking, int):
+        raise RepairPlanInternalError("blocking_repair_groups not int")
+    if json_blocking != db_blocking_groups:
+        raise RepairPlanInternalError(
+            "blocking_repair_groups JSON/DB mismatch"
+        )
+
+    # --- Source field consistency ---
+    if result.get("source_scan_updated_at") != db_source_scan:
+        raise RepairPlanInternalError(
+            "source_scan_updated_at JSON/DB mismatch"
+        )
+    if result.get("source_assessment_updated_at") != db_source_assessment:
+        raise RepairPlanInternalError(
+            "source_assessment_updated_at JSON/DB mismatch"
+        )
+    if result.get("source_assessment_policy_version") != db_source_policy:
+        raise RepairPlanInternalError(
+            "source_assessment_policy_version JSON/DB mismatch"
+        )
+
+    # --- Timestamp consistency ---
+    if result.get("created_at") != db_created_at:
+        raise RepairPlanInternalError("created_at JSON/DB mismatch")
+    if result.get("updated_at") != db_updated_at:
+        raise RepairPlanInternalError("updated_at JSON/DB mismatch")
 
     return result
 

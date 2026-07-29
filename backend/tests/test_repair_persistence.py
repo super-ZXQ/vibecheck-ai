@@ -307,7 +307,13 @@ class TestRepairPersistence:
 
         retrieved = get_repair_result(task_id)
         assert retrieved["source_scan_updated_at"] == malicious
-        assert retrieved["repair_groups"][0]["title"] == malicious
+
+        # title 和 description 现在从冻结策略重建（不信任输入），
+        # 因此 SQL 注入文本不会出现在序列化输出中。
+        assert retrieved["repair_groups"][0]["title"] != malicious
+        assert retrieved["repair_groups"][0]["description"] != malicious
+        assert malicious not in retrieved["repair_groups"][0]["title"]
+        assert malicious not in retrieved["repair_groups"][0]["description"]
 
         # Part B: 恶意 task_id 本身
         _create_task_raw(malicious)
@@ -367,6 +373,10 @@ class TestRepairPersistence:
             "src/relative/path.py",          # 相对路径（应保留）
             "../escape/attempt.py",         # 路径穿越（应脱敏）
         ]
+        # 保持 count 字段与 related_files 列表一致（6 个文件，全部返回，未截断）
+        plan["repair_groups"][0]["total_related_files"] = 6
+        plan["repair_groups"][0]["returned_related_files"] = 6
+        plan["repair_groups"][0]["related_files_truncated"] = False
 
         _save_minimal_plan(task_id, plan=plan)
 
@@ -443,7 +453,9 @@ class TestRepairPersistence:
         task_id = _make_task()
         plan = _make_repair_plan(task_id=task_id)
         safe = serialize_repair_plan(
-            task_id, plan, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"
+            task_id, plan,
+            "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "p0-6-v1",
+            None, "2026-01-01T00:00:00Z",
         )
         safe[field] = value
         _insert_raw_repair_row(task_id, json.dumps(safe, ensure_ascii=False))
@@ -469,17 +481,23 @@ class TestRepairPersistence:
         """serialize_repair_plan 应拒绝非 dict 的修复计划。"""
         with pytest.raises(RepairPlanSerializationError):
             serialize_repair_plan(
-                "task-1", "not-a-dict", None, "2026-01-01T00:00:00Z"
+                "task-1", "not-a-dict",
+                "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "p0-6-v1",
+                None, "2026-01-01T00:00:00Z",
             )
 
         with pytest.raises(RepairPlanSerializationError):
             serialize_repair_plan(
-                "task-1", ["list", "not", "dict"], None, "2026-01-01T00:00:00Z"
+                "task-1", ["list", "not", "dict"],
+                "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "p0-6-v1",
+                None, "2026-01-01T00:00:00Z",
             )
 
         with pytest.raises(RepairPlanSerializationError):
             serialize_repair_plan(
-                "task-1", None, None, "2026-01-01T00:00:00Z"
+                "task-1", None,
+                "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "p0-6-v1",
+                None, "2026-01-01T00:00:00Z",
             )
 
     # --- 18. Serialize boundary rejects invalid plan_status ---
@@ -489,14 +507,18 @@ class TestRepairPersistence:
         plan["plan_status"] = "invalid"
         with pytest.raises(RepairPlanSerializationError):
             serialize_repair_plan(
-                "task-1", plan, None, "2026-01-01T00:00:00Z"
+                "task-1", plan,
+                "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "p0-6-v1",
+                None, "2026-01-01T00:00:00Z",
             )
 
         plan2 = _make_repair_plan(task_id="task-1")
         plan2["plan_status"] = 123  # 非 str
         with pytest.raises(RepairPlanSerializationError):
             serialize_repair_plan(
-                "task-1", plan2, None, "2026-01-01T00:00:00Z"
+                "task-1", plan2,
+                "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "p0-6-v1",
+                None, "2026-01-01T00:00:00Z",
             )
 
     # --- 19. Serialize boundary rejects non-list repair_groups ---
@@ -506,14 +528,18 @@ class TestRepairPersistence:
         plan["repair_groups"] = "not-a-list"
         with pytest.raises(RepairPlanSerializationError):
             serialize_repair_plan(
-                "task-1", plan, None, "2026-01-01T00:00:00Z"
+                "task-1", plan,
+                "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "p0-6-v1",
+                None, "2026-01-01T00:00:00Z",
             )
 
         plan2 = _make_repair_plan(task_id="task-1")
         plan2["repair_groups"] = {"not": "a-list"}
         with pytest.raises(RepairPlanSerializationError):
             serialize_repair_plan(
-                "task-1", plan2, None, "2026-01-01T00:00:00Z"
+                "task-1", plan2,
+                "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "p0-6-v1",
+                None, "2026-01-01T00:00:00Z",
             )
 
         # 非列表的 verification_steps 也应被拒绝
@@ -521,7 +547,9 @@ class TestRepairPersistence:
         plan3["verification_steps"] = "not-a-list"
         with pytest.raises(RepairPlanSerializationError):
             serialize_repair_plan(
-                "task-1", plan3, None, "2026-01-01T00:00:00Z"
+                "task-1", plan3,
+                "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "p0-6-v1",
+                None, "2026-01-01T00:00:00Z",
             )
 
     # --- 20. Serialize boundary masks string fields via mask_untrusted_text ---
@@ -543,7 +571,9 @@ class TestRepairPersistence:
         plan["agent_prompt"] = f"secret is {token} here"
 
         safe = serialize_repair_plan(
-            "task-1", plan, None, "2026-01-01T00:00:00Z"
+            "task-1", plan,
+            "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "p0-6-v1",
+            None, "2026-01-01T00:00:00Z",
         )
         serialized = json.dumps(safe, ensure_ascii=False)
 
@@ -552,11 +582,16 @@ class TestRepairPersistence:
         assert aws_key not in serialized
         assert "sup3rS3cr3tPass" not in serialized
 
-        # 显式格式 token 被脱敏为 first4...last4 形式
-        assert safe["repair_groups"][0]["title"] == "ghp_...aaaa"
+        # title 和 description 现在从冻结策略重建，不信任输入中的注入值。
+        # 注入的 token 不应出现在重建的字段中。
+        assert token not in safe["repair_groups"][0]["title"]
+        assert token not in safe["repair_groups"][0]["description"]
+        assert aws_key not in safe["repair_groups"][0]["description"]
+        assert "sup3rS3cr3tPass" not in safe["repair_groups"][0]["description"]
 
-        # 连接字符串密码被替换为 ***
-        assert ":***@" in safe["repair_groups"][0]["description"]
+        # related_files 中的 token 被脱敏
+        for fp in safe["repair_groups"][0]["related_files"]:
+            assert token not in fp
 
         # agent_prompt 中的 token 也被脱敏
         assert token not in safe["agent_prompt"]

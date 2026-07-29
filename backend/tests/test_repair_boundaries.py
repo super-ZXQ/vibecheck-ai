@@ -60,10 +60,12 @@ from app.services.repair_policy import *
 from app.services.repair_service import (
     generate_repair_plan, serialize_repair_plan,
     RepairPlanInternalError, RepairPlanSerializationError,
+    RepairPlanTooLargeError,
 )
 from app.services.repair_policy import (
     ACTION_CODES, _COMMAND_ALLOWLIST, get_allowed_commands,
-    is_command_allowed, AGENT_PROMPT_FORBIDDEN,
+    is_command_allowed, AGENT_PROMPT_FORBIDDEN_FIELDS,
+    AGENT_PROMPT_FORBIDDEN_PATTERNS,
 )
 
 
@@ -166,6 +168,9 @@ def _serialize_plan(plan, task_id="test-task"):
     return serialize_repair_plan(
         task_id=task_id,
         repair_plan=plan,
+        source_scan_updated_at="2026-01-01T00:00:00Z",
+        source_assessment_updated_at="2026-01-01T00:00:00Z",
+        source_assessment_policy_version="p0-6-v1",
         created_at=None,
         updated_at="2026-01-01T00:00:00Z",
     )
@@ -771,11 +776,19 @@ class TestConfigLimits:
     # --- I37: Config zero defense via max(1, int(value)) ---
 
     def test_config_zero_defense(self, monkeypatch):
-        """运行时将配置设为 0 时, max(1, int(0)) = 1 防御生效。"""
+        """运行时将配置设为 0 时, max(1, int(0)) = 1 防御生效。
+
+        当 repair_max_groups 被钳制为 1 且存在 mandatory groups（blocking
+        finding 产生的 VERIFY_NO_SECRET_REMAINS + RERUN_SECURITY_SCAN）时，
+        mandatory groups 数量超过 max_groups，正确抛出 RepairPlanTooLargeError
+        而非静默丢弃安全动作。
+        """
         monkeypatch.setattr("app.core.config.settings.repair_max_groups", 0)
         monkeypatch.setattr("app.core.config.settings.repair_max_related_files_per_group", 0)
         monkeypatch.setattr("app.core.config.settings.repair_max_agent_prompt_chars", 0)
         monkeypatch.setattr("app.core.config.settings.repair_max_json_bytes", 0)
-        plan = _generate_plan([_make_finding()])
-        # Should not crash — max(1, int(0)) = 1
-        assert plan["plan_status"] in ("complete", "partial")
+        # _make_finding() 默认 is_blocking=True，会产生 mandatory singleton
+        # groups (VERIFY_NO_SECRET_REMAINS + RERUN_SECURITY_SCAN = 2 个)。
+        # max_groups 被钳制为 1，2 > 1 -> RepairPlanTooLargeError
+        with pytest.raises(RepairPlanTooLargeError):
+            _generate_plan([_make_finding()])

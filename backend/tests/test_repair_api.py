@@ -103,6 +103,10 @@ def _insert_repair_plan(task_id, plan_status="complete"):
 
     绕过 save_repair_result 的序列化边界，用于快速设置测试前置条件。
     返回插入的 plan dict。
+
+    注意: repair_groups 必须与 summary 中的 total_repair_groups /
+    blocking_repair_groups 计数保持一致，因为 get_repair_result 会校验
+    JSON 内部计数与 DB 冗余列之间的一致性。
     """
     from app.db.database import _get_connection, now_iso
     now = now_iso()
@@ -115,7 +119,11 @@ def _insert_repair_plan(task_id, plan_status="complete"):
         "summary": {"total_repair_groups": 1, "blocking_repair_groups": 1,
                      "manual_review_required": False, "coverage_warning": False,
                      "groups_truncated": False},
-        "repair_groups": [],
+        "repair_groups": [{
+            "group_id": "RG001",
+            "action_code": "REVOKE_OR_ROTATE_SECRET",
+            "commands": [],
+        }],
         "verification_steps": [],
         "agent_prompt": "",
         "source_scan_updated_at": "2026-01-01T00:00:00Z",

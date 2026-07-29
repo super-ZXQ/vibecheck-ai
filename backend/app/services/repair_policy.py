@@ -640,7 +640,7 @@ def is_known_template_key(key: str) -> bool:
 # --- Rule ID to template key mapping (R001-R011) ---
 # ---------------------------------------------------------------------------
 
-# Maps rule_id prefix to the expected repair_template_key.
+# Maps rule_id to the expected repair_template_key (single template).
 # This is used for testing that all R001-R011 rules have explicit mappings.
 # Rule R010 (ENV_EXAMPLE_FILE) produces notices, not findings, so it
 # has no repair_template_key — but it is listed here for completeness.
@@ -657,6 +657,43 @@ RULE_TEMPLATE_MAP: MappingProxyType = MappingProxyType({
     "R010_ENV_EXAMPLE_FILE": "",
     "R011_PRODUCTION_ENV_WITH_SECRET": "use_env_var_production",
 })
+
+# Immutable mapping: rule_id → frozenset of ALLOWED repair_template_keys.
+# Used at RUNTIME by the repair engine to validate each Finding.
+# If a Finding's repair_template_key is not in the allowed set for its
+# rule_id, the plan is set to partial and MANUAL_REVIEW_REQUIRED is added.
+# R010 should never produce a Finding; if one appears, it requires manual review.
+RULE_ALLOWED_TEMPLATE_KEYS: MappingProxyType = MappingProxyType({
+    "R001_GITHUB_TOKEN": frozenset({"rotate_github_token"}),
+    "R002_AWS_ACCESS_KEY": frozenset({"rotate_aws_credentials"}),
+    "R003_AWS_SECRET_KEY": frozenset({"rotate_aws_credentials"}),
+    "R004_GOOGLE_API_KEY": frozenset({"rotate_google_api_key"}),
+    "R005_PRIVATE_KEY": frozenset({"rotate_private_key"}),
+    "R006_PASSWORD_ASSIGNMENT": frozenset({"use_env_var_password"}),
+    "R007_GENERIC_TOKEN_ASSIGNMENT": frozenset({
+        "use_env_var_secret",
+        "rotate_aws_credentials",
+    }),
+    "R008_CONNECTION_STRING": frozenset({"use_env_var_connection_string"}),
+    "R009_ENV_FILE_PRESENT": frozenset({"secure_env_file"}),
+    "R010_ENV_EXAMPLE_FILE": frozenset(),  # No valid template — manual review
+    "R011_PRODUCTION_ENV_WITH_SECRET": frozenset({"use_env_var_production"}),
+})
+
+
+def get_allowed_template_keys_for_rule(rule_id: str) -> frozenset[str] | None:
+    """Get the set of allowed repair_template_keys for a rule_id.
+
+    Returns None if the rule_id is unknown (no policy mapping).
+    Returns an empty frozenset if the rule is known but should never
+    produce a Finding (e.g. R010).
+    """
+    return RULE_ALLOWED_TEMPLATE_KEYS.get(rule_id)
+
+
+def is_known_rule_id(rule_id: str) -> bool:
+    """Check if a rule_id has a policy mapping."""
+    return rule_id in RULE_ALLOWED_TEMPLATE_KEYS
 
 
 # ---------------------------------------------------------------------------
@@ -767,16 +804,32 @@ AGENT_PROMPT_REQUIREMENTS: tuple[str, ...] = (
     "11. 修改后重新运行VibeCheck。",
 )
 
-# Agent prompt forbidden patterns — must NOT appear in the prompt.
-AGENT_PROMPT_FORBIDDEN: tuple[str, ...] = (
+# Agent prompt forbidden patterns — untrusted field VALUES that must NOT
+# appear in the final agent_prompt. These target injectable content from
+# scan results, NOT the fixed safety reminder text (which legitimately
+# contains words like "原始secret" as a safety warning).
+# Each entry is compiled to a regex for robust matching.
+AGENT_PROMPT_FORBIDDEN_FIELDS: tuple[str, ...] = (
     "repo_url",
     "owner",
     "repo_name",
     "snippet",
     "snippet_masked",
-    "原始secret",
     "数据库路径",
     "临时路径",
+    "临时绝对路径",
+)
+
+# Patterns that indicate untrusted content has leaked into the prompt.
+# These are regex patterns checked against the VARIABLE portion of the
+# prompt (action summary), NOT the fixed safety requirements.
+AGENT_PROMPT_FORBIDDEN_PATTERNS: tuple[str, ...] = (
+    r'https?://[^\s"\'<>]+',          # URLs (repo_url, etc.)
+    r'gh[pousr]_[A-Za-z0-9]{36}',     # GitHub token patterns
+    r'AKIA[0-9A-Z]{16}',              # AWS access key patterns
+    r'[A-Za-z]:[/\\][^\s"\'<>]+',     # Windows absolute paths
+    r'/(?:var|tmp|home|Users)/[^\s"\'<>]+',  # POSIX absolute paths
+    r'\\x[0-9a-fA-F]{2}',            # Escape sequences
 )
 
 
