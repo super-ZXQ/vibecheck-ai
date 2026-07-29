@@ -64,6 +64,16 @@ class Settings(BaseSettings):
     scan_max_persisted_skipped_files_per_task: int = Field(default=2000, ge=1)
     scan_max_persisted_scan_errors_per_task: int = Field(default=500, ge=1)
     scan_max_result_json_bytes: int = Field(default=8 * 1024 * 1024, ge=1)
+
+    # --- Assessment limits (P0-6) ---
+    # Technical size limits for assessment results. These are NOT policy
+    # values — they do not affect scoring. They prevent unbounded
+    # assessment_json from consuming database space.
+    # assessment_max_blocking_reasons: max items in blocking_reasons list.
+    # assessment_max_json_bytes: max serialized assessment_json size.
+    assessment_max_blocking_reasons: int = Field(default=100, ge=1)
+    assessment_max_json_bytes: int = Field(default=2 * 1024 * 1024, ge=1)
+
     scan_binary_extensions: list[str] = [
         ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp",
         ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar",

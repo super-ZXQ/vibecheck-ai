@@ -10,9 +10,14 @@ Design:
 - Masked snippets must never contain original secrets.
 
 Tables:
-- tasks:       Task lifecycle records (P0-3).
-- scan_results: Persisted scan result snapshots (P0-5). One row per task_id.
-               result_json contains only desensitized public models from P0-4.
+- tasks:              Task lifecycle records (P0-3).
+- scan_results:       Persisted scan result snapshots (P0-5). One row per task_id.
+                      result_json contains only desensitized public models from P0-4.
+- assessment_results: Persisted security assessment snapshots (P0-6). One row
+                      per task_id. assessment_json contains only deterministic
+                      scoring output computed from the already-desensitized
+                      scan_results. score and verdict are redundant columns for
+                      lightweight polling queries. Never contains raw secrets.
 """
 
 import sqlite3
@@ -127,6 +132,33 @@ def init_db() -> None:
                 conn.execute(
                     "ALTER TABLE scan_results ADD COLUMN summary_json TEXT"
                 )
+            # --- assessment_results: one persisted assessment per task (P0-6) ---
+            # assessment_json contains ONLY deterministic scoring output computed
+            # from the already-desensitized scan_results. No raw secrets, no
+            # temp paths, no internal exception objects.
+            # score and verdict are redundant columns so polling queries can
+            # read two lightweight values instead of parsing assessment_json.
+            # source_scan_updated_at tracks which scan_results version this
+            # assessment was computed from.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS assessment_results (
+                    task_id TEXT PRIMARY KEY,
+                    schema_version INTEGER NOT NULL,
+                    policy_version TEXT NOT NULL,
+                    assessment_scope TEXT NOT NULL,
+                    assessment_json TEXT NOT NULL,
+                    score INTEGER NOT NULL,
+                    verdict TEXT NOT NULL,
+                    source_scan_updated_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (task_id) REFERENCES tasks(id)
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_assessment_verdict
+                ON assessment_results(verdict)
+            """)
             conn.commit()
             _initialized = True
         finally:
@@ -139,7 +171,8 @@ def reset_db() -> None:
     with _init_lock:
         conn = _get_connection()
         try:
-            # Drop scan_results first (FK references tasks)
+            # Drop assessment_results and scan_results first (FK references tasks)
+            conn.execute("DROP TABLE IF EXISTS assessment_results")
             conn.execute("DROP TABLE IF EXISTS scan_results")
             conn.execute("DROP TABLE IF EXISTS tasks")
             conn.commit()
