@@ -18,6 +18,12 @@ Tables:
                       scoring output computed from the already-desensitized
                       scan_results. score and verdict are redundant columns for
                       lightweight polling queries. Never contains raw secrets.
+- repair_results:     Persisted repair plan snapshots (P0-7). One row per
+                      task_id. repair_json contains only deterministic repair
+                      plan output computed from the already-desensitized
+                      scan_results and assessment_results. plan_status and
+                      total/blocking group counts are redundant columns for
+                      lightweight polling queries. Never contains raw secrets.
 """
 
 import sqlite3
@@ -159,6 +165,37 @@ def init_db() -> None:
                 CREATE INDEX IF NOT EXISTS idx_assessment_verdict
                 ON assessment_results(verdict)
             """)
+            # --- repair_results: one persisted repair plan per task (P0-7) ---
+            # repair_json contains ONLY deterministic repair plan output
+            # computed from the already-desensitized scan_results and
+            # assessment_results. No raw secrets, no temp paths, no
+            # internal exception objects, no repo_url.
+            # plan_status and total/blocking group counts are redundant
+            # columns so polling queries can read lightweight values
+            # instead of parsing repair_json.
+            # source_scan_updated_at and source_assessment_updated_at
+            # track which scan_results and assessment_results versions
+            # this repair plan was computed from.
+            # No repair_status index is created — it has no actual query
+            # use at this stage.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS repair_results (
+                    task_id TEXT PRIMARY KEY,
+                    schema_version INTEGER NOT NULL,
+                    policy_version TEXT NOT NULL,
+                    repair_scope TEXT NOT NULL,
+                    repair_json TEXT NOT NULL,
+                    plan_status TEXT NOT NULL,
+                    total_repair_groups INTEGER NOT NULL,
+                    blocking_repair_groups INTEGER NOT NULL,
+                    source_scan_updated_at TEXT NOT NULL,
+                    source_assessment_updated_at TEXT NOT NULL,
+                    source_assessment_policy_version TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (task_id) REFERENCES tasks(id)
+                )
+            """)
             conn.commit()
             _initialized = True
         finally:
@@ -171,7 +208,9 @@ def reset_db() -> None:
     with _init_lock:
         conn = _get_connection()
         try:
-            # Drop assessment_results and scan_results first (FK references tasks)
+            # Drop repair_results, assessment_results, and scan_results
+            # first (FK references tasks)
+            conn.execute("DROP TABLE IF EXISTS repair_results")
             conn.execute("DROP TABLE IF EXISTS assessment_results")
             conn.execute("DROP TABLE IF EXISTS scan_results")
             conn.execute("DROP TABLE IF EXISTS tasks")
