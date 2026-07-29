@@ -300,11 +300,13 @@ def _read_scan_result(task_id: str) -> tuple[dict, dict, str]:
     return scan_result, summary, scan_updated_at
 
 
-def _read_assessment(task_id: str) -> tuple[dict, str, str]:
-    """Read persisted assessment, updated_at, and policy_version from SQLite.
+def _read_assessment(task_id: str) -> tuple[dict, str, str, str]:
+    """Read persisted assessment, updated_at, policy_version, and
+    source_scan_updated_at from SQLite.
 
     Returns:
-        (assessment_dict, assessment_updated_at, assessment_policy_version)
+        (assessment_dict, assessment_updated_at, assessment_policy_version,
+         source_scan_updated_at)
 
     Raises:
         RepairPlanInternalError: If the assessment is missing, cannot
@@ -316,7 +318,8 @@ def _read_assessment(task_id: str) -> tuple[dict, str, str]:
         init_db()
         conn = _get_connection()
         row = conn.execute(
-            "SELECT assessment_json, updated_at, policy_version "
+            "SELECT assessment_json, updated_at, policy_version, "
+            "source_scan_updated_at "
             "FROM assessment_results WHERE task_id = ?",
             (task_id,),
         ).fetchone()
@@ -327,6 +330,7 @@ def _read_assessment(task_id: str) -> tuple[dict, str, str]:
         assessment_json = row["assessment_json"]
         assessment_updated_at = row["updated_at"]
         assessment_policy_version = row["policy_version"]
+        source_scan_updated_at = row["source_scan_updated_at"]
     except RepairPlanInternalError:
         _db_error = True
         raise
@@ -354,7 +358,10 @@ def _read_assessment(task_id: str) -> tuple[dict, str, str]:
     if not isinstance(assessment, dict):
         raise RepairPlanInternalError("Assessment is not a dict")
 
-    return assessment, assessment_updated_at, assessment_policy_version
+    return (
+        assessment, assessment_updated_at, assessment_policy_version,
+        source_scan_updated_at,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -369,12 +376,14 @@ def _validate_consistency(
     assessment: dict,
     assessment_updated_at: str,
     assessment_policy_version: str,
+    source_scan_updated_at: str,
 ) -> None:
     """Validate that scan result and assessment are consistent.
 
     Checks:
     1. assessment.task_id == task_id
-    2. assessment.source_scan_updated_at == scan_updated_at
+    2. source_scan_updated_at (from assessment_results column) ==
+       scan_updated_at (from scan_results column)
     3. assessment_policy_version is supported by P0-7
 
     Raises:
@@ -385,8 +394,7 @@ def _validate_consistency(
     if assessment.get("task_id") != task_id:
         raise RepairPlanInternalError("Assessment task_id mismatch")
 
-    # Check 2: assessment source_scan_updated_at matches scan updated_at
-    source_scan_updated_at = assessment.get("source_scan_updated_at")
+    # Check 2: source_scan_updated_at (table column) matches scan updated_at
     if source_scan_updated_at != scan_updated_at:
         raise RepairPlanInternalError(
             "Assessment source_scan_updated_at does not match scan updated_at"
@@ -926,6 +934,7 @@ def generate_repair_plan(
     assessment: dict,
     assessment_updated_at: str,
     assessment_policy_version: str,
+    source_scan_updated_at: str,
 ) -> dict:
     """Compute a deterministic repair plan from persisted results.
 
@@ -945,6 +954,7 @@ def generate_repair_plan(
         assessment:                 The persisted assessment dict.
         assessment_updated_at:      The assessment_results.updated_at.
         assessment_policy_version:  The assessment_results.policy_version.
+        source_scan_updated_at:     The assessment_results.source_scan_updated_at.
 
     Returns:
         A RepairPlan dict with the fixed structure.
@@ -956,6 +966,7 @@ def generate_repair_plan(
     _validate_consistency(
         task_id, scan_result, summary, scan_updated_at,
         assessment, assessment_updated_at, assessment_policy_version,
+        source_scan_updated_at,
     )
 
     # 2. Extract findings
@@ -1515,9 +1526,10 @@ def generate_and_save_repair_plan(task_id: str) -> dict:
     scan_result, summary, scan_updated_at = _read_scan_result(task_id)
 
     # Step 2: Read persisted assessment
-    assessment, assessment_updated_at, assessment_policy_version = (
-        _read_assessment(task_id)
-    )
+    (
+        assessment, assessment_updated_at, assessment_policy_version,
+        source_scan_updated_at,
+    ) = _read_assessment(task_id)
 
     # Step 3: Compute repair plan
     repair_plan = generate_repair_plan(
@@ -1528,6 +1540,7 @@ def generate_and_save_repair_plan(task_id: str) -> dict:
         assessment=assessment,
         assessment_updated_at=assessment_updated_at,
         assessment_policy_version=assessment_policy_version,
+        source_scan_updated_at=source_scan_updated_at,
     )
 
     # Step 4: Persist repair plan
