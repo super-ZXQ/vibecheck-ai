@@ -316,32 +316,57 @@ def sanitize_assessment_file_path(value: str | None) -> str:
 
 
 # --- Absolute path removal from text ---
+#
+# DESIGN: URLs like https://github.com/test/repo must be PRESERVED.
+# The previous regex used unbounded /[A-Za-z] and // patterns that
+# matched inside URLs (after the :// prefix).
+#
+# Solution: use BOUNDARY-AWARE matching. Absolute paths are only
+# recognized at:
+# - String start (^)
+# - After whitespace (\s)
+# - After an opening bracket ([({<)
+# - After a quote (" or ')
+#
+# The colon (:) is deliberately EXCLUDED from the boundary so that
+# the // in "https://" is never treated as a UNC path start.
+#
+# /var/tmp/ is listed BEFORE /tmp/ for longest-prefix-first matching
+# within the same alternation group.
+_PATH_BOUNDARY = r'(?:^|(?<=[\s\[({<"\']))'
 
-# Single unified regex with longest-prefix-first alternation.
-# /var/tmp/ MUST come before /tmp/ to prevent partial matching
-# that leaves "/var" as a residual.
-# Stop at whitespace, quotes, and angle brackets to avoid over-matching.
 _PATH_TEXT_RE = re.compile(
-    r'/var/tmp/[^\s"\'<>]*'      # /var/tmp/... (longest prefix first)
-    r'|/tmp/[^\s"\'<>]*'          # /tmp/...
-    r'|/home/[^\s"\'<>]*'         # /home/...
-    r'|/Users/[^\s"\'<>]*'        # /Users/...
-    r'|/[A-Za-z][^\s"\'<>]*'      # Any other POSIX absolute: /etc/..., /root/..., /opt/...
-    r'|[A-Za-z]:[/\\][^\s"\'<>]*' # Windows drive: C:\..., C:/...
-    r'|\\\\[^\s"\'<>]*'           # UNC backslash: \\server\share...
-    r'|//[^\s"\'<>]*'             # UNC forward slash: //server/share...
+    # POSIX absolute paths (boundary-aware):
+    # /var/tmp/... must come before /tmp/ for longest-prefix match
+    _PATH_BOUNDARY + r'(/var/tmp/[^\s"\'<>]*'
+    r'|/tmp/[^\s"\'<>]*'
+    r'|/home/[^\s"\'<>]*'
+    r'|/Users/[^\s"\'<>]*'
+    r'|/[A-Za-z][^\s"\'<>]*)'
+    # Windows drive paths: C:\... or C:/...
+    r'|' + _PATH_BOUNDARY + r'([A-Za-z]:[/\\][^\s"\'<>]*)'
+    # UNC backslash: \\server\share...
+    r'|' + _PATH_BOUNDARY + r'(\\\\[^\s"\'<>]*)'
+    # UNC forward slash: //server/share...
+    # The boundary excludes : so https:// is never matched.
+    r'|' + _PATH_BOUNDARY + r'(//[^\s"\'<>]*)'
 )
 
 
 def _clean_path_from_text(text: str) -> str:
-    """Remove absolute temp paths from text.
+    """Remove absolute temp paths from text while preserving URLs.
 
     Replaces detected absolute paths with "<redacted-path>".
     Does not preserve basename, parent dir, or task ID.
 
-    Uses a single unified regex with longest-prefix-first alternation
-    so that /var/tmp/... is matched as a whole, not partially as
-    /tmp/... leaving /var as residue.
+    Uses boundary-aware matching so that URLs like
+    ``https://github.com/test/repo`` are NOT broken — the ``/`` after
+    ``://`` is not treated as a path start because the boundary
+    requires whitespace, bracket, quote, or string-start before the path.
+
+    /var/tmp/ is matched as a whole (longest prefix first) so that
+    ``/var/tmp/task/.env`` becomes ``<redacted-path>``, not
+    ``/var<redacted-path>``.
 
     Detects:
     - /var/tmp/..., /tmp/..., /home/..., /Users/..., /etc/..., /root/..., etc.
