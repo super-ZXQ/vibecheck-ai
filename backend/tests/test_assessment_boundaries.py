@@ -34,11 +34,15 @@ from app.services.assessment_service import (
     get_assessment_result,
     run_assessment,
     AssessmentInternalError,
+    AssessmentPersistError,
     AssessmentSerializationError,
     sanitize_assessment_file_path,
     _clean_path_from_text,
     _strict_int,
     _strict_bool,
+    _normalize_sort_str,
+    _normalize_sort_int,
+    _normalize_sort_bool,
 )
 from app.services.assessment_policy import (
     ASSESSMENT_SCHEMA_VERSION,
@@ -1288,3 +1292,611 @@ class TestFindingSortNoDefaultStr:
         # Critical blocking finding should be first in blocking_reasons.
         if retrieved["blocking_reasons"]:
             assert retrieved["blocking_reasons"][0]["severity"] == "critical"
+
+
+# ============================================================
+# J. save_assessment_result database error boundary
+# ============================================================
+
+class TestSaveAssessmentDatabaseBoundary:
+    """All SQLite operations in save_assessment_result are wrapped."""
+
+    def test_init_db_error_raises_persist_error(self, test_db, monkeypatch):
+        """init_db raising sqlite3.Error → AssessmentPersistError."""
+        # Setup BEFORE monkeypatch so the test fixture is not affected.
+        task_id, scan_dict, scan_updated = _setup_task_with_scan(test_db)
+        assessment = assess_scan_result(task_id, scan_dict)
+        def _boom():
+            raise sqlite3.Error("init failed")
+        monkeypatch.setattr(
+            "app.services.assessment_service.init_db", _boom
+        )
+        with pytest.raises(AssessmentPersistError):
+            save_assessment_result(task_id, assessment, scan_updated)
+        row = _read_db_row(task_id)
+        assert row is None
+
+    def test_get_connection_error_raises_persist_error(
+        self, test_db, monkeypatch
+    ):
+        """_get_connection raising sqlite3.Error → AssessmentPersistError."""
+        # Setup BEFORE monkeypatch so the test fixture is not affected.
+        task_id, scan_dict, scan_updated = _setup_task_with_scan(test_db)
+        assessment = assess_scan_result(task_id, scan_dict)
+        def _boom():
+            raise sqlite3.Error("connection failed")
+        monkeypatch.setattr(
+            "app.services.assessment_service._get_connection", _boom
+        )
+        with pytest.raises(AssessmentPersistError):
+            save_assessment_result(task_id, assessment, scan_updated)
+        row = _read_db_row(task_id)
+        assert row is None
+
+    def test_query_created_at_failure_raises_persist_error(
+        self, test_db, monkeypatch
+    ):
+        """SELECT created_at failure → AssessmentPersistError."""
+        # Setup BEFORE monkeypatch so the test fixture is not affected.
+        task_id, scan_dict, scan_updated = _setup_task_with_scan(test_db)
+        assessment = assess_scan_result(task_id, scan_dict)
+        class _BadConn:
+            def execute(self, *args, **kwargs):
+                raise sqlite3.Error("execute failed")
+            def commit(self):
+                pass
+            def rollback(self):
+                pass
+            def close(self):
+                pass
+        monkeypatch.setattr(
+            "app.services.assessment_service._get_connection",
+            lambda: _BadConn(),
+        )
+        with pytest.raises(AssessmentPersistError):
+            save_assessment_result(task_id, assessment, scan_updated)
+
+    def test_insert_failure_raises_persist_error(self, test_db, monkeypatch):
+        """INSERT/UPDATE failure → AssessmentPersistError."""
+        # Setup BEFORE monkeypatch so the test fixture is not affected.
+        task_id, scan_dict, scan_updated = _setup_task_with_scan(test_db)
+        assessment = assess_scan_result(task_id, scan_dict)
+        _original_get_connection = _get_connection
+
+        class _HalfBadConn:
+            def __init__(self):
+                self._real = _original_get_connection()
+                self._insert_failed = False
+            def execute(self, *args, **kwargs):
+                sql = args[0] if args else ""
+                if "INSERT" in sql and not self._insert_failed:
+                    self._insert_failed = True
+                    raise sqlite3.Error("insert failed")
+                return self._real.execute(*args, **kwargs)
+            def commit(self):
+                self._real.commit()
+            def rollback(self):
+                self._real.rollback()
+            def close(self):
+                self._real.close()
+        monkeypatch.setattr(
+            "app.services.assessment_service._get_connection",
+            lambda: _HalfBadConn(),
+        )
+        with pytest.raises(AssessmentPersistError):
+            save_assessment_result(task_id, assessment, scan_updated)
+
+    def test_commit_failure_raises_persist_error(self, test_db, monkeypatch):
+        """commit failure → AssessmentPersistError."""
+        # Setup BEFORE monkeypatch so the test fixture is not affected.
+        task_id, scan_dict, scan_updated = _setup_task_with_scan(test_db)
+        assessment = assess_scan_result(task_id, scan_dict)
+        _original_get_connection = _get_connection
+
+        class _BadCommitConn:
+            def __init__(self):
+                self._real = _original_get_connection()
+            def execute(self, *args, **kwargs):
+                return self._real.execute(*args, **kwargs)
+            def commit(self):
+                raise sqlite3.Error("commit failed")
+            def rollback(self):
+                pass
+            def close(self):
+                self._real.close()
+        monkeypatch.setattr(
+            "app.services.assessment_service._get_connection",
+            lambda: _BadCommitConn(),
+        )
+        with pytest.raises(AssessmentPersistError):
+            save_assessment_result(task_id, assessment, scan_updated)
+
+    def test_close_failure_after_success_raises_persist_error(
+        self, test_db, monkeypatch
+    ):
+        """Normal write succeeds, but close fails → AssessmentPersistError."""
+        # Setup BEFORE monkeypatch so the test fixture is not affected.
+        task_id, scan_dict, scan_updated = _setup_task_with_scan(test_db)
+        assessment = assess_scan_result(task_id, scan_dict)
+        _original_get_connection = _get_connection
+
+        class _BadCloseConn:
+            def __init__(self):
+                self._real = _original_get_connection()
+            def execute(self, *args, **kwargs):
+                return self._real.execute(*args, **kwargs)
+            def commit(self):
+                self._real.commit()
+            def rollback(self):
+                self._real.rollback()
+            def close(self):
+                raise sqlite3.Error("close failed")
+        monkeypatch.setattr(
+            "app.services.assessment_service._get_connection",
+            lambda: _BadCloseConn(),
+        )
+        with pytest.raises(AssessmentPersistError):
+            save_assessment_result(task_id, assessment, scan_updated)
+
+    def test_serialization_error_plus_close_error_preserves_serialization(
+        self, test_db, monkeypatch
+    ):
+        """Serialization fails AND close fails → AssessmentInternalError
+        (serialization error preserved, close error suppressed)."""
+        # Setup BEFORE monkeypatch so the test fixture is not affected.
+        task_id, scan_dict, scan_updated = _setup_task_with_scan(test_db)
+        assessment = assess_scan_result(task_id, scan_dict)
+        _original_get_connection = _get_connection
+
+        class _BadCloseConn:
+            def __init__(self):
+                self._real = _original_get_connection()
+            def execute(self, *args, **kwargs):
+                return self._real.execute(*args, **kwargs)
+            def commit(self):
+                self._real.commit()
+            def rollback(self):
+                pass
+            def close(self):
+                raise sqlite3.Error("close failed")
+        monkeypatch.setattr(
+            "app.services.assessment_service._get_connection",
+            lambda: _BadCloseConn(),
+        )
+        # Corrupt to cause serializationError
+        assessment["score"] = True
+        # Should raise AssessmentSerializationError (subclass of
+        # AssessmentInternalError), NOT AssessmentPersistError.
+        with pytest.raises(AssessmentInternalError) as exc_info:
+            save_assessment_result(task_id, assessment, scan_updated)
+        assert not isinstance(exc_info.value, AssessmentPersistError), \
+            "Serialization error must NOT be wrapped as PersistError"
+
+    def test_persist_error_message_no_sensitive_info(
+        self, test_db, monkeypatch
+    ):
+        """AssessmentPersistError message has no str(exc) or DB details."""
+        # Setup BEFORE monkeypatch so the test fixture is not affected.
+        task_id, scan_dict, scan_updated = _setup_task_with_scan(test_db)
+        assessment = assess_scan_result(task_id, scan_dict)
+        sensitive = "secret_database_path /tmp/private/database.db"
+        def _boom():
+            raise sqlite3.Error(sensitive)
+        monkeypatch.setattr(
+            "app.services.assessment_service._get_connection", _boom
+        )
+        try:
+            save_assessment_result(task_id, assessment, scan_updated)
+            assert False, "Should have raised"
+        except AssessmentPersistError as e:
+            msg = str(e)
+            assert sensitive not in msg
+            assert "secret_database_path" not in msg
+            assert "/tmp/private" not in msg
+
+
+# ============================================================
+# K. Field-level Finding sort type validation
+# ============================================================
+
+class TestFieldLevelFindingSortTypes:
+    """Each sort field has a fixed type; heterogeneous types are rejected."""
+
+    def test_str_vs_int_file_path_raises_not_typeerror(self, test_db):
+        """Two findings with file_path='a.py' and file_path=5 must
+        raise AssessmentInternalError, not TypeError."""
+        task_id, scan_dict, scan_updated = _setup_task_with_scan(
+            test_db,
+            findings=[Finding(
+                rule_id="R_MIX1",
+                rule_name="Test",
+                severity=Severity.CRITICAL,
+                confidence=Confidence.HIGH,
+                file_path="a.py",
+                line_start=1, line_end=1,
+                column_start=1, column_end=10,
+                snippet_masked="***",
+                is_blocking=False,
+                finding_type=FindingType.CONTENT,
+                description="A",
+                category="token",
+                secret_type="github_token",
+                message="Remove",
+                repair_template_key="remove_secret",
+            )],
+        )
+        # Inject int into file_path of second finding
+        scan_dict["findings"].append({
+            "rule_id": "R_MIX1",
+            "rule_name": "Test",
+            "severity": "critical",
+            "confidence": "high",
+            "file_path": 5,
+            "line_start": 2, "line_end": 2,
+            "column_start": 1, "column_end": 10,
+            "snippet_masked": "***",
+            "is_blocking": False,
+            "finding_type": "content",
+            "description": "B",
+            "category": "token",
+            "secret_type": "github_token",
+            "message": "Remove",
+            "repair_template_key": "remove_secret",
+        })
+        with pytest.raises(AssessmentInternalError):
+            assess_scan_result(task_id, scan_dict)
+
+    def test_str_vs_int_rule_id_raises_not_typeerror(self, test_db):
+        """Two findings with rule_id='R1' and rule_id=1 must raise
+        AssessmentInternalError, not TypeError in sorted(groups.keys())."""
+        task_id, scan_dict, scan_updated = _setup_task_with_scan(
+            test_db,
+            findings=[Finding(
+                rule_id="R1",
+                rule_name="Test",
+                severity=Severity.HIGH,
+                confidence=Confidence.MEDIUM,
+                file_path="a.py",
+                line_start=1, line_end=1,
+                column_start=1, column_end=10,
+                snippet_masked="***",
+                is_blocking=False,
+                finding_type=FindingType.CONTENT,
+                description="A",
+                category="token",
+                secret_type="github_token",
+                message="Remove",
+                repair_template_key="remove_secret",
+            )],
+        )
+        scan_dict["findings"].append({
+            "rule_id": 1,
+            "rule_name": "Test",
+            "severity": "high",
+            "confidence": "medium",
+            "file_path": "b.py",
+            "line_start": 2, "line_end": 2,
+            "column_start": 1, "column_end": 10,
+            "snippet_masked": "***",
+            "is_blocking": False,
+            "finding_type": "content",
+            "description": "B",
+            "category": "token",
+            "secret_type": "github_token",
+            "message": "Remove",
+            "repair_template_key": "remove_secret",
+        })
+        with pytest.raises(AssessmentInternalError):
+            assess_scan_result(task_id, scan_dict)
+
+    @pytest.mark.parametrize("field_name,bad_value", [
+        ("is_blocking", 1),
+        ("line_start", True),
+        ("severity", 5),
+        ("confidence", []),
+        ("description", {}),
+    ])
+    def test_illegal_field_types_rejected(
+        self, test_db, field_name, bad_value
+    ):
+        """Each illegal field type raises AssessmentInternalError."""
+        task_id, scan_dict, scan_updated = _setup_task_with_scan(
+            test_db,
+            findings=[Finding(
+                rule_id="R_ILLEGAL",
+                rule_name="Test",
+                severity=Severity.CRITICAL,
+                confidence=Confidence.HIGH,
+                file_path="config.py",
+                line_start=1, line_end=1,
+                column_start=1, column_end=20,
+                snippet_masked="ghp_****",
+                is_blocking=False,
+                finding_type=FindingType.CONTENT,
+                description="Found",
+                category="token",
+                secret_type="github_token",
+                message="Remove",
+                repair_template_key="remove_secret",
+            )],
+        )
+        scan_dict["findings"][0][field_name] = bad_value
+        with pytest.raises(AssessmentInternalError):
+            assess_scan_result(task_id, scan_dict)
+
+    def test_valid_findings_shuffled_same_result(self, test_db):
+        """Shuffled input finding order produces identical assessment."""
+        findings_a = [
+            Finding(
+                rule_id="R_DETERM_A",
+                rule_name="Rule A",
+                severity=Severity.HIGH,
+                confidence=Confidence.MEDIUM,
+                file_path="z.py",
+                line_start=5, line_end=5,
+                column_start=1, column_end=10,
+                snippet_masked="***",
+                is_blocking=False,
+                finding_type=FindingType.CONTENT,
+                description="A",
+                category="token",
+                secret_type="github_token",
+                message="Remove",
+                repair_template_key="remove_secret",
+            ),
+            Finding(
+                rule_id="R_DETERM_A",
+                rule_name="Rule A",
+                severity=Severity.CRITICAL,
+                confidence=Confidence.HIGH,
+                file_path="a.py",
+                line_start=1, line_end=1,
+                column_start=1, column_end=10,
+                snippet_masked="***",
+                is_blocking=True,
+                finding_type=FindingType.CONTENT,
+                description="B",
+                category="token",
+                secret_type="github_token",
+                message="Remove",
+                repair_template_key="remove_secret",
+            ),
+            Finding(
+                rule_id="R_DETERM_B",
+                rule_name="Rule B",
+                severity=Severity.MEDIUM,
+                confidence=Confidence.LOW,
+                file_path="m.py",
+                line_start=3, line_end=3,
+                column_start=2, column_end=8,
+                snippet_masked="***",
+                is_blocking=False,
+                finding_type=FindingType.CONTENT,
+                description="C",
+                category="token",
+                secret_type="github_token",
+                message="Remove",
+                repair_template_key="remove_secret",
+            ),
+        ]
+        # Run with original order
+        task_a, scan_a, updated_a = _setup_task_with_scan(
+            test_db, findings=findings_a
+        )
+        assessment_a = assess_scan_result(task_a, scan_a)
+        save_assessment_result(task_a, assessment_a, updated_a)
+        result_a = get_assessment_result(task_a)
+
+        # Run with reversed order
+        findings_b = list(reversed(findings_a))
+        task_b, scan_b, updated_b = _setup_task_with_scan(
+            test_db, findings=findings_b
+        )
+        assessment_b = assess_scan_result(task_b, scan_b)
+        save_assessment_result(task_b, assessment_b, updated_b)
+        result_b = get_assessment_result(task_b)
+
+        # score_breakdown must be identical (same rule order, same deductions)
+        assert result_a["score"] == result_b["score"]
+        assert result_a["score_before_caps"] == result_b["score_before_caps"]
+        assert (
+            json.dumps(result_a["score_breakdown"], sort_keys=True)
+            == json.dumps(result_b["score_breakdown"], sort_keys=True)
+        )
+
+    def test_normalize_sort_str_rejects_int(self):
+        """_normalize_sort_str rejects int."""
+        with pytest.raises(AssessmentInternalError):
+            _normalize_sort_str(5)
+
+    def test_normalize_sort_str_rejects_bool(self):
+        """_normalize_sort_str rejects bool."""
+        with pytest.raises(AssessmentInternalError):
+            _normalize_sort_str(True)
+
+    def test_normalize_sort_str_none_to_empty(self):
+        """_normalize_sort_str(None) returns ''."""
+        assert _normalize_sort_str(None) == ""
+
+    def test_normalize_sort_int_rejects_bool(self):
+        """_normalize_sort_int rejects bool (even though bool is int subclass)."""
+        with pytest.raises(AssessmentInternalError):
+            _normalize_sort_int(True)
+
+    def test_normalize_sort_int_none_to_zero(self):
+        """_normalize_sort_int(None) returns 0."""
+        assert _normalize_sort_int(None) == 0
+
+    def test_normalize_sort_bool_rejects_int(self):
+        """_normalize_sort_bool rejects int 0 and 1."""
+        with pytest.raises(AssessmentInternalError):
+            _normalize_sort_bool(0)
+        with pytest.raises(AssessmentInternalError):
+            _normalize_sort_bool(1)
+
+    def test_normalize_sort_bool_none_to_false(self):
+        """_normalize_sort_bool(None) returns False."""
+        assert _normalize_sort_bool(None) is False
+
+
+# ============================================================
+# L. URL preservation in path cleaning
+# ============================================================
+
+class TestURLPreservationInPathCleaning:
+    """URLs are preserved while absolute paths are redacted."""
+
+    @pytest.mark.parametrize("url_text", [
+        "http://example.com/a",
+        "https://github.com/test/repo",
+        "git+https://example.com/repo.git",
+        "http://example.com/docs",
+    ])
+    def test_url_preserved(self, url_text):
+        """URLs are not broken by path cleaning."""
+        assert _clean_path_from_text(url_text) == url_text
+
+    def test_url_in_backticks_preserved(self):
+        """URL in backticks is preserved exactly."""
+        text = "See `https://github.com/test/repo`"
+        assert _clean_path_from_text(text) == text
+
+    @pytest.mark.parametrize("path_text,expected", [
+        ("/var/tmp/task/repo/.env", "<redacted-path>"),
+        ("/tmp/task/repo/.env", "<redacted-path>"),
+        ("/etc/passwd", "<redacted-path>"),
+        ("C:\\Users\\alice\\AppData\\Local\\Temp\\a.txt",
+         "<redacted-path>"),
+        ("\\\\server\\share\\temp\\a.txt", "<redacted-path>"),
+        ("//server/share/temp/a.txt", "<redacted-path>"),
+    ])
+    def test_absolute_path_redacted(self, path_text, expected):
+        """Absolute paths are still redacted."""
+        assert _clean_path_from_text(path_text) == expected
+
+    def test_var_tmp_exact_assertion(self):
+        """Exact assertion for /var/tmp path cleaning."""
+        assert _clean_path_from_text(
+            "err /var/tmp/task-secret/repo/.env done"
+        ) == "err <redacted-path> done"
+
+    def test_url_and_path_mixed(self):
+        """URL is preserved while path is redacted in same text."""
+        text = "Repo: https://github.com/test/repo Error: /tmp/secret/.env"
+        result = _clean_path_from_text(text)
+        assert "https://github.com/test/repo" in result
+        assert "/tmp/secret/.env" not in result
+        assert "<redacted-path>" in result
+
+    def test_no_residue_in_var_tmp(self):
+        """No /var, username, task ID, or basename residue."""
+        result = _clean_path_from_text(
+            "Error at /var/tmp/task-secret/repo/.env"
+        )
+        assert "/var" not in result
+        assert "task-secret" not in result
+        assert "repo" not in result
+        assert ".env" not in result
+
+    def test_forward_slash_unc_in_text(self):
+        """Forward-slash UNC paths are cleaned from text."""
+        result = _clean_path_from_text(
+            "scan at //server/share/temp/repo/data.db"
+        )
+        assert "//server" not in result
+        assert "<redacted-path>" in result
+
+
+# ============================================================
+# M. get_assessment_result connection close semantics
+# ============================================================
+
+class TestGetAssessmentCloseSemantics:
+    """Connection close is called exactly once; close failures are handled."""
+
+    def test_row_not_found_close_called_once(self, test_db, monkeypatch):
+        """When row is None, close is called exactly once."""
+        close_count = [0]
+        _original_get_connection = _get_connection
+
+        class _CountingConn:
+            def __init__(self):
+                self._real = _original_get_connection()
+            def execute(self, *args, **kwargs):
+                return self._real.execute(*args, **kwargs)
+            def close(self):
+                close_count[0] += 1
+                self._real.close()
+        monkeypatch.setattr(
+            "app.services.assessment_service._get_connection",
+            lambda: _CountingConn(),
+        )
+        # Call with non-existent task_id
+        result = get_assessment_result("nonexistent-task-id")
+        assert result is None
+        assert close_count[0] == 1, f"Expected 1 close, got {close_count[0]}"
+
+    def test_close_failure_after_success_raises_internal_error(
+        self, test_db, monkeypatch
+    ):
+        """Normal read succeeds, but close fails → AssessmentInternalError."""
+        # Setup and save BEFORE monkeypatch so the test fixture is not affected.
+        task_id, scan_dict, scan_updated = _setup_task_with_scan(test_db)
+        assessment = assess_scan_result(task_id, scan_dict)
+        save_assessment_result(task_id, assessment, scan_updated)
+
+        _original_get_connection = _get_connection
+
+        class _BadCloseConn:
+            def __init__(self):
+                self._real = _original_get_connection()
+            def execute(self, *args, **kwargs):
+                return self._real.execute(*args, **kwargs)
+            def close(self):
+                raise sqlite3.Error("close failed")
+        monkeypatch.setattr(
+            "app.services.assessment_service._get_connection",
+            lambda: _BadCloseConn(),
+        )
+        with pytest.raises(AssessmentInternalError):
+            get_assessment_result(task_id)
+
+    def test_query_failure_and_close_failure_raises_internal_error(
+        self, test_db, monkeypatch
+    ):
+        """Both query and close fail → AssessmentInternalError (query
+        error preserved, close error suppressed)."""
+        class _BadConn:
+            def execute(self, *args, **kwargs):
+                raise sqlite3.Error("query failed")
+            def close(self):
+                raise sqlite3.Error("close failed")
+        monkeypatch.setattr(
+            "app.services.assessment_service._get_connection",
+            lambda: _BadConn(),
+        )
+        with pytest.raises(AssessmentInternalError) as exc_info:
+            get_assessment_result("any-task-id")
+        # Message should be the DB read error, not the close error
+        msg = str(exc_info.value)
+        assert "close" not in msg.lower()
+
+    def test_no_sensitive_info_in_error(self, test_db, monkeypatch):
+        """Error messages do not leak underlying exception details."""
+        sensitive = "secret_db_error_at /tmp/private/database.db"
+
+        class _BadConn:
+            def execute(self, *args, **kwargs):
+                raise sqlite3.Error(sensitive)
+            def close(self):
+                pass
+        monkeypatch.setattr(
+            "app.services.assessment_service._get_connection",
+            lambda: _BadConn(),
+        )
+        with pytest.raises(AssessmentInternalError) as exc_info:
+            get_assessment_result("any-task-id")
+        msg = str(exc_info.value)
+        assert sensitive not in msg
+        assert "secret_db_error_at" not in msg
+        assert "/tmp/private" not in msg
