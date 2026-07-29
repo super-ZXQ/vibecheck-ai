@@ -461,6 +461,17 @@ def _extract_finding_fields(finding: dict) -> dict:
         raise RepairPlanInternalError("Finding file_path is not a string")
     file_path = file_path or ""
 
+    # Validate integer fields (line_start, line_end, column_start, column_end).
+    # These fields are not extracted into the return dict, but they are
+    # type-validated to reject malformed input early — a non-int value
+    # indicates a corrupted or tampered scan result.
+    for _int_field in ("line_start", "line_end", "column_start", "column_end"):
+        _iv = finding.get(_int_field)
+        if _iv is not None and type(_iv) is not int:
+            raise RepairPlanInternalError(
+                f"Finding {_int_field} is not an integer"
+            )
+
     return {
         "rule_id": rule_id,
         "secret_type": secret_type,
