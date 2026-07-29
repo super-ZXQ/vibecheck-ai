@@ -177,6 +177,28 @@ _REDACTED_PATH = "<redacted-path>"
 _REDACTED_METADATA = "<redacted-metadata>"
 _UNKNOWN_RULE = "<unknown-rule>"
 
+
+def _validate_rule_id_for_output(rid: str) -> str:
+    """Validate a single rule_id for inclusion in repair group output.
+
+    Only allows:
+    - Known rule_id values from RULE_ALLOWED_TEMPLATE_KEYS (R001-R011)
+    - <unknown-rule> sentinel
+
+    Returns the validated rule_id, or raises RepairPlanSerializationError.
+    """
+    if not isinstance(rid, str) or not rid:
+        raise RepairPlanSerializationError(
+            "related_rule_ids contains empty or non-string value"
+        )
+    if rid == _UNKNOWN_RULE:
+        return rid
+    if not is_known_rule_id(rid):
+        raise RepairPlanSerializationError(
+            f"related_rule_ids contains invalid rule_id: {rid!r}"
+        )
+    return rid
+
 _POSIX_ABSOLUTE_RE = re.compile(r'^/')
 _WINDOWS_DRIVE_RE = re.compile(r'^[A-Za-z]:[/\\]')
 _UNC_RE = re.compile(r'^(?:\\\\|//)')
@@ -762,7 +784,8 @@ def _aggregate_groups(
         group["findings"].append(ff)
         if ff["file_path"]:
             group["related_files"].add(ff["file_path"])
-        group["related_rule_ids"].add(ff["rule_id"])
+        if ff["rule_id"]:
+            group["related_rule_ids"].add(ff["rule_id"])
 
         # Update highest severity
         if SEVERITY_ORDER.get(ff["severity"], 99) < SEVERITY_ORDER.get(
@@ -1531,6 +1554,10 @@ def _serialize_repair_group(group: dict) -> dict:
         raise RepairPlanSerializationError(
             "returned_related_files does not match len(related_files)"
         )
+    if total_related < returned_related:
+        raise RepairPlanSerializationError(
+            "total_related_files < returned_related_files"
+        )
     if files_truncated != (total_related > returned_related):
         raise RepairPlanSerializationError(
             "related_files_truncated inconsistent with counts"
@@ -1546,7 +1573,9 @@ def _serialize_repair_group(group: dict) -> dict:
         # Rebuilt from frozen policy:
         "title": action.title,
         "description": _safe_masked_desc(action.description),
-        "related_rule_ids": [_safe_masked_str(r) for r in _related_rule_ids],
+        "related_rule_ids": sorted(set(
+            _validate_rule_id_for_output(r) for r in _related_rule_ids
+        )),
         "related_files": [_sanitize_file_path(f) for f in _related_files],
         "total_related_files": total_related,
         "returned_related_files": returned_related,
@@ -1621,12 +1650,6 @@ def serialize_repair_plan(
     if not isinstance(_groups, list):
         raise RepairPlanSerializationError("repair_groups must be a list")
 
-    _verification_steps = repair_plan.get("verification_steps", [])
-    if not isinstance(_verification_steps, list):
-        raise RepairPlanSerializationError(
-            "verification_steps must be a list"
-        )
-
     # Validate plan_status
     plan_status = repair_plan.get("plan_status")
     if not isinstance(plan_status, str) or plan_status not in (
@@ -1639,6 +1662,20 @@ def serialize_repair_plan(
     # Serialize groups first (rebuilt from policy)
     safe_groups = [_serialize_repair_group(g) for g in _groups]
 
+    # --- Rebuild agent_prompt from safe_groups (NEVER trust input) ---
+    max_prompt_chars = max(1, int(settings.repair_max_agent_prompt_chars))
+    safe_agent_prompt = _generate_agent_prompt(
+        safe_groups, plan_status, max_prompt_chars
+    )
+
+    # --- Rebuild verification_steps from safe_groups (NEVER trust input) ---
+    has_blocking = any(
+        g.get("blocking") is True for g in safe_groups
+    )
+    safe_verification_steps = _generate_verification_steps(
+        plan_status, has_blocking
+    )
+
     return {
         "schema_version": REPAIR_SCHEMA_VERSION,
         "policy_version": POLICY_VERSION,
@@ -1649,10 +1686,8 @@ def serialize_repair_plan(
             repair_plan.get("summary", {}), safe_groups
         ),
         "repair_groups": safe_groups,
-        "verification_steps": [
-            _safe_masked_desc(s) for s in _verification_steps
-        ],
-        "agent_prompt": _safe_masked_desc(repair_plan.get("agent_prompt")),
+        "verification_steps": safe_verification_steps,
+        "agent_prompt": safe_agent_prompt,
         # Source fields from AUTHORITATIVE parameters only
         "source_scan_updated_at": _safe_masked_str(source_scan_updated_at),
         "source_assessment_updated_at": _safe_masked_str(
@@ -2027,10 +2062,16 @@ def _validate_persisted_repair_plan(
                 "description does not match frozen policy"
             )
 
-        # related_rule_ids: safe string list
+        # related_rule_ids: strict validation
         related_rule_ids = g["related_rule_ids"]
         if not isinstance(related_rule_ids, list):
             raise RepairPlanInternalError("related_rule_ids is not a list")
+        # No empty strings allowed
+        if any(not rid for rid in related_rule_ids):
+            raise RepairPlanInternalError(
+                "related_rule_ids contains empty string"
+            )
+        # Each must be a valid known rule_id or <unknown-rule>
         for rid in related_rule_ids:
             if not isinstance(rid, str):
                 raise RepairPlanInternalError(
@@ -2040,6 +2081,20 @@ def _validate_persisted_repair_plan(
                 raise RepairPlanInternalError(
                     "related_rule_ids contains control characters"
                 )
+            if rid != _UNKNOWN_RULE and not is_known_rule_id(rid):
+                raise RepairPlanInternalError(
+                    f"related_rule_ids contains invalid rule_id: {rid!r}"
+                )
+        # No duplicates allowed
+        if len(related_rule_ids) != len(set(related_rule_ids)):
+            raise RepairPlanInternalError(
+                "related_rule_ids contains duplicates"
+            )
+        # Must be sorted (deterministic order)
+        if related_rule_ids != sorted(related_rule_ids):
+            raise RepairPlanInternalError(
+                "related_rule_ids not in sorted order"
+            )
 
         # related_files: safe repo-relative path list
         related_files = g["related_files"]
@@ -2080,6 +2135,12 @@ def _validate_persisted_repair_plan(
         if returned_related_files != len(related_files):
             raise RepairPlanInternalError(
                 "returned_related_files does not match len(related_files)"
+            )
+
+        # total_related_files >= returned_related_files
+        if total_related_files < returned_related_files:
+            raise RepairPlanInternalError(
+                "total_related_files < returned_related_files"
             )
 
         # related_files_truncated: consistent with counts
@@ -2134,7 +2195,7 @@ def _validate_persisted_repair_plan(
                 "verification_steps do not match frozen policy"
             )
 
-    # --- 6. verification_steps ---
+    # --- 6. verification_steps (strict equality with rebuilt value) ---
     verification_steps = result["verification_steps"]
     if not isinstance(verification_steps, list):
         raise RepairPlanInternalError("verification_steps is not a list")
@@ -2144,7 +2205,19 @@ def _validate_persisted_repair_plan(
                 "verification_steps contains non-string"
             )
 
-    # --- 7. agent_prompt validation ---
+    # Rebuild expected verification_steps from plan_status and groups
+    has_blocking = any(
+        g.get("blocking") is True for g in repair_groups
+    )
+    expected_verification_steps = _generate_verification_steps(
+        plan_status, has_blocking
+    )
+    if verification_steps != expected_verification_steps:
+        raise RepairPlanInternalError(
+            "verification_steps does not match policy-rebuilt value"
+        )
+
+    # --- 7. agent_prompt (strict equality with rebuilt value) ---
     agent_prompt = result["agent_prompt"]
     if not isinstance(agent_prompt, str):
         raise RepairPlanInternalError("agent_prompt is not a string")
@@ -2155,29 +2228,25 @@ def _validate_persisted_repair_plan(
             "agent_prompt exceeds repair_max_agent_prompt_chars"
         )
 
-    # All 11 AGENT_PROMPT_REQUIREMENTS must be present
-    for req in AGENT_PROMPT_REQUIREMENTS:
-        if req not in agent_prompt:
-            raise RepairPlanInternalError(
-                "agent_prompt missing a required safety requirement"
-            )
+    # Rebuild expected agent_prompt from repair_groups and plan_status
+    expected_agent_prompt = _generate_agent_prompt(
+        repair_groups, plan_status, max_prompt_chars
+    )
 
-    # Partial plan must contain PARTIAL_DECLARATION
-    if plan_status == "partial":
-        if PARTIAL_DECLARATION not in agent_prompt:
-            raise RepairPlanInternalError(
-                "Partial plan agent_prompt missing PARTIAL_DECLARATION"
-            )
+    # Strict equality — no extra lines, no missing content, no order changes
+    if agent_prompt != expected_agent_prompt:
+        raise RepairPlanInternalError(
+            "agent_prompt does not match policy-rebuilt value"
+        )
 
-    # No forbidden content in agent_prompt
-    # Check for Cf, Zl, Zp (not Cc — newlines are legitimate in prompts)
+    # Defense-in-depth: check for forbidden Unicode and patterns
+    # (should be caught by equality check, but kept as extra layer)
     _prompt_forbidden = frozenset({"Cf", "Zl", "Zp"})
     for ch in agent_prompt:
         if unicodedata.category(ch) in _prompt_forbidden:
             raise RepairPlanInternalError(
                 "agent_prompt contains forbidden Unicode format character"
             )
-    # Check variable portion for forbidden fields and patterns
     marker = "## 修复动作摘要"
     marker_idx = agent_prompt.find(marker)
     variable_part = ""
