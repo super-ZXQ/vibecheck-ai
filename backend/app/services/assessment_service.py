@@ -1167,16 +1167,38 @@ def save_assessment_result(
     Raises:
         AssessmentResultTooLargeError: If serialized assessment_json exceeds
             assessment_max_json_bytes.
-        AssessmentPersistError: If the database operation fails.
+        AssessmentPersistError: If any database operation fails.
+        AssessmentInternalError: If serialization fails (preserved, NOT
+            wrapped as AssessmentPersistError).
     """
-    init_db()
+    # --- A. Determine now timestamp ---
     now = now_iso()
 
-    conn = _get_connection()
+    # --- B. Get database connection ---
+    # conn is initialized to None so that the finally block can safely
+    # check whether a connection was actually opened before attempting
+    # to close it. This prevents AttributeError if init_db or
+    # _get_connection fails before conn is assigned.
+    #
+    # _success tracks whether the try block completed without exception.
+    # It is used in the finally block to decide whether a close failure
+    # should raise a new AssessmentPersistError (no prior error) or be
+    # suppressed (prior error already in flight).
+    # We CANNOT use sys.exc_info() for this because inside the
+    # except handler for the close failure, sys.exc_info()[1] is the
+    # close exception itself — not None and not the original error.
+    conn = None
+    safe_assessment = None
+    assessment_json = None
+    _success = False
+
     try:
-        # --- Determine created_at ---
-        # For upsert, read the original created_at from the existing row.
-        # For first save, created_at = now.
+        # init_db and _get_connection are inside the try so that
+        # sqlite3.Error from either is mapped to AssessmentPersistError.
+        init_db()
+        conn = _get_connection()
+
+        # --- C. Query existing created_at ---
         existing = conn.execute(
             "SELECT created_at FROM assessment_results WHERE task_id = ?",
             (task_id,),
@@ -1187,10 +1209,10 @@ def save_assessment_result(
         else:
             created_at = now
 
-        # --- Explicit serialization boundary ---
-        # Build the safe dict with strict whitelists and defensive masking.
-        # task_id comes from the parameter, NOT from assessment["task_id"].
-        # schema_version, policy_version, assessment_scope come from policy.
+        # --- D. Explicit serialization ---
+        # serialize_assessment_result may raise AssessmentSerializationError
+        # or AssessmentInternalError. These MUST be preserved as internal
+        # errors — they must NOT be wrapped as AssessmentPersistError.
         safe_assessment = serialize_assessment_result(
             task_id=task_id,
             assessment=assessment,
@@ -1198,22 +1220,18 @@ def save_assessment_result(
             updated_at=now,
         )
 
-        # --- Serialize to JSON ---
-        # json.dumps with sort_keys for deterministic output.
-        # Only the already-safe dict is serialized — no vars, __dict__, asdict.
+        # Serialize to JSON with sort_keys for deterministic output.
         assessment_json = json.dumps(
             safe_assessment, ensure_ascii=False, sort_keys=True
         )
 
-        # --- Check byte size limit ---
+        # Check byte size limit — AssessmentResultTooLargeError stays independent.
         if len(assessment_json.encode("utf-8")) > settings.assessment_max_json_bytes:
             raise AssessmentResultTooLargeError(
                 "assessment_json exceeds assessment_max_json_bytes"
             )
 
-        # --- Execute upsert ---
-        # The SAME created_at and updated_at values are used in both the
-        # assessment_json and the database columns.
+        # --- E. Execute upsert and commit ---
         conn.execute(
             """INSERT INTO assessment_results
                (task_id, schema_version, policy_version, assessment_scope,
@@ -1238,22 +1256,50 @@ def save_assessment_result(
                 safe_assessment["score"],
                 safe_assessment["verdict"],
                 source_scan_updated_at,
-                created_at,  # created_at — preserved on UPDATE
-                now,         # updated_at — always updated
+                created_at,
+                now,
             ),
         )
         conn.commit()
+        _success = True
     except (AssessmentResultTooLargeError, AssessmentInternalError):
         # Serialization errors (AssessmentSerializationError extends
         # AssessmentInternalError) and size limit errors must NOT be
         # wrapped as AssessmentPersistError — they are internal errors.
+        # Attempt rollback if we have a connection, but never let
+        # rollback failure mask the original exception.
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         raise
-    except Exception as exc:
-        # Wrap unexpected DB errors in AssessmentPersistError.
-        # Never expose str(exc) or repr(exc) to callers.
-        raise AssessmentPersistError("Failed to persist assessment result") from exc
+    except Exception:
+        # All other exceptions (sqlite3.Error, etc.) are database
+        # failures → AssessmentPersistError.
+        # Never expose str(exc), repr(exc), or DB details.
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        raise AssessmentPersistError(
+            "Failed to persist assessment result"
+        )
     finally:
-        conn.close()
+        # --- F. Close connection (exactly once) ---
+        # If there was no prior exception (_success is True) but close
+        # fails, that is a database failure → AssessmentPersistError.
+        # If there WAS a prior exception (_success is False), close
+        # failure must NOT mask it — we suppress the close error.
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                if _success:
+                    raise AssessmentPersistError(
+                        "Failed to close database connection"
+                    )
 
     return safe_assessment
 
@@ -1289,8 +1335,21 @@ def get_assessment_result(task_id: str) -> Optional[dict[str, Any]]:
     # fetchone, row field reading, and connection close are ALL inside
     # the try block. Any database exception is caught and mapped to
     # AssessmentInternalError with a fixed safe message.
+    #
+    # Connection close semantics:
+    # - Connection is closed EXACTLY ONCE in the finally block.
+    # - When row is None (not found), we do NOT close in the try body.
+    # - close failure is NEVER silently ignored:
+    #   * If a DB read error already occurred → preserve that error.
+    #   * If no prior error → close failure becomes AssessmentInternalError.
+    #
+    # _db_error tracks whether a DB exception was already raised.
+    # We CANNOT use sys.exc_info() for this because inside the
+    # except handler for the close failure, sys.exc_info()[1] is the
+    # close exception itself — not None and not the original error.
     conn = None
     raw_json = None
+    _db_error = False
     try:
         init_db()
         conn = _get_connection()
@@ -1299,11 +1358,14 @@ def get_assessment_result(task_id: str) -> Optional[dict[str, Any]]:
             (task_id,),
         ).fetchone()
         if row is None:
-            # Close before returning — conn is guaranteed non-None here.
-            conn.close()
+            # Do NOT close here — finally will close exactly once.
             return None
         raw_json = row["assessment_json"]
     except Exception:
+        # Any DB error (init_db, connection, execute, fetchone, row read)
+        # is mapped to a fixed AssessmentInternalError.
+        # The original exception content is never exposed.
+        _db_error = True
         raise AssessmentInternalError(
             "Failed to read assessment from database"
         )
@@ -1312,7 +1374,13 @@ def get_assessment_result(task_id: str) -> Optional[dict[str, Any]]:
             try:
                 conn.close()
             except Exception:
-                pass  # Already raising or returning; ignore close error.
+                # If a DB exception is already in flight (_db_error is
+                # True), preserve it. Otherwise, close failure itself
+                # is an internal error.
+                if not _db_error:
+                    raise AssessmentInternalError(
+                        "Failed to close database connection"
+                    )
 
     # --- Parse JSON ---
     try:
