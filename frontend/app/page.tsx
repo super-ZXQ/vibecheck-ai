@@ -1,36 +1,88 @@
+/**
+ * Home page — URL submission form.
+ *
+ * On submit: calls submitCheck, redirects to /check/{task_id}.
+ * Errors are displayed via ErrorState with fixed safe messages.
+ */
+
+"use client";
+
+import { useState } from "react";
+import { useRouter } from "next/navigation";
+
+import { ErrorState } from "@/components/ErrorState";
+import {
+  ApiConfigError,
+  ApiHttpError,
+  ApiNetworkError,
+  submitCheck,
+} from "@/lib/api";
+import { getErrorMessage } from "@/lib/error-messages";
+
 export default function Home() {
+  const router = useRouter();
+  const [repoUrl, setRepoUrl] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = repoUrl.trim();
+    if (!trimmed || loading) return;
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      const response = await submitCheck(trimmed);
+      // Redirect to check page — polling happens there
+      router.push(`/check/${response.task_id}`);
+    } catch (err) {
+      if (err instanceof ApiConfigError) {
+        setError(
+          "后端 API 地址未配置，请检查环境变量 NEXT_PUBLIC_API_BASE_URL。",
+        );
+      } else if (err instanceof ApiHttpError) {
+        // Priority: backend error_message (already desensitized) → error_code mapping
+        setError(err.errorMessage || getErrorMessage(err.errorCode));
+      } else if (err instanceof ApiNetworkError) {
+        setError("网络连接失败，请检查网络后重试。");
+      } else {
+        setError(getErrorMessage(null));
+      }
+      setLoading(false);
+    }
+  };
+
   return (
-    <main style={{ maxWidth: 640, margin: "80px auto", padding: "0 24px" }}>
-      <h1 style={{ fontSize: "2rem", marginBottom: "0.5rem" }}>VibeCheck</h1>
-      <p style={{ color: "#666", marginBottom: "2rem" }}>
+    <main className="container">
+      <h1 className="page-title">VibeCheck</h1>
+      <p className="page-subtitle">
         项目上线体检工具 — 输入公开 GitHub 仓库地址，检查项目是否适合上线。
       </p>
-      <div style={{ display: "flex", gap: "8px" }}>
-        <input
-          type="text"
-          placeholder="https://github.com/owner/repo"
-          style={{
-            flex: 1,
-            padding: "12px 16px",
-            borderRadius: 8,
-            border: "1px solid #ddd",
-            fontSize: "1rem",
-          }}
-        />
-        <button
-          style={{
-            padding: "12px 24px",
-            borderRadius: 8,
-            border: "none",
-            background: "#6366f1",
-            color: "#fff",
-            fontSize: "1rem",
-            cursor: "pointer",
-          }}
-        >
-          开始检测
-        </button>
-      </div>
+
+      <form onSubmit={handleSubmit}>
+        <div className="input-group">
+          <input
+            type="text"
+            className="input-field"
+            placeholder="https://github.com/owner/repo"
+            value={repoUrl}
+            onChange={(e) => setRepoUrl(e.target.value)}
+            disabled={loading}
+            aria-label="GitHub 仓库地址"
+          />
+          <button
+            type="submit"
+            className="btn btn-primary"
+            disabled={loading || !repoUrl.trim()}
+          >
+            {loading ? <span className="spinner" /> : "开始检测"}
+          </button>
+        </div>
+      </form>
+
+      {error && <ErrorState message={error} />}
     </main>
   );
 }
