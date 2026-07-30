@@ -282,25 +282,57 @@ def _sanitize_file_path(value: Any) -> str:
     - Control characters via unicodedata.category (Cc, Cf, Zl, Zp)
     - Backticks (prevent Markdown code-span injection)
 
-    Any control character or backtick causes the path to be replaced
-    with <redacted-path> to prevent prompt injection via newlines,
-    text direction manipulation, or Markdown escaping.
+    Any control character, backtick, or dangerous pattern causes the path
+    to be replaced with <redacted-path> to prevent prompt injection via
+    newlines, text direction manipulation, or Markdown escaping.
 
-    After safety checks, the path is normalized to the canonical
-    repository-relative format:
-    - Backslashes unified to /
-    - Single . path segments removed
-    - Consecutive // collapsed to single /
-    - Empty result after normalization → <redacted-path>
+    Processing order (CRITICAL for idempotency):
+    A. Strict input type validation.
+    B. mask_untrusted_text on the raw string.
+    C. Reject NUL, Cc, Cf, Zl, Zp, backticks.
+    D. Unify backslashes to /.
+    E. Split path into segments.
+    F. Reject any '..' segment.
+    G. Remove empty segments and single '.' segments.
+    H. Rejoin into canonical_path.
+    I. If canonical_path is empty → return empty string.
+       (The serialization boundary converts this to
+       RepairPlanSerializationError for original empty strings and
+       '.'/'./' inputs — see _serialize_repair_group.)
+    J. Re-run ALL safety checks on canonical_path:
+       - POSIX absolute path check
+       - Windows drive path check
+       - UNC path check
+       - Windows rooted path check
+       - User home ~ check
+       If any matches → return <redacted-path>.
+    K. Return canonical_path.
+
+    Safety checks are run BOTH on the backslash-converted string (step D,
+    before empty-segment removal) AND on the canonical_path (step J, after
+    segment removal). This two-pass approach catches:
+    - Dangerous prefixes stripped by segment removal (// → relative)
+    - Dangerous patterns exposed by segment removal (./~ → ~)
+
+    This ordering ensures that removing '.' segments cannot produce a
+    dangerous path that escapes safety checks. For example:
+        ./~/.ssh/id_rsa   → ~/.ssh/id_rsa → <redacted-path>
+        ./C:/secret.txt   → C:/secret.txt → <redacted-path>
+        //server/share    → <redacted-path> (caught before segment removal)
+
+    The function is idempotent: for any input, calling it twice yields
+    the same result as calling it once.
 
     Examples:
         src\\config.py       → src/config.py
         ./src/config.py      → src/config.py
         src//config.py       → src/config.py
+        ./~/.ssh/id_rsa      → <redacted-path>
+        ./C:/secret.txt      → <redacted-path>
     """
     s = _strict_str(value)
     s = mask_untrusted_text(s)
-    # Reject NUL bytes
+    # C. Reject NUL bytes
     if '\x00' in s:
         return _REDACTED_PATH
     # Reject any forbidden Unicode category character (Cc, Cf, Zl, Zp)
@@ -309,26 +341,60 @@ def _sanitize_file_path(value: Any) -> str:
     # Reject backticks — Markdown code-span escaping is unreliable
     if '`' in s:
         return _REDACTED_PATH
-    if _POSIX_ABSOLUTE_RE.match(s):
-        return _REDACTED_PATH
-    if _WINDOWS_DRIVE_RE.match(s):
-        return _REDACTED_PATH
-    if _UNC_RE.match(s):
-        return _REDACTED_PATH
-    if _WINDOWS_ROOTED_RE.match(s):
-        return _REDACTED_PATH
-    if _USER_HOME_RE.match(s):
-        return _REDACTED_PATH
-    # Normalize to canonical repository-relative format
+    # D. Unify backslashes to /
     normalized = s.replace('\\', '/')
+    # Pre-normalization safety check on the converted string.
+    # This catches dangerous prefixes that would be lost when empty
+    # segments are removed in step G. For example:
+    #   //server/share/secret.env  (UNC) → would lose leading //
+    #   /etc/passwd                 (POSIX absolute) → would lose leading /
+    # After step G removes empty segments, these become relative-looking
+    # paths that would pass the post-normalization check. Checking here
+    # ensures they are caught before the prefix is stripped.
+    if _POSIX_ABSOLUTE_RE.match(normalized):
+        return _REDACTED_PATH
+    if _WINDOWS_DRIVE_RE.match(normalized):
+        return _REDACTED_PATH
+    if _UNC_RE.match(normalized):
+        return _REDACTED_PATH
+    if _WINDOWS_ROOTED_RE.match(normalized):
+        return _REDACTED_PATH
+    if _USER_HOME_RE.match(normalized):
+        return _REDACTED_PATH
+    # E. Split path into segments
     parts = normalized.split('/')
+    # F. Reject any '..' segment
     if '..' in parts:
         return _REDACTED_PATH
-    # Remove single '.' segments and empty strings from splitting '//'
+    # G. Remove empty segments and single '.' segments
     normalized_parts = [p for p in parts if p and p != '.']
-    if not normalized_parts:
+    # H. Rejoin into canonical_path
+    canonical_path = '/'.join(normalized_parts)
+    # I. If canonical_path is empty → return empty string
+    # The serialization boundary (_serialize_repair_group) converts this
+    # to RepairPlanSerializationError — original empty strings, '.', './',
+    # and similar paths that normalize to empty must not be silently
+    # accepted, as they would lose Finding position information.
+    # Note: This returns "" (not <redacted-path>) so the serializer can
+    # distinguish "normalizes to empty" (error) from "dangerous path"
+    # (redacted). The serializer's `if not sanitized` check catches this.
+    if not canonical_path:
+        return ""
+    # J. Re-run ALL safety checks on canonical_path
+    # This catches dangerous patterns that were hidden behind './' or
+    # '.\' prefixes, e.g. ./~/.ssh/id_rsa → ~/.ssh/id_rsa
+    if _POSIX_ABSOLUTE_RE.match(canonical_path):
         return _REDACTED_PATH
-    return '/'.join(normalized_parts)
+    if _WINDOWS_DRIVE_RE.match(canonical_path):
+        return _REDACTED_PATH
+    if _UNC_RE.match(canonical_path):
+        return _REDACTED_PATH
+    if _WINDOWS_ROOTED_RE.match(canonical_path):
+        return _REDACTED_PATH
+    if _USER_HOME_RE.match(canonical_path):
+        return _REDACTED_PATH
+    # K. Return canonical_path
+    return canonical_path
 
 
 # --- Path removal from text ---
@@ -1603,6 +1669,15 @@ def _serialize_repair_group(group: dict) -> dict:
         if not sanitized:
             raise RepairPlanSerializationError(
                 "related_files contains path that sanitizes to empty"
+            )
+        # Defensive idempotency check: _sanitize_file_path must be
+        # idempotent. If it is not, the path is not canonical and
+        # cannot be safely persisted. This is a defense-in-depth layer
+        # on top of the guarantee that _sanitize_file_path itself is
+        # idempotent by construction.
+        if _sanitize_file_path(sanitized) != sanitized:
+            raise RepairPlanSerializationError(
+                "related_files path is not canonical"
             )
         _sanitized.append(sanitized)
     _normalized = sorted(set(_sanitized))
