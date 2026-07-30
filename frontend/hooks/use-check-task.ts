@@ -50,6 +50,19 @@ import type {
 const DEFAULT_POLL_INTERVAL_MS = 2000;
 const DEFAULT_POLL_TIMEOUT_MS = 300_000;
 
+/**
+ * E2E test override for poll timeout (never set in production).
+ * Allows tests to use a shorter timeout without waiting 5 minutes.
+ * Production default remains 300000ms.
+ */
+function getTestPollTimeout(): number | undefined {
+  if (typeof window !== "undefined") {
+    const val = (window as unknown as Record<string, unknown>).__TEST_POLL_TIMEOUT_MS__;
+    if (typeof val === "number" && val > 0) return val;
+  }
+  return undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -96,7 +109,7 @@ export interface UseCheckTaskResult {
 
 export function useCheckTask(options?: UseCheckTaskOptions): UseCheckTaskResult {
   const pollIntervalMs = options?.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
-  const pollTimeoutMs = options?.pollTimeoutMs ?? DEFAULT_POLL_TIMEOUT_MS;
+  const pollTimeoutMs = options?.pollTimeoutMs ?? getTestPollTimeout() ?? DEFAULT_POLL_TIMEOUT_MS;
 
   const [state, setState] = useState<UIState>("idle");
   const [taskId, setTaskId] = useState<string | null>(null);
@@ -220,7 +233,13 @@ export function useCheckTask(options?: UseCheckTaskOptions): UseCheckTaskResult 
 
         // Terminal states
         if (status.status === "completed") {
-          cleanup();
+          // Stop polling timer but keep AbortController alive for result
+          // loading. Calling cleanup() here would abort the signal,
+          // preventing all result fetches in loadResults().
+          if (pollTimerRef.current) {
+            clearTimeout(pollTimerRef.current);
+            pollTimerRef.current = null;
+          }
           await loadResults(id, signal);
           return;
         }

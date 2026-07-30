@@ -36,6 +36,20 @@ const DEFAULT_TIMEOUT_MS = 10_000;
  * If missing, throws ApiConfigError — never falls back to localhost.
  */
 function getApiBaseUrl(): string {
+  // E2E test overrides (never active in production)
+  if (typeof window !== "undefined") {
+    const forceErr = (window as unknown as Record<string, unknown>).__TEST_FORCE_CONFIG_ERROR__;
+    if (forceErr === true) {
+      throw new ApiConfigError();
+    }
+    // Test-only API base URL override. Allows E2E tests to work
+    // even when Next.js dev server doesn't inline NEXT_PUBLIC_API_BASE_URL.
+    const testUrl = (window as unknown as Record<string, unknown>).__TEST_API_BASE_URL__;
+    if (typeof testUrl === "string" && testUrl.trim() !== "") {
+      return testUrl.replace(/\/+$/, "");
+    }
+  }
+
   const url = process.env.NEXT_PUBLIC_API_BASE_URL;
   if (!url || url.trim() === "") {
     throw new ApiConfigError();
