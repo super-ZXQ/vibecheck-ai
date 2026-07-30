@@ -113,6 +113,14 @@ class Settings(BaseSettings):
     max_pending_tasks: int = 5  # max pending tasks in queue
     max_running_tasks: int = 1  # only 1 task runs at a time (MVP)
 
+    # --- CORS (P0-8) ---
+    # Only the configured origins are allowed. The wildcard "*" is
+    # explicitly forbidden. Origins come from the CORS_ALLOWED_ORIGINS
+    # environment variable (JSON array string) or the default list.
+    cors_allowed_origins: list[str] = [
+        "http://localhost:3000",
+    ]
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 
