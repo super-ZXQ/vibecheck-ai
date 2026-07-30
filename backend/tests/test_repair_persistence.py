@@ -383,7 +383,7 @@ class TestRepairPersistence:
     # --- 9. Path desensitization ---
     def test_path_desensitization(self, test_db):
         """repair_groups 中的绝对路径应被脱敏为 <redacted-path>，
-        相对路径保持不变。"""
+        相对路径保持不变。重复的 <redacted-path> 经规范化后只保留一个。"""
         task_id = _make_task()
         plan = _make_repair_plan(task_id=task_id)
         plan["repair_groups"][0]["related_files"] = [
@@ -403,12 +403,14 @@ class TestRepairPersistence:
 
         retrieved = get_repair_result(task_id)
         files = retrieved["repair_groups"][0]["related_files"]
-        assert files[0] == "<redacted-path>"
-        assert files[1] == "<redacted-path>"
-        assert files[2] == "<redacted-path>"
-        assert files[3] == "<redacted-path>"
-        assert files[4] == "src/relative/path.py"
-        assert files[5] == "<redacted-path>"
+        # 5 unsafe paths all become <redacted-path>, deduplicated to 1.
+        # 1 safe path preserved. Sorted: <redacted-path> < src/...
+        assert files == ["<redacted-path>", "src/relative/path.py"]
+        # Normalized counts: 2 unique files, not truncated
+        grp = retrieved["repair_groups"][0]
+        assert grp["returned_related_files"] == 2
+        assert grp["total_related_files"] == 2
+        assert grp["related_files_truncated"] is False
 
     # --- 10. DB error classification ---
     def test_db_error_raises_persist_error(self, test_db, monkeypatch):

@@ -1815,18 +1815,24 @@ def _make_valid_partial_safe_plan(task_id="test-task"):
 
 def _make_complete_with_manual_safe_plan(task_id="test-task"):
     """Create a serialized plan with plan_status='complete' but containing
-    a MANUAL_REVIEW_REQUIRED group — an invalid combination."""
+    a MANUAL_REVIEW_REQUIRED group — an invalid combination.
+
+    Serialization correctly rejects this combination, so we build a valid
+    partial plan first, then corrupt plan_status to 'complete' to create
+    an invalid snapshot for read-validation testing.
+    """
+    # Build a valid PARTIAL plan with MANUAL_REVIEW_REQUIRED
     plan = {
         "schema_version": REPAIR_SCHEMA_VERSION,
         "policy_version": POLICY_VERSION,
         "repair_scope": REPAIR_SCOPE,
         "task_id": task_id,
-        "plan_status": "complete",
+        "plan_status": "partial",
         "summary": {
             "total_repair_groups": 1,
             "blocking_repair_groups": 0,
             "manual_review_required": True,
-            "coverage_warning": False,
+            "coverage_warning": True,
             "groups_truncated": False,
         },
         "repair_groups": [
@@ -1844,13 +1850,13 @@ def _make_complete_with_manual_safe_plan(task_id="test-task"):
             },
         ],
         "verification_steps": [],
-        "agent_prompt": _make_valid_agent_prompt("complete"),
+        "agent_prompt": _make_valid_agent_prompt("partial"),
         "source_scan_updated_at": "2026-01-01T00:00:00Z",
         "source_assessment_updated_at": "2026-01-01T00:00:00Z",
         "source_assessment_policy_version": "p0-6-v1",
         "created_at": None, "updated_at": None,
     }
-    return serialize_repair_plan(
+    safe = serialize_repair_plan(
         task_id=task_id,
         repair_plan=plan,
         source_scan_updated_at="2026-01-01T00:00:00Z",
@@ -1859,6 +1865,10 @@ def _make_complete_with_manual_safe_plan(task_id="test-task"):
         created_at="2026-01-01T00:00:00Z",
         updated_at="2026-01-01T00:00:00Z",
     )
+    # Corrupt: change to complete (invalid with MANUAL_REVIEW_REQUIRED)
+    safe["plan_status"] = "complete"
+    safe["summary"]["coverage_warning"] = False
+    return safe
 
 
 class TestStrictSnapshotSemantics:

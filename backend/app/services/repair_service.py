@@ -1180,9 +1180,9 @@ def _generate_agent_prompt(
     3. 11 fixed safety requirements (always complete)
     4. Variable repair action summary (can be truncated)
 
-    If max_chars is too small for the fixed content, raises
-    RepairPlanTooLargeError — never returns a prompt missing
-    safety requirements.
+    GUARANTEE: Every successful return path produces a prompt with
+    len(prompt) <= max_chars. If this is impossible, raises
+    RepairPlanTooLargeError — never returns an over-limit prompt.
 
     The prompt contains ONLY:
     - rule_id, secret_type, repair_template_key (sanitized, single-line)
@@ -1212,74 +1212,85 @@ def _generate_agent_prompt(
 
     fixed_content = "\n".join(fixed_lines)
 
-    # Check if fixed content alone exceeds max_chars
+    # 1. Fixed content alone exceeds max_chars → impossible to proceed.
     if len(fixed_content) > max_chars:
         raise RepairPlanTooLargeError(
             "Agent prompt fixed content exceeds max_chars"
         )
 
-    if not repair_groups:
-        # Empty prompt — just fixed content
-        prompt = fixed_content
-        return _validate_agent_prompt(prompt)
+    # Initialise prompt to fixed_content — the minimum safe result.
+    prompt = fixed_content
 
-    # --- Build variable content (action summary, can be truncated) ---
-    # Build line by line, checking size after each complete line/group.
-    variable_header = "\n\n## 修复动作摘要\n\n"
-    remaining_chars = max_chars - len(fixed_content) - len(variable_header)
-    if remaining_chars <= 0:
-        # No room for any variable content — return fixed + header
-        prompt = fixed_content + variable_header.rstrip()
-        return _validate_agent_prompt(prompt)
+    if repair_groups:
+        # --- Build variable content (action summary, can be truncated) ---
+        variable_header = "\n\n## 修复动作摘要\n\n"
+        remaining_chars = (
+            max_chars - len(fixed_content) - len(variable_header)
+        )
 
-    variable_lines: list[str] = []
-    current_len = 0
+        if remaining_chars > 0:
+            # 2. variable_header fits — try to add repair group lines.
+            variable_lines: list[str] = []
+            current_len = 0
 
-    for group in repair_groups:
-        action_code = group.get("action_code", "")
-        title = group.get("title", "")
-        finding_count = group.get("finding_count", 0)
-        rule_ids = group.get("related_rule_ids", [])
-        related_files = group.get("related_files", [])
+            for group in repair_groups:
+                action_code = group.get("action_code", "")
+                title = group.get("title", "")
+                finding_count = group.get("finding_count", 0)
+                rule_ids = group.get("related_rule_ids", [])
+                related_files = group.get("related_files", [])
 
-        # Build action summary line — only safe fields
-        line_parts = [f"- [{action_code}] {title}"]
-        if finding_count > 0:
-            line_parts.append(f"({finding_count}个发现)")
-        if rule_ids:
-            rule_str = ", ".join(rule_ids[:10])
-            line_parts.append(f"规则: {rule_str}")
-        action_line = " ".join(line_parts)
+                # Build action summary line — only safe fields
+                line_parts = [f"- [{action_code}] {title}"]
+                if finding_count > 0:
+                    line_parts.append(f"({finding_count}个发现)")
+                if rule_ids:
+                    rule_str = ", ".join(rule_ids[:10])
+                    line_parts.append(f"规则: {rule_str}")
+                action_line = " ".join(line_parts)
 
-        # Check if this line fits (including newline)
-        line_with_nl = action_line + "\n"
-        if current_len + len(line_with_nl) > remaining_chars:
-            break  # Stop adding — don't cut mid-line
-        variable_lines.append(action_line)
-        current_len += len(line_with_nl)
+                line_with_nl = action_line + "\n"
+                if current_len + len(line_with_nl) > remaining_chars:
+                    break
+                variable_lines.append(action_line)
+                current_len += len(line_with_nl)
 
-        # Add related files line if present
-        # Use JSON string representation instead of Markdown backticks
-        # to prevent injection via backtick escaping
-        if related_files:
-            safe_files = [
-                json.dumps(fp, ensure_ascii=False)
-                for fp in related_files[:10]
-            ]
-            files_line = f"  相关文件: {' '.join(safe_files)}"
-            files_with_nl = files_line + "\n"
-            if current_len + len(files_with_nl) > remaining_chars:
-                break  # Stop adding — don't cut mid-line
-            variable_lines.append(files_line)
-            current_len += len(files_with_nl)
+                if related_files:
+                    safe_files = [
+                        json.dumps(fp, ensure_ascii=False)
+                        for fp in related_files[:10]
+                    ]
+                    files_line = f"  相关文件: {' '.join(safe_files)}"
+                    files_with_nl = files_line + "\n"
+                    if current_len + len(files_with_nl) > remaining_chars:
+                        break
+                    variable_lines.append(files_line)
+                    current_len += len(files_with_nl)
 
-    # Assemble final prompt
-    if variable_lines:
-        prompt = fixed_content + variable_header + "\n".join(variable_lines)
-    else:
-        prompt = fixed_content
+            if variable_lines:
+                prompt = (
+                    fixed_content
+                    + variable_header
+                    + "\n".join(variable_lines)
+                )
+            else:
+                # 3. variable_header fits but no complete group line
+                #    fits — return fixed_content + header.rstrip()
+                #    only if within max_chars.
+                candidate = fixed_content + variable_header.rstrip()
+                if len(candidate) <= max_chars:
+                    prompt = candidate
+                # else: prompt stays as fixed_content
+        # else: remaining_chars <= 0 — prompt stays as fixed_content.
+        # Do NOT append a header that would exceed max_chars.
 
-    # --- Final validation: ensure no forbidden content leaked in ---
+    # --- ABSOLUTE GUARANTEE: every successful return path passes
+    #     this check. No over-limit prompt can ever be returned. ---
+    if len(prompt) > max_chars:
+        raise RepairPlanTooLargeError(
+            "Agent prompt exceeds max_chars"
+        )
+
     return _validate_agent_prompt(prompt)
 
 
@@ -1533,29 +1544,47 @@ def _serialize_repair_group(group: dict) -> dict:
             "related_files must be a list"
         )
 
-    # Validate count consistency
-    total_related = _strict_int(
+    # Validate count consistency (input checks before normalization)
+    _input_total = _strict_int(
         group.get("total_related_files", 0), minimum=0
     )
-    returned_related = len(_related_files)
-    files_truncated = _strict_bool(
+    _input_returned = len(_related_files)
+    _input_truncated = _strict_bool(
         group.get("related_files_truncated", False)
     )
-    
-    if returned_related != _strict_int(
+
+    if _input_returned != _strict_int(
         group.get("returned_related_files", 0), minimum=0
     ):
         raise RepairPlanSerializationError(
             "returned_related_files does not match len(related_files)"
         )
-    if total_related < returned_related:
+    if _input_total < _input_returned:
         raise RepairPlanSerializationError(
             "total_related_files < returned_related_files"
         )
-    if files_truncated != (total_related > returned_related):
+    if _input_truncated != (_input_total > _input_returned):
         raise RepairPlanSerializationError(
             "related_files_truncated inconsistent with counts"
         )
+
+    # --- Normalize related_files: sanitize, remove empty, deduplicate, sort ---
+    _sanitized = [_sanitize_file_path(f) for f in _related_files]
+    _non_empty = [fp for fp in _sanitized if fp]
+    _normalized = sorted(set(_non_empty))
+
+    # Recompute counts from the normalized list.
+    # If input was not truncated, adjust total to match normalized count
+    # (deduplication may have reduced the list).  If input was truncated,
+    # preserve the original total (it represents files omitted by the
+    # max_related_files limit, not by normalization).
+    returned_related = len(_normalized)
+    if _input_truncated:
+        total_related = max(_input_total, returned_related)
+        files_truncated = True
+    else:
+        total_related = returned_related
+        files_truncated = False
 
     return {
         "group_id": _safe_masked_str(group.get("group_id")),
@@ -1570,7 +1599,7 @@ def _serialize_repair_group(group: dict) -> dict:
         "related_rule_ids": sorted(set(
             _validate_rule_id_for_output(r) for r in _related_rule_ids
         )),
-        "related_files": [_sanitize_file_path(f) for f in _related_files],
+        "related_files": _normalized,
         "total_related_files": total_related,
         "returned_related_files": returned_related,
         "related_files_truncated": files_truncated,
@@ -1585,6 +1614,133 @@ def _serialize_repair_group(group: dict) -> dict:
             _safe_masked_desc(s) for s in action.verification_steps
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# --- Shared snapshot semantics validation ---
+# ---------------------------------------------------------------------------
+
+def _validate_repair_snapshot_semantics(
+    plan_status: str,
+    summary: dict,
+    repair_groups: list[dict],
+    error_cls: type[Exception],
+) -> None:
+    """Shared snapshot semantics validation used by BOTH the serialization
+    boundary and the read validation boundary.
+
+    This function enforces the deterministic invariants that MUST hold
+    for any valid repair plan snapshot. It is called:
+    - At serialization time (error_cls = RepairPlanSerializationError)
+    - At read time (error_cls = RepairPlanInternalError)
+
+    Invariants enforced:
+    1. coverage_warning == (plan_status == "partial")
+    2. If any partial-trigger action exists (MANUAL_REVIEW_REQUIRED,
+       REVIEW_SCAN_COVERAGE, RESOLVE_SCAN_ERROR), then plan_status must
+       be "partial" and coverage_warning must be True.
+    3. groups_truncated == True requires:
+       plan_status == "partial", coverage_warning == True,
+       MANUAL_REVIEW_REQUIRED present, RERUN_SECURITY_SCAN present.
+    4. Any related_files_truncated == True requires the same four
+       conditions as groups_truncated.
+    5. plan_status == "complete": no partial-trigger actions,
+       no groups_truncated, no related_files_truncated,
+       coverage_warning must be False.
+    6. plan_status == "partial": must have at least one verifiable
+       partial reason (partial-trigger action, groups_truncated,
+       or related_files_truncated).
+
+    Args:
+        plan_status: "complete" or "partial"
+        summary: The summary dict (must contain coverage_warning,
+                 groups_truncated as bools)
+        repair_groups: List of safe repair group dicts
+        error_cls: The exception class to raise on validation failure
+
+    Raises:
+        error_cls: If any invariant is violated.
+    """
+    def _fail(msg: str) -> None:
+        raise error_cls(msg)
+
+    coverage_warning = summary.get("coverage_warning")
+    groups_truncated = summary.get("groups_truncated")
+
+    # 0. Validate ALL repair_groups elements are dicts BEFORE any
+    #    field access. This prevents AttributeError/TypeError/KeyError
+    #    from escaping when groups are corrupted.
+    for g in repair_groups:
+        if not isinstance(g, dict):
+            _fail("repair_group is not a dict")
+
+    # 1. coverage_warning == (plan_status == "partial")
+    expected_cw = (plan_status == "partial")
+    if coverage_warning != expected_cw:
+        _fail("coverage_warning does not match plan_status")
+
+    # Compute action_codes from repair_groups (all verified as dicts)
+    action_codes = {g["action_code"] for g in repair_groups}
+
+    _partial_trigger_actions = {
+        ACTION_MANUAL_REVIEW_REQUIRED,
+        ACTION_REVIEW_SCAN_COVERAGE,
+        ACTION_RESOLVE_SCAN_ERROR,
+    }
+    has_partial_trigger = bool(action_codes & _partial_trigger_actions)
+
+    # 2. Partial-trigger actions require partial + coverage_warning
+    if has_partial_trigger:
+        if plan_status != "partial":
+            _fail("partial-trigger action present but plan_status is not partial")
+        if not coverage_warning:
+            _fail("partial-trigger action present but coverage_warning is false")
+
+    # 3. groups_truncated semantics
+    if groups_truncated:
+        if plan_status != "partial":
+            _fail("groups_truncated is true but plan_status is not partial")
+        if not coverage_warning:
+            _fail("groups_truncated is true but coverage_warning is false")
+        if ACTION_MANUAL_REVIEW_REQUIRED not in action_codes:
+            _fail("groups_truncated is true but MANUAL_REVIEW_REQUIRED is missing")
+        if ACTION_RERUN_SECURITY_SCAN not in action_codes:
+            _fail("groups_truncated is true but RERUN_SECURITY_SCAN is missing")
+
+    # 4. related_files_truncated semantics
+    for g in repair_groups:
+        if g.get("related_files_truncated") is True:
+            if plan_status != "partial":
+                _fail("related_files_truncated is true but plan_status is not partial")
+            if not coverage_warning:
+                _fail("related_files_truncated is true but coverage_warning is false")
+            if ACTION_MANUAL_REVIEW_REQUIRED not in action_codes:
+                _fail("related_files_truncated is true but MANUAL_REVIEW_REQUIRED is missing")
+            if ACTION_RERUN_SECURITY_SCAN not in action_codes:
+                _fail("related_files_truncated is true but RERUN_SECURITY_SCAN is missing")
+            break
+
+    # 5. plan_status == "complete" constraints
+    if plan_status == "complete":
+        if has_partial_trigger:
+            _fail("complete plan_status but partial-trigger action present")
+        if groups_truncated:
+            _fail("complete plan_status but groups_truncated is true")
+        for g in repair_groups:
+            if g.get("related_files_truncated") is True:
+                _fail("complete plan_status but related_files_truncated is true")
+                break
+        if coverage_warning:
+            _fail("complete plan_status but coverage_warning is true")
+
+    # 6. plan_status == "partial" must have at least one verifiable reason
+    if plan_status == "partial":
+        has_files_truncated = any(
+            g.get("related_files_truncated") is True
+            for g in repair_groups
+        )
+        if not (has_partial_trigger or groups_truncated or has_files_truncated):
+            _fail("partial plan_status but no verifiable partial reason")
 
 
 def _serialize_summary(
@@ -1668,8 +1824,7 @@ def serialize_repair_plan(
     # Serialize groups first (rebuilt from policy)
     safe_groups = [_serialize_repair_group(g) for g in _groups]
 
-    # --- Validate truncation semantics at serialization boundary ---
-    # groups_truncated: strict read from input, then semantic validation
+    # --- Validate groups_truncated type at serialization boundary ---
     _raw_summary = repair_plan.get("summary", {})
     if not isinstance(_raw_summary, dict):
         _raw_summary = {}
@@ -1680,40 +1835,31 @@ def serialize_repair_plan(
             "groups_truncated is not a strict bool"
         )
 
-    if _input_groups_truncated:
-        _sg_action_codes = {g["action_code"] for g in safe_groups}
-        if ACTION_MANUAL_REVIEW_REQUIRED not in _sg_action_codes:
-            raise RepairPlanSerializationError(
-                "groups_truncated is true but MANUAL_REVIEW_REQUIRED is missing"
-            )
-        if ACTION_RERUN_SECURITY_SCAN not in _sg_action_codes:
-            raise RepairPlanSerializationError(
-                "groups_truncated is true but RERUN_SECURITY_SCAN is missing"
-            )
+    # --- Build safe summary for shared semantic validation ---
+    # coverage_warning is rebuilt from plan_status (NEVER trust input)
+    _safe_summary = _serialize_summary(
+        _raw_summary, safe_groups, plan_status
+    )
 
-    # related_files_truncated in any safe group: semantic validation
-    for g in safe_groups:
-        if g.get("related_files_truncated") is True:
-            if plan_status != "partial":
-                raise RepairPlanSerializationError(
-                    "related_files_truncated is true but plan_status is not partial"
-                )
-            _sg_action_codes = {g["action_code"] for g in safe_groups}
-            if ACTION_MANUAL_REVIEW_REQUIRED not in _sg_action_codes:
-                raise RepairPlanSerializationError(
-                    "related_files_truncated is true but MANUAL_REVIEW_REQUIRED is missing"
-                )
-            if ACTION_RERUN_SECURITY_SCAN not in _sg_action_codes:
-                raise RepairPlanSerializationError(
-                    "related_files_truncated is true but RERUN_SECURITY_SCAN is missing"
-                )
-            break
+    # --- Shared snapshot semantics validation ---
+    _validate_repair_snapshot_semantics(
+        plan_status=plan_status,
+        summary=_safe_summary,
+        repair_groups=safe_groups,
+        error_cls=RepairPlanSerializationError,
+    )
 
     # --- Rebuild agent_prompt from safe_groups (NEVER trust input) ---
     max_prompt_chars = max(1, int(settings.repair_max_agent_prompt_chars))
     safe_agent_prompt = _generate_agent_prompt(
         safe_groups, plan_status, max_prompt_chars
     )
+
+    # Defensive length check at serialization boundary
+    if len(safe_agent_prompt) > max_prompt_chars:
+        raise RepairPlanSerializationError(
+            "Serialized agent_prompt exceeds max_chars"
+        )
 
     # --- Rebuild verification_steps from safe_groups (NEVER trust input) ---
     has_blocking = any(
@@ -1729,9 +1875,7 @@ def serialize_repair_plan(
         "repair_scope": REPAIR_SCOPE,
         "task_id": task_id,
         "plan_status": plan_status,
-        "summary": _serialize_summary(
-            repair_plan.get("summary", {}), safe_groups, plan_status
-        ),
+        "summary": _safe_summary,
         "repair_groups": safe_groups,
         "verification_steps": safe_verification_steps,
         "agent_prompt": safe_agent_prompt,
@@ -2039,7 +2183,12 @@ def _validate_persisted_repair_plan(
     if not isinstance(repair_groups, list):
         raise RepairPlanInternalError("repair_groups is not a list")
 
-    # Recalculate summary from groups
+    # --- 5a. Validate ALL elements are dicts BEFORE any field access ---
+    for g in repair_groups:
+        if not isinstance(g, dict):
+            raise RepairPlanInternalError("repair_group is not a dict")
+
+    # Now safe to compute summary from groups — all elements are dicts
     actual_total = len(repair_groups)
     actual_blocking = sum(
         1 for g in repair_groups if g.get("blocking") is True
@@ -2073,6 +2222,7 @@ def _validate_persisted_repair_plan(
     }
 
     for idx, g in enumerate(repair_groups):
+        # Type already validated above, but keep defensive check
         if not isinstance(g, dict):
             raise RepairPlanInternalError("repair_group is not a dict")
         if set(g.keys()) != _expected_group_fields:
@@ -2176,7 +2326,8 @@ def _validate_persisted_repair_plan(
                 "related_rule_ids not in sorted order"
             )
 
-        # related_files: safe repo-relative path list
+        # related_files: safe repo-relative path list — must be
+        # normalized: no empty strings, no duplicates, sorted.
         related_files = g["related_files"]
         if not isinstance(related_files, list):
             raise RepairPlanInternalError("related_files is not a list")
@@ -2185,11 +2336,21 @@ def _validate_persisted_repair_plan(
                 raise RepairPlanInternalError(
                     "related_files contains non-string"
                 )
+            # Reject empty strings
+            if not fp:
+                raise RepairPlanInternalError(
+                    "related_files contains empty string"
+                )
             # Re-validate each path — must pass _sanitize_file_path unchanged
             if _sanitize_file_path(fp) != fp:
                 raise RepairPlanInternalError(
                     "related_files contains unsafe path"
                 )
+        # Must be deduplicated and sorted (deterministic order)
+        if related_files != sorted(set(related_files)):
+            raise RepairPlanInternalError(
+                "related_files not normalized (duplicates or unsorted)"
+            )
 
         # total_related_files: non-negative int, reject bool
         total_related_files = g["total_related_files"]
@@ -2275,26 +2436,10 @@ def _validate_persisted_repair_plan(
                 "verification_steps do not match frozen policy"
             )
 
-    # --- 5b. Action-based partial consistency ---
-    # Compute action_codes set from repair_groups
+    # --- 5b. Shared snapshot semantics validation ---
+    # Replaces inline action-based and truncation checks with the
+    # shared function used by both serialization and read boundaries.
     action_codes = {g["action_code"] for g in repair_groups}
-
-    # If any partial-trigger action exists, plan_status must be "partial"
-    # and coverage_warning must be True
-    _partial_trigger_actions = {
-        ACTION_MANUAL_REVIEW_REQUIRED,
-        ACTION_REVIEW_SCAN_COVERAGE,
-        ACTION_RESOLVE_SCAN_ERROR,
-    }
-    if action_codes & _partial_trigger_actions:
-        if plan_status != "partial":
-            raise RepairPlanInternalError(
-                "partial-trigger action present but plan_status is not partial"
-            )
-        if not coverage_warning:
-            raise RepairPlanInternalError(
-                "partial-trigger action present but coverage_warning is false"
-            )
 
     # manual_review_required must strictly equal
     # (ACTION_MANUAL_REVIEW_REQUIRED in action_codes)
@@ -2305,54 +2450,18 @@ def _validate_persisted_repair_plan(
             "manual_review_required does not match action_codes"
         )
 
-    # --- 5c. Truncation semantics ---
-    # groups_truncated == True requires:
-    #   plan_status == "partial"
-    #   coverage_warning == True
-    #   MANUAL_REVIEW_REQUIRED present
-    #   RERUN_SECURITY_SCAN present
-    if groups_truncated:
-        if plan_status != "partial":
-            raise RepairPlanInternalError(
-                "groups_truncated is true but plan_status is not partial"
-            )
-        if not coverage_warning:
-            raise RepairPlanInternalError(
-                "groups_truncated is true but coverage_warning is false"
-            )
-        if ACTION_MANUAL_REVIEW_REQUIRED not in action_codes:
-            raise RepairPlanInternalError(
-                "groups_truncated is true but MANUAL_REVIEW_REQUIRED is missing"
-            )
-        if ACTION_RERUN_SECURITY_SCAN not in action_codes:
-            raise RepairPlanInternalError(
-                "groups_truncated is true but RERUN_SECURITY_SCAN is missing"
-            )
-
-    # related_files_truncated == True in any group requires:
-    #   plan_status == "partial"
-    #   coverage_warning == True
-    #   MANUAL_REVIEW_REQUIRED present
-    #   RERUN_SECURITY_SCAN present
-    for g in repair_groups:
-        if g.get("related_files_truncated") is True:
-            if plan_status != "partial":
-                raise RepairPlanInternalError(
-                    "related_files_truncated is true but plan_status is not partial"
-                )
-            if not coverage_warning:
-                raise RepairPlanInternalError(
-                    "related_files_truncated is true but coverage_warning is false"
-                )
-            if ACTION_MANUAL_REVIEW_REQUIRED not in action_codes:
-                raise RepairPlanInternalError(
-                    "related_files_truncated is true but MANUAL_REVIEW_REQUIRED is missing"
-                )
-            if ACTION_RERUN_SECURITY_SCAN not in action_codes:
-                raise RepairPlanInternalError(
-                    "related_files_truncated is true but RERUN_SECURITY_SCAN is missing"
-                )
-            break
+    # Shared semantic validation (coverage_warning, partial-trigger,
+    # groups_truncated, related_files_truncated, complete/partial
+    # constraints — all in one function)
+    _validate_repair_snapshot_semantics(
+        plan_status=plan_status,
+        summary={
+            "coverage_warning": coverage_warning,
+            "groups_truncated": groups_truncated,
+        },
+        repair_groups=repair_groups,
+        error_cls=RepairPlanInternalError,
+    )
 
     # --- 6. verification_steps (strict equality with rebuilt value) ---
     verification_steps = result["verification_steps"]
@@ -2609,7 +2718,17 @@ def get_repair_result(task_id: str) -> Optional[dict]:
         raise RepairPlanInternalError("Repair plan JSON is not a dict")
 
     # --- Strict validation of all fields ---
-    return _validate_persisted_repair_plan(result, task_id, db_columns)
+    # Wrap in try-except to catch any AttributeError, TypeError,
+    # KeyError, or ValueError from corrupted input that escapes
+    # the explicit checks. Convert ALL to RepairPlanInternalError.
+    try:
+        return _validate_persisted_repair_plan(result, task_id, db_columns)
+    except RepairPlanInternalError:
+        raise
+    except (AttributeError, TypeError, KeyError, ValueError) as exc:
+        raise RepairPlanInternalError(
+            "Corrupted repair plan data rejected by validation"
+        ) from exc
 
 
 def get_repair_plan_available(task_id: str) -> bool:
