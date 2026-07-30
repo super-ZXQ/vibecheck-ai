@@ -272,7 +272,7 @@ def sanitize_prompt_metadata(value: Any, field_name: str) -> str:
 
 
 def _sanitize_file_path(value: Any) -> str:
-    """Sanitize a file path for safe display.
+    """Sanitize and normalize a file path for safe display.
 
     Only allows repo-relative paths. Rejects:
     - Absolute paths (POSIX, Windows drive, UNC, rooted)
@@ -285,6 +285,18 @@ def _sanitize_file_path(value: Any) -> str:
     Any control character or backtick causes the path to be replaced
     with <redacted-path> to prevent prompt injection via newlines,
     text direction manipulation, or Markdown escaping.
+
+    After safety checks, the path is normalized to the canonical
+    repository-relative format:
+    - Backslashes unified to /
+    - Single . path segments removed
+    - Consecutive // collapsed to single /
+    - Empty result after normalization → <redacted-path>
+
+    Examples:
+        src\\config.py       → src/config.py
+        ./src/config.py      → src/config.py
+        src//config.py       → src/config.py
     """
     s = _strict_str(value)
     s = mask_untrusted_text(s)
@@ -307,11 +319,16 @@ def _sanitize_file_path(value: Any) -> str:
         return _REDACTED_PATH
     if _USER_HOME_RE.match(s):
         return _REDACTED_PATH
+    # Normalize to canonical repository-relative format
     normalized = s.replace('\\', '/')
     parts = normalized.split('/')
     if '..' in parts:
         return _REDACTED_PATH
-    return s
+    # Remove single '.' segments and empty strings from splitting '//'
+    normalized_parts = [p for p in parts if p and p != '.']
+    if not normalized_parts:
+        return _REDACTED_PATH
+    return '/'.join(normalized_parts)
 
 
 # --- Path removal from text ---
@@ -1568,10 +1585,27 @@ def _serialize_repair_group(group: dict) -> dict:
             "related_files_truncated inconsistent with counts"
         )
 
-    # --- Normalize related_files: sanitize, remove empty, deduplicate, sort ---
-    _sanitized = [_sanitize_file_path(f) for f in _related_files]
-    _non_empty = [fp for fp in _sanitized if fp]
-    _normalized = sorted(set(_non_empty))
+    # --- Normalize related_files: sanitize, reject empty, deduplicate, sort ---
+    # Each element must be a non-empty string that sanitizes to a non-empty
+    # normalized path. Empty strings are REJECTED, not silently deleted —
+    # silent deletion would lose Finding positions.
+    _sanitized: list[str] = []
+    for f in _related_files:
+        if not isinstance(f, str):
+            raise RepairPlanSerializationError(
+                "related_files contains non-string value"
+            )
+        if not f:
+            raise RepairPlanSerializationError(
+                "related_files contains empty string"
+            )
+        sanitized = _sanitize_file_path(f)
+        if not sanitized:
+            raise RepairPlanSerializationError(
+                "related_files contains path that sanitizes to empty"
+            )
+        _sanitized.append(sanitized)
+    _normalized = sorted(set(_sanitized))
 
     # Recompute counts from the normalized list.
     # If input was not truncated, adjust total to match normalized count
@@ -1614,6 +1648,79 @@ def _serialize_repair_group(group: dict) -> dict:
             _safe_masked_desc(s) for s in action.verification_steps
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# --- Shared snapshot identity validation ---
+# ---------------------------------------------------------------------------
+
+def _validate_repair_snapshot_identity(
+    *,
+    task_id: Any,
+    source_scan_updated_at: Any,
+    source_assessment_updated_at: Any,
+    source_assessment_policy_version: Any,
+    created_at: Any,
+    updated_at: Any,
+    error_cls: type[Exception],
+) -> None:
+    """Shared top-level identity and version chain validation.
+
+    Used by BOTH the serialization boundary and the read validation
+    boundary to enforce identical rules on identity fields.
+
+    Invariants enforced:
+    1. task_id: must be a non-empty str with no control characters.
+       No implicit str conversion allowed.
+    2. source_scan_updated_at, source_assessment_updated_at,
+       created_at, updated_at: must each be a non-empty str.
+       Rejects None, bool, int, float, list, dict, empty string.
+    3. source_assessment_policy_version: must be a non-empty str AND
+       is_supported_assessment_policy(...) must return True.
+
+    Args:
+        error_cls: The exception class to raise on validation failure.
+            RepairPlanSerializationError at serialization time,
+            RepairPlanInternalError at read time.
+
+    Raises:
+        error_cls: If any invariant is violated.
+    """
+    def _fail(msg: str) -> None:
+        raise error_cls(msg)
+
+    def _validate_non_empty_str(
+        value: Any, field_name: str
+    ) -> None:
+        """Strict validation: must be exactly str (not bool/int/etc)
+        and non-empty. No implicit conversion."""
+        if type(value) is not str:
+            _fail(f"{field_name} is not a str")
+        if not value:
+            _fail(f"{field_name} is empty")
+
+    # 1. task_id: strict str, non-empty, no control characters
+    _validate_non_empty_str(task_id, "task_id")
+    if _has_forbidden_unicode(task_id):
+        _fail("task_id contains control characters")
+
+    # 2. Non-empty str fields
+    _validate_non_empty_str(
+        source_scan_updated_at, "source_scan_updated_at"
+    )
+    _validate_non_empty_str(
+        source_assessment_updated_at, "source_assessment_updated_at"
+    )
+    _validate_non_empty_str(created_at, "created_at")
+    _validate_non_empty_str(updated_at, "updated_at")
+
+    # 3. source_assessment_policy_version: non-empty str + supported
+    _validate_non_empty_str(
+        source_assessment_policy_version,
+        "source_assessment_policy_version",
+    )
+    if not is_supported_assessment_policy(source_assessment_policy_version):
+        _fail("source_assessment_policy_version is not supported")
 
 
 # ---------------------------------------------------------------------------
@@ -1792,7 +1899,7 @@ def serialize_repair_plan(
     source_scan_updated_at: str,
     source_assessment_updated_at: str,
     source_assessment_policy_version: str,
-    created_at: Optional[str],
+    created_at: str,
     updated_at: str,
 ) -> dict:
     """Explicit serialization boundary for RepairPlan.
@@ -1800,13 +1907,43 @@ def serialize_repair_plan(
     Constructs the safe dict that gets persisted as repair_json.
     Forces identity fields from policy constants. Enforces strict
     field whitelists and defensive desensitization.
-    
+
     Source version chain fields are taken from AUTHORITATIVE parameters,
     NOT from the repair_plan dict. This ensures JSON and database
     columns always match.
+
+    Identity validation order:
+    1. Strict type validation (must be exact str, no implicit conversion)
+    2. Non-empty validation
+    3. Policy validation (supported assessment policy version)
+    4. Safe masking (mask_untrusted_text)
+    5. Save to output dict
+
+    created_at MUST be a non-empty str — the persistence layer resolves
+    it to the final timestamp before calling this function.
     """
     if not isinstance(repair_plan, dict):
         raise RepairPlanSerializationError("Repair plan must be a dict")
+
+    # --- Validate top-level identity fields BEFORE any processing ---
+    # Strict type → non-empty → policy → safe mask
+    _validate_repair_snapshot_identity(
+        task_id=task_id,
+        source_scan_updated_at=source_scan_updated_at,
+        source_assessment_updated_at=source_assessment_updated_at,
+        source_assessment_policy_version=source_assessment_policy_version,
+        created_at=created_at,
+        updated_at=updated_at,
+        error_cls=RepairPlanSerializationError,
+    )
+
+    # Apply safe masking AFTER validation passes
+    safe_task_id = _safe_masked_str(task_id)
+    safe_source_scan = _safe_masked_str(source_scan_updated_at)
+    safe_source_assess = _safe_masked_str(source_assessment_updated_at)
+    safe_source_policy = _safe_masked_str(source_assessment_policy_version)
+    safe_created_at = _safe_masked_str(created_at)
+    safe_updated_at = _safe_masked_str(updated_at)
 
     _groups = repair_plan.get("repair_groups", [])
     if not isinstance(_groups, list):
@@ -1873,22 +2010,18 @@ def serialize_repair_plan(
         "schema_version": REPAIR_SCHEMA_VERSION,
         "policy_version": POLICY_VERSION,
         "repair_scope": REPAIR_SCOPE,
-        "task_id": task_id,
+        "task_id": safe_task_id,
         "plan_status": plan_status,
         "summary": _safe_summary,
         "repair_groups": safe_groups,
         "verification_steps": safe_verification_steps,
         "agent_prompt": safe_agent_prompt,
-        # Source fields from AUTHORITATIVE parameters only
-        "source_scan_updated_at": _safe_masked_str(source_scan_updated_at),
-        "source_assessment_updated_at": _safe_masked_str(
-            source_assessment_updated_at
-        ),
-        "source_assessment_policy_version": _safe_masked_str(
-            source_assessment_policy_version
-        ),
-        "created_at": created_at,
-        "updated_at": updated_at,
+        # Source fields from AUTHORITATIVE parameters, validated + masked
+        "source_scan_updated_at": safe_source_scan,
+        "source_assessment_updated_at": safe_source_assess,
+        "source_assessment_policy_version": safe_source_policy,
+        "created_at": safe_created_at,
+        "updated_at": safe_updated_at,
     }
 
 
@@ -1970,6 +2103,8 @@ def save_repair_result(
             )
 
         # Execute upsert and commit
+        # Use safe_plan's final validated+masked fields for DB columns
+        # to ensure JSON and DB column consistency.
         conn.execute(
             """INSERT INTO repair_results
                (task_id, schema_version, policy_version, repair_scope,
@@ -1992,7 +2127,7 @@ def save_repair_result(
                    source_assessment_policy_version=excluded.source_assessment_policy_version,
                    updated_at=excluded.updated_at""",
             (
-                task_id,
+                safe_plan["task_id"],
                 safe_plan["schema_version"],
                 safe_plan["policy_version"],
                 safe_plan["repair_scope"],
@@ -2000,11 +2135,11 @@ def save_repair_result(
                 safe_plan["plan_status"],
                 safe_plan["summary"]["total_repair_groups"],
                 safe_plan["summary"]["blocking_repair_groups"],
-                source_scan_updated_at,
-                source_assessment_updated_at,
-                source_assessment_policy_version,
-                created_at,
-                now,
+                safe_plan["source_scan_updated_at"],
+                safe_plan["source_assessment_updated_at"],
+                safe_plan["source_assessment_policy_version"],
+                safe_plan["created_at"],
+                safe_plan["updated_at"],
             ),
         )
         conn.commit()
@@ -2531,41 +2666,23 @@ def _validate_persisted_repair_plan(
                 "agent_prompt contains forbidden pattern"
             )
 
-    # --- 8. Source version chain fields (strict type + value validation) ---
+    # --- 8. Source version chain and identity fields ---
+    # Use shared identity validation — same rules as serialization boundary.
     source_scan_updated_at = result["source_scan_updated_at"]
-    if not isinstance(source_scan_updated_at, str) or not source_scan_updated_at:
-        raise RepairPlanInternalError(
-            "source_scan_updated_at is not a non-empty str"
-        )
-
     source_assessment_updated_at = result["source_assessment_updated_at"]
-    if not isinstance(source_assessment_updated_at, str) or not source_assessment_updated_at:
-        raise RepairPlanInternalError(
-            "source_assessment_updated_at is not a non-empty str"
-        )
-
     source_policy = result["source_assessment_policy_version"]
-    if not isinstance(source_policy, str) or not source_policy:
-        raise RepairPlanInternalError(
-            "source_assessment_policy_version is not a non-empty str"
-        )
-    if not is_supported_assessment_policy(source_policy):
-        raise RepairPlanInternalError(
-            "source_assessment_policy_version is not supported"
-        )
-
-    # --- 8b. Time fields (strict non-empty str, reject int/bool/float/list/dict/None) ---
     created_at = result["created_at"]
-    if not isinstance(created_at, str) or not created_at:
-        raise RepairPlanInternalError(
-            "created_at is not a non-empty str"
-        )
-
     updated_at = result["updated_at"]
-    if not isinstance(updated_at, str) or not updated_at:
-        raise RepairPlanInternalError(
-            "updated_at is not a non-empty str"
-        )
+
+    _validate_repair_snapshot_identity(
+        task_id=result_task_id,
+        source_scan_updated_at=source_scan_updated_at,
+        source_assessment_updated_at=source_assessment_updated_at,
+        source_assessment_policy_version=source_policy,
+        created_at=created_at,
+        updated_at=updated_at,
+        error_cls=RepairPlanInternalError,
+    )
 
     # --- 9. JSON and DB redundant column consistency (with strict types) ---
     # DB columns must also pass strict type validation
@@ -2587,35 +2704,20 @@ def _validate_persisted_repair_plan(
             "DB blocking_repair_groups is not a strict int"
         )
 
-    db_scan_updated = db_columns["source_scan_updated_at"]
-    if not isinstance(db_scan_updated, str) or not db_scan_updated:
-        raise RepairPlanInternalError(
-            "DB source_scan_updated_at is not a non-empty str"
-        )
-
-    db_assess_updated = db_columns["source_assessment_updated_at"]
-    if not isinstance(db_assess_updated, str) or not db_assess_updated:
-        raise RepairPlanInternalError(
-            "DB source_assessment_updated_at is not a non-empty str"
-        )
-
-    db_assess_pv = db_columns["source_assessment_policy_version"]
-    if not isinstance(db_assess_pv, str) or not db_assess_pv:
-        raise RepairPlanInternalError(
-            "DB source_assessment_policy_version is not a non-empty str"
-        )
-
-    db_created = db_columns["created_at"]
-    if not isinstance(db_created, str) or not db_created:
-        raise RepairPlanInternalError(
-            "DB created_at is not a non-empty str"
-        )
-
-    db_updated = db_columns["updated_at"]
-    if not isinstance(db_updated, str) or not db_updated:
-        raise RepairPlanInternalError(
-            "DB updated_at is not a non-empty str"
-        )
+    # DB identity columns validated via the SAME shared function used by
+    # the serialization boundary and JSON field validation above.
+    # This ensures both boundaries enforce identical rules: strict str
+    # type, non-empty, no control characters (task_id), and supported
+    # policy version (source_assessment_policy_version).
+    _validate_repair_snapshot_identity(
+        task_id=db_columns["task_id"],
+        source_scan_updated_at=db_columns["source_scan_updated_at"],
+        source_assessment_updated_at=db_columns["source_assessment_updated_at"],
+        source_assessment_policy_version=db_columns["source_assessment_policy_version"],
+        created_at=db_columns["created_at"],
+        updated_at=db_columns["updated_at"],
+        error_cls=RepairPlanInternalError,
+    )
 
     # Value consistency between JSON and DB
     if total_repair_groups != db_total:
@@ -2626,21 +2728,21 @@ def _validate_persisted_repair_plan(
         raise RepairPlanInternalError(
             "blocking_repair_groups JSON/DB mismatch"
         )
-    if source_scan_updated_at != db_scan_updated:
+    if source_scan_updated_at != db_columns["source_scan_updated_at"]:
         raise RepairPlanInternalError(
             "source_scan_updated_at JSON/DB mismatch"
         )
-    if source_assessment_updated_at != db_assess_updated:
+    if source_assessment_updated_at != db_columns["source_assessment_updated_at"]:
         raise RepairPlanInternalError(
             "source_assessment_updated_at JSON/DB mismatch"
         )
-    if source_policy != db_assess_pv:
+    if source_policy != db_columns["source_assessment_policy_version"]:
         raise RepairPlanInternalError(
             "source_assessment_policy_version JSON/DB mismatch"
         )
-    if created_at != db_created:
+    if created_at != db_columns["created_at"]:
         raise RepairPlanInternalError("created_at JSON/DB mismatch")
-    if updated_at != db_updated:
+    if updated_at != db_columns["updated_at"]:
         raise RepairPlanInternalError("updated_at JSON/DB mismatch")
 
     return result
@@ -2665,7 +2767,7 @@ def get_repair_result(task_id: str) -> Optional[dict]:
         init_db()
         conn = _get_connection()
         row = conn.execute(
-            "SELECT repair_json, plan_status, total_repair_groups, "
+            "SELECT task_id, repair_json, plan_status, total_repair_groups, "
             "blocking_repair_groups, source_scan_updated_at, "
             "source_assessment_updated_at, "
             "source_assessment_policy_version, "
@@ -2677,6 +2779,7 @@ def get_repair_result(task_id: str) -> Optional[dict]:
             return None
         raw_json = row["repair_json"]
         db_columns = {
+            "task_id": row["task_id"],
             "plan_status": row["plan_status"],
             "total_repair_groups": row["total_repair_groups"],
             "blocking_repair_groups": row["blocking_repair_groups"],
