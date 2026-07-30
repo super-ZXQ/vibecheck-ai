@@ -15,6 +15,7 @@ import { useEffect, useRef } from "react";
 
 import { CheckProgress } from "@/components/CheckProgress";
 import { ErrorState } from "@/components/ErrorState";
+import { RepairPlan } from "@/components/RepairPlan";
 import { ResultTabs } from "@/components/ResultTabs";
 import { ScoreSummary } from "@/components/ScoreSummary";
 import { useCheckTask } from "@/hooks/use-check-task";
@@ -105,6 +106,7 @@ export default function CheckPage({ params }: CheckPageProps) {
           assessmentStatus={hook.assessmentStatus}
           repairPlan={hook.repairPlan}
           repairPlanStatus={hook.repairPlanStatus}
+          renderRepairPlan={(plan) => <RepairPlan plan={plan} />}
         />
       </main>
     );
