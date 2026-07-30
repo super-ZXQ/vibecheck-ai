@@ -15,6 +15,8 @@ import { useEffect, useRef } from "react";
 
 import { CheckProgress } from "@/components/CheckProgress";
 import { ErrorState } from "@/components/ErrorState";
+import { ResultTabs } from "@/components/ResultTabs";
+import { ScoreSummary } from "@/components/ScoreSummary";
 import { useCheckTask } from "@/hooks/use-check-task";
 
 // UUID v4 format validation (case-insensitive)
@@ -92,13 +94,18 @@ export default function CheckPage({ params }: CheckPageProps) {
 
   // --- Completed ---
   if (state === "completed") {
-    // Phase 4 will replace this with full results display
     return (
       <main className="container">
         <h1 className="page-title">检测结果</h1>
-        <div className="card">
-          <p>检测已完成。结果加载完毕。</p>
-        </div>
+        {taskStatus && <ScoreSummary taskStatus={taskStatus} />}
+        <ResultTabs
+          scanResult={hook.scanResult}
+          scanResultStatus={hook.scanResultStatus}
+          assessment={hook.assessment}
+          assessmentStatus={hook.assessmentStatus}
+          repairPlan={hook.repairPlan}
+          repairPlanStatus={hook.repairPlanStatus}
+        />
       </main>
     );
   }
