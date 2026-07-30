@@ -93,6 +93,8 @@ class TaskStatusResponse(BaseModel):
     security_score: int | None = None
     security_verdict: str | None = None
     assessment_url: str | None = None
+    repair_plan_available: bool | None = None
+    repair_plan_url: str | None = None
 
 
 # --- Fixed safe empty response for failed tasks without results ---

@@ -30,6 +30,7 @@ STAGE_DOWNLOADING = "downloading"
 STAGE_EXTRACTING = "extracting"
 STAGE_SCANNING = "scanning"
 STAGE_ASSESSING = "assessing"
+STAGE_REPAIRING = "repairing"
 STAGE_FINISHED = "finished"
 
 
@@ -136,6 +137,22 @@ class TaskRecord:
                 resp["security_score"] = None
                 resp["security_verdict"] = None
                 resp["assessment_url"] = None
+
+            # Include lightweight repair plan availability (P0-7)
+            # Reads ONLY the task_id column from repair_results —
+            # does NOT parse the full repair_json.
+            # For tasks without a persisted repair plan (e.g. legacy
+            # P0-6 tasks), repair_plan_available is False and
+            # repair_plan_url is None.
+            from app.services.repair_service import get_repair_plan_available
+            repair_available = get_repair_plan_available(self.id)
+            resp["repair_plan_available"] = repair_available
+            if repair_available:
+                resp["repair_plan_url"] = (
+                    f"/api/check/{self.id}/repair-plan"
+                )
+            else:
+                resp["repair_plan_url"] = None
         return resp
 
 

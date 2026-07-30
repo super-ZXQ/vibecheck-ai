@@ -1,13 +1,13 @@
-"""Background task runner — processes download + extract + scan + assess sequentially.
+"""Background task runner — processes download + extract + scan + assess + repair sequentially.
 
 Concurrency model (MVP):
 - Only 1 task runs at a time (global asyncio.Lock).
 - Pending tasks wait in the SQLite queue.
 - After each task completes, the next pending task is automatically picked up.
 
-Pipeline stages (P0-6):
+Pipeline stages (P0-7):
   download → extract → scan → persist scan result → assess → persist
-  assessment → completed → cleanup
+  assessment → generate repair plan → persist repair plan → completed → cleanup
 
 Error handling:
 - All errors are mapped to machine-readable error codes.
@@ -19,22 +19,26 @@ Error handling:
 - Oversized scan results are caught and mapped to SCAN_RESULT_TOO_LARGE.
 - Assessment exceptions are caught and mapped to ASSESSMENT_INTERNAL_ERROR
   or ASSESSMENT_PERSIST_FAILED or ASSESSMENT_RESULT_TOO_LARGE.
+- Repair plan exceptions are caught and mapped to REPAIR_PLAN_INTERNAL_ERROR
+  or REPAIR_PLAN_PERSIST_FAILED or REPAIR_PLAN_TOO_LARGE.
 - Logs never contain str(exc), repr(exc), repo content, or absolute paths.
 
-Non-blocking I/O (P0-5/P0-6):
-- scan_directory, save_scan_result, and run_assessment are synchronous,
-  CPU/IO-bound operations. They are executed via asyncio.to_thread so
-  the FastAPI event loop stays responsive.
+Non-blocking I/O (P0-5/P0-6/P0-7):
+- scan_directory, save_scan_result, run_assessment, and
+  generate_and_save_repair_plan are synchronous, CPU/IO-bound operations.
+  They are executed via asyncio.to_thread so the FastAPI event loop
+  stays responsive.
 - No asyncio.wait_for or hard timeout — relies on P0-4 built-in limits.
 - Cleanup (temp file deletion) only runs AFTER the thread completes,
   guaranteed by await on asyncio.to_thread.
 
-Assessment boundary (P0-6):
-- Assessment reads ONLY from persisted scan_results (never from temp).
-- Assessment must succeed BEFORE mark_completed.
-- If assessment fails, the task is marked failed — even if scan_results
-  was already persisted. The failed task's assessment API will NOT
-  return residual assessment data.
+Repair plan boundary (P0-7):
+- Repair plan reads ONLY from persisted scan_results and
+  assessment_results (never from temp directory or memory).
+- Repair plan must succeed BEFORE mark_completed.
+- If repair plan generation fails, the task is marked failed — even if
+  scan_results and assessment_results were already persisted.
+  The failed task's repair plan API will NOT return residual data.
 """
 
 import asyncio
@@ -52,6 +56,9 @@ from app.core.error_codes import (
     GITHUB_RATE_LIMITED,
     INTERNAL_ERROR,
     PRIVATE_REPOSITORY,
+    REPAIR_PLAN_INTERNAL_ERROR,
+    REPAIR_PLAN_PERSIST_FAILED,
+    REPAIR_PLAN_TOO_LARGE,
     REPOSITORY_NOT_FOUND,
     UNSAFE_ARCHIVE,
     CLEANUP_FAILED,
@@ -77,11 +84,18 @@ from app.services.assessment_service import (
     AssessmentResultTooLargeError,
     run_assessment,
 )
+from app.services.repair_service import (
+    RepairPlanInternalError,
+    RepairPlanPersistError,
+    RepairPlanTooLargeError,
+    generate_and_save_repair_plan,
+)
 from app.services.scan_result_service import save_scan_result, ScanResultTooLargeError
 from app.services.task_manager import (
     STAGE_ASSESSING,
     STAGE_DOWNLOADING,
     STAGE_EXTRACTING,
+    STAGE_REPAIRING,
     STAGE_SCANNING,
     mark_running,
     mark_completed,
@@ -120,7 +134,7 @@ def _map_extraction_error(error: ExtractionError) -> tuple[str, str]:
 
 
 async def _process_task(task_id: str) -> None:
-    """Process a single task: download → extract → scan → assess → complete.
+    """Process a single task: download → extract → scan → assess → repair → complete.
 
     Pipeline:
     1. Download tarball from GitHub.
@@ -128,11 +142,14 @@ async def _process_task(task_id: str) -> None:
     3. Scan extracted directory with P0-4 scanner.
     4. Persist scan result to scan_results table.
     5. Assess: read persisted scan result, compute score, persist assessment.
-    6. Mark task as completed (only after successful assessment persistence).
+    6. Generate repair plan: read persisted scan and assessment, compute
+       deterministic repair plan, persist to repair_results.
+    7. Mark task as completed (only after successful repair plan persistence).
 
     On any failure, marks the task as failed with a desensitized error.
     Temp files are always cleaned up via try/finally — in success, scan
-    failure, persistence failure, and assessment failure paths.
+    failure, persistence failure, assessment failure, and repair plan
+    failure paths.
     """
     download_result = None
     extract_dest = None
@@ -304,11 +321,82 @@ async def _process_task(task_id: str) -> None:
             )
             return
 
-        # --- Stage 6: Complete with summary ---
-        # Only reached after scan result AND assessment are successfully
-        # persisted. The scan_summary is fetched from scan_results by
-        # to_response(). The security_score and security_verdict are
-        # fetched from assessment_results by to_response().
+        # --- Stage 6: Generate repair plan ---
+        # Repair plan reads ONLY from the persisted scan_results and
+        # assessment_results tables (never from temp directory or memory).
+        # It computes a deterministic repair plan and persists it to
+        # repair_results.
+        # generate_and_save_repair_plan is synchronous (CPU/IO-bound).
+        # Run it in a thread via asyncio.to_thread so the event loop
+        # stays responsive.
+        # Repair plan MUST succeed before mark_completed — if it fails,
+        # the task is marked failed even though scan_results and
+        # assessment_results were already persisted.
+        # The failed task's repair plan API will NOT return residual data.
+        mark_running(task_id, STAGE_REPAIRING, 95)
+        try:
+            await asyncio.to_thread(
+                generate_and_save_repair_plan,
+                task_id,
+            )
+        except RepairPlanTooLargeError as e:
+            # Serialized repair_json exceeded repair_max_json_bytes.
+            # Log only the exception type — never str(exc) or DB details.
+            logger.error(
+                "Repair plan too large for task %s: %s",
+                task_id, type(e).__name__,
+            )
+            mark_failed(
+                task_id, REPAIR_PLAN_TOO_LARGE,
+                get_error_message(REPAIR_PLAN_TOO_LARGE),
+            )
+            return
+        except RepairPlanInternalError as e:
+            # Reading or parsing the persisted scan/assessment failed,
+            # consistency validation failed, or repair plan computation
+            # failed.
+            # Log only the exception type — never str(exc) or stack traces.
+            logger.error(
+                "Repair plan internal error for task %s: %s",
+                task_id, type(e).__name__,
+            )
+            mark_failed(
+                task_id, REPAIR_PLAN_INTERNAL_ERROR,
+                get_error_message(REPAIR_PLAN_INTERNAL_ERROR),
+            )
+            return
+        except RepairPlanPersistError as e:
+            # SQLite repair_results write failed.
+            # Log only the exception type — never str(exc) or DB errors.
+            logger.error(
+                "Repair plan persistence failed for task %s: %s",
+                task_id, type(e).__name__,
+            )
+            mark_failed(
+                task_id, REPAIR_PLAN_PERSIST_FAILED,
+                get_error_message(REPAIR_PLAN_PERSIST_FAILED),
+            )
+            return
+        except Exception as e:
+            # Catch-all for any unexpected error not covered above.
+            # Log only the exception type — never str(exc) or DB errors.
+            logger.error(
+                "Repair plan failed for task %s: %s",
+                task_id, type(e).__name__,
+            )
+            mark_failed(
+                task_id, REPAIR_PLAN_INTERNAL_ERROR,
+                get_error_message(REPAIR_PLAN_INTERNAL_ERROR),
+            )
+            return
+
+        # --- Stage 7: Complete with summary ---
+        # Only reached after scan result, assessment, AND repair plan are
+        # successfully persisted. The scan_summary is fetched from
+        # scan_results by to_response(). The security_score and
+        # security_verdict are fetched from assessment_results by
+        # to_response(). The repair_plan_available and repair_plan_url
+        # are fetched from repair_results by to_response().
         mark_completed(
             task_id,
             file_count=extract_result.file_count,
