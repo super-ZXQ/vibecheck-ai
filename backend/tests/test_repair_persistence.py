@@ -478,7 +478,7 @@ class TestRepairPersistence:
         safe = serialize_repair_plan(
             task_id, plan,
             "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "p0-6-v1",
-            None, "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z",
         )
         safe[field] = value
         _insert_raw_repair_row(task_id, json.dumps(safe, ensure_ascii=False))
@@ -506,21 +506,21 @@ class TestRepairPersistence:
             serialize_repair_plan(
                 "task-1", "not-a-dict",
                 "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "p0-6-v1",
-                None, "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z",
             )
 
         with pytest.raises(RepairPlanSerializationError):
             serialize_repair_plan(
                 "task-1", ["list", "not", "dict"],
                 "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "p0-6-v1",
-                None, "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z",
             )
 
         with pytest.raises(RepairPlanSerializationError):
             serialize_repair_plan(
                 "task-1", None,
                 "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "p0-6-v1",
-                None, "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z",
             )
 
     # --- 18. Serialize boundary rejects invalid plan_status ---
@@ -532,7 +532,7 @@ class TestRepairPersistence:
             serialize_repair_plan(
                 "task-1", plan,
                 "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "p0-6-v1",
-                None, "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z",
             )
 
         plan2 = _make_repair_plan(task_id="task-1")
@@ -541,7 +541,7 @@ class TestRepairPersistence:
             serialize_repair_plan(
                 "task-1", plan2,
                 "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "p0-6-v1",
-                None, "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z",
             )
 
     # --- 19. Serialize boundary rejects non-list repair_groups ---
@@ -553,7 +553,7 @@ class TestRepairPersistence:
             serialize_repair_plan(
                 "task-1", plan,
                 "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "p0-6-v1",
-                None, "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z",
             )
 
         plan2 = _make_repair_plan(task_id="task-1")
@@ -562,7 +562,7 @@ class TestRepairPersistence:
             serialize_repair_plan(
                 "task-1", plan2,
                 "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "p0-6-v1",
-                None, "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z",
             )
 
         # verification_steps is now REBUILT from policy — non-list input
@@ -572,7 +572,7 @@ class TestRepairPersistence:
         safe = serialize_repair_plan(
             "task-1", plan3,
             "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "p0-6-v1",
-            None, "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z",
         )
         assert isinstance(safe["verification_steps"], list)
         assert all(isinstance(s, str) for s in safe["verification_steps"])
@@ -598,7 +598,7 @@ class TestRepairPersistence:
         safe = serialize_repair_plan(
             "task-1", plan,
             "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "p0-6-v1",
-            None, "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z",
         )
         serialized = json.dumps(safe, ensure_ascii=False)
 
