@@ -39,6 +39,9 @@ from app.services.repair_service import (
     RepairPlanSerializationError,
     _generate_agent_prompt,
     _validate_repair_snapshot_semantics,
+    _validate_repair_snapshot_identity,
+    _validate_persisted_repair_plan,
+    _sanitize_file_path,
 )
 from app.services.task_manager import create_task, mark_completed
 
@@ -750,9 +753,12 @@ class TestRelatedFilesNormalization:
         files = safe["repair_groups"][0]["related_files"]
         assert files == ["a.py", "z.py"]
 
-    def test_empty_string_removed(self, test_db):
-        """related_files containing empty string after sanitization
-        → empty removed, not in output."""
+    def test_empty_string_rejected(self, test_db):
+        """related_files containing empty string → RepairPlanSerializationError.
+
+        Empty paths must NOT be silently deleted — silent deletion would
+        lose Finding positions. The serialization boundary must reject
+        them explicitly."""
         task_id = _make_task()
         plan = {
             "schema_version": REPAIR_SCHEMA_VERSION,
@@ -785,18 +791,16 @@ class TestRelatedFilesNormalization:
             "source_assessment_policy_version": "p0-6-v1",
             "created_at": None, "updated_at": None,
         }
-        safe = serialize_repair_plan(
-            task_id=task_id,
-            repair_plan=plan,
-            source_scan_updated_at="2026-01-01T00:00:00Z",
-            source_assessment_updated_at="2026-01-01T00:00:00Z",
-            source_assessment_policy_version="p0-6-v1",
-            created_at="2026-01-01T00:00:00Z",
-            updated_at="2026-01-01T00:00:00Z",
-        )
-        files = safe["repair_groups"][0]["related_files"]
-        assert files == ["config.py"]
-        assert "" not in files
+        with pytest.raises(RepairPlanSerializationError):
+            serialize_repair_plan(
+                task_id=task_id,
+                repair_plan=plan,
+                source_scan_updated_at="2026-01-01T00:00:00Z",
+                source_assessment_updated_at="2026-01-01T00:00:00Z",
+                source_assessment_policy_version="p0-6-v1",
+                created_at="2026-01-01T00:00:00Z",
+                updated_at="2026-01-01T00:00:00Z",
+            )
 
     def test_redacted_path_duplicates_deduplicated(self, test_db):
         """Multiple unsafe paths → all become <redacted-path>,
@@ -968,3 +972,397 @@ class TestRelatedFilesNormalization:
         )
         with pytest.raises(RepairPlanInternalError):
             get_repair_result(task_id)
+
+
+# ===========================================================================
+# Sixth-round: Identity field validation at serialization boundary
+# ===========================================================================
+
+class TestSnapshotIdentitySerialization:
+    """Verify serialize_repair_plan rejects invalid identity fields."""
+
+    def _make_base_plan(self, task_id="test-task"):
+        return {
+            "schema_version": REPAIR_SCHEMA_VERSION,
+            "policy_version": POLICY_VERSION,
+            "repair_scope": REPAIR_SCOPE,
+            "task_id": task_id,
+            "plan_status": "complete",
+            "summary": {
+                "total_repair_groups": 1, "blocking_repair_groups": 1,
+                "manual_review_required": False, "coverage_warning": False,
+                "groups_truncated": False,
+            },
+            "repair_groups": [{
+                "group_id": "RG001",
+                "action_code": ACTION_REVOKE_OR_ROTATE_SECRET,
+                "priority": 1, "blocking": True,
+                "highest_severity": "critical", "highest_confidence": "high",
+                "title": "Test", "description": "Test",
+                "related_rule_ids": ["R001_GITHUB_TOKEN"],
+                "related_files": ["config.py"],
+                "total_related_files": 1, "returned_related_files": 1,
+                "related_files_truncated": False, "finding_count": 1,
+                "steps": ["step1"], "commands": [], "safety_notes": ["note"],
+                "verification_steps": ["verify1"],
+            }],
+            "verification_steps": ["step1"],
+            "agent_prompt": "",
+            "source_scan_updated_at": "2026-01-01T00:00:00Z",
+            "source_assessment_updated_at": "2026-01-01T00:00:00Z",
+            "source_assessment_policy_version": "p0-6-v1",
+            "created_at": None, "updated_at": None,
+        }
+
+    def _serialize(self, **overrides):
+        """Call serialize_repair_plan with given parameter overrides."""
+        defaults = dict(
+            task_id="test-task",
+            repair_plan=self._make_base_plan(),
+            source_scan_updated_at="2026-01-01T00:00:00Z",
+            source_assessment_updated_at="2026-01-01T00:00:00Z",
+            source_assessment_policy_version="p0-6-v1",
+            created_at="2026-01-01T00:00:00Z",
+            updated_at="2026-01-01T00:00:00Z",
+        )
+        defaults.update(overrides)
+        return serialize_repair_plan(**defaults)
+
+    def test_task_id_empty_rejected(self):
+        """task_id='' → RepairPlanSerializationError."""
+        with pytest.raises(RepairPlanSerializationError):
+            self._serialize(task_id="")
+
+    def test_source_scan_updated_at_empty_rejected(self):
+        """source_scan_updated_at='' → RepairPlanSerializationError."""
+        with pytest.raises(RepairPlanSerializationError):
+            self._serialize(source_scan_updated_at="")
+
+    def test_source_assessment_updated_at_none_rejected(self):
+        """source_assessment_updated_at=None → RepairPlanSerializationError."""
+        with pytest.raises(RepairPlanSerializationError):
+            self._serialize(source_assessment_updated_at=None)
+
+    def test_source_assessment_policy_version_wrong_rejected(self):
+        """source_assessment_policy_version='wrong' → RepairPlanSerializationError."""
+        with pytest.raises(RepairPlanSerializationError):
+            self._serialize(source_assessment_policy_version="wrong")
+
+    def test_created_at_none_rejected(self):
+        """created_at=None → RepairPlanSerializationError."""
+        with pytest.raises(RepairPlanSerializationError):
+            self._serialize(created_at=None)
+
+    def test_updated_at_list_rejected(self):
+        """updated_at=[] → RepairPlanSerializationError."""
+        with pytest.raises(RepairPlanSerializationError):
+            self._serialize(updated_at=[])
+
+    def test_task_id_int_rejected(self):
+        """task_id=123 (int, not str) → RepairPlanSerializationError.
+        No implicit str conversion allowed."""
+        with pytest.raises(RepairPlanSerializationError):
+            self._serialize(task_id=123)
+
+    def test_created_at_bool_rejected(self):
+        """created_at=True (bool) → RepairPlanSerializationError."""
+        with pytest.raises(RepairPlanSerializationError):
+            self._serialize(created_at=True)
+
+    def test_source_scan_updated_at_float_rejected(self):
+        """source_scan_updated_at=1.5 (float) → RepairPlanSerializationError."""
+        with pytest.raises(RepairPlanSerializationError):
+            self._serialize(source_scan_updated_at=1.5)
+
+    def test_valid_identity_fields_pass_both_boundaries(self, test_db):
+        """Valid top-level fields → serialization and full read validation
+        both pass.
+
+        Assembles matching db_columns from the serialized result and passes
+        them to _validate_persisted_repair_plan — must pass normally.
+        """
+        task_id = _make_task()
+        safe = serialize_repair_plan(
+            task_id=task_id,
+            repair_plan=self._make_base_plan(task_id=task_id),
+            source_scan_updated_at="2026-01-01T00:00:00Z",
+            source_assessment_updated_at="2026-01-01T00:00:00Z",
+            source_assessment_policy_version="p0-6-v1",
+            created_at="2026-01-01T00:00:00Z",
+            updated_at="2026-01-01T00:00:00Z",
+        )
+
+        # Assemble matching db_columns from safe_plan
+        db_columns = {
+            "task_id": safe["task_id"],
+            "plan_status": safe["plan_status"],
+            "total_repair_groups": safe["summary"]["total_repair_groups"],
+            "blocking_repair_groups": safe["summary"]["blocking_repair_groups"],
+            "source_scan_updated_at": safe["source_scan_updated_at"],
+            "source_assessment_updated_at": safe["source_assessment_updated_at"],
+            "source_assessment_policy_version": safe["source_assessment_policy_version"],
+            "created_at": safe["created_at"],
+            "updated_at": safe["updated_at"],
+        }
+
+        # Must pass full persisted validation
+        result = _validate_persisted_repair_plan(safe, task_id, db_columns)
+        assert result is not None
+        assert result["task_id"] == task_id
+
+        # Also verify via the full read path
+        _insert_raw_repair_row(
+            task_id, json.dumps(safe, ensure_ascii=False),
+        )
+        retrieved = get_repair_result(task_id)
+        assert retrieved is not None
+        assert retrieved["task_id"] == task_id
+
+
+# ===========================================================================
+# Sixth-round: Empty related_files rejection (no silent deletion)
+# ===========================================================================
+
+class TestEmptyRelatedFilesRejection:
+    """Verify empty related_files are rejected, never silently deleted."""
+
+    def _make_plan_with_files(self, task_id, related_files, total=None,
+                              returned=None, truncated=False):
+        if total is None:
+            total = len(related_files)
+        if returned is None:
+            returned = len(related_files)
+        return {
+            "schema_version": REPAIR_SCHEMA_VERSION,
+            "policy_version": POLICY_VERSION,
+            "repair_scope": REPAIR_SCOPE,
+            "task_id": task_id,
+            "plan_status": "complete",
+            "summary": {
+                "total_repair_groups": 1, "blocking_repair_groups": 1,
+                "manual_review_required": False, "coverage_warning": False,
+                "groups_truncated": False,
+            },
+            "repair_groups": [{
+                "group_id": "RG001",
+                "action_code": ACTION_REVOKE_OR_ROTATE_SECRET,
+                "priority": 1, "blocking": True,
+                "highest_severity": "critical", "highest_confidence": "high",
+                "title": "Test", "description": "Test",
+                "related_rule_ids": ["R001_GITHUB_TOKEN"],
+                "related_files": related_files,
+                "total_related_files": total,
+                "returned_related_files": returned,
+                "related_files_truncated": truncated,
+                "finding_count": 1,
+                "steps": ["step1"], "commands": [], "safety_notes": ["note"],
+                "verification_steps": ["verify1"],
+            }],
+            "verification_steps": ["step1"],
+            "agent_prompt": "",
+            "source_scan_updated_at": "2026-01-01T00:00:00Z",
+            "source_assessment_updated_at": "2026-01-01T00:00:00Z",
+            "source_assessment_policy_version": "p0-6-v1",
+            "created_at": None, "updated_at": None,
+        }
+
+    def test_only_empty_string_rejected(self, test_db):
+        """related_files=[''] → RepairPlanSerializationError.
+
+        Must NOT silently delete to produce []."""
+        task_id = _make_task()
+        plan = self._make_plan_with_files(task_id, [""])
+        with pytest.raises(RepairPlanSerializationError):
+            serialize_repair_plan(
+                task_id=task_id,
+                repair_plan=plan,
+                source_scan_updated_at="2026-01-01T00:00:00Z",
+                source_assessment_updated_at="2026-01-01T00:00:00Z",
+                source_assessment_policy_version="p0-6-v1",
+                created_at="2026-01-01T00:00:00Z",
+                updated_at="2026-01-01T00:00:00Z",
+            )
+
+    def test_empty_string_with_valid_rejected(self, test_db):
+        """related_files=['config.py', ''] → RepairPlanSerializationError."""
+        task_id = _make_task()
+        plan = self._make_plan_with_files(task_id, ["config.py", ""])
+        with pytest.raises(RepairPlanSerializationError):
+            serialize_repair_plan(
+                task_id=task_id,
+                repair_plan=plan,
+                source_scan_updated_at="2026-01-01T00:00:00Z",
+                source_assessment_updated_at="2026-01-01T00:00:00Z",
+                source_assessment_policy_version="p0-6-v1",
+                created_at="2026-01-01T00:00:00Z",
+                updated_at="2026-01-01T00:00:00Z",
+            )
+
+    def test_redacted_path_input_duplicates_deduplicated(self, test_db):
+        """related_files=['<redacted-path>', '<redacted-path>'] →
+        output one '<redacted-path>'.
+
+        <redacted-path> is a valid safe placeholder; duplicates are
+        deduplicated normally."""
+        task_id = _make_task()
+        plan = self._make_plan_with_files(
+            task_id, ["<redacted-path>", "<redacted-path>"],
+        )
+        safe = serialize_repair_plan(
+            task_id=task_id,
+            repair_plan=plan,
+            source_scan_updated_at="2026-01-01T00:00:00Z",
+            source_assessment_updated_at="2026-01-01T00:00:00Z",
+            source_assessment_policy_version="p0-6-v1",
+            created_at="2026-01-01T00:00:00Z",
+            updated_at="2026-01-01T00:00:00Z",
+        )
+        files = safe["repair_groups"][0]["related_files"]
+        assert files == ["<redacted-path>"]
+        assert safe["repair_groups"][0]["returned_related_files"] == 1
+        assert safe["repair_groups"][0]["total_related_files"] == 1
+
+    def test_read_empty_string_api_500(self, client):
+        """Corrupted DB with empty string in related_files →
+        RepairPlanInternalError → API 500."""
+        task_id = _make_task()
+        safe = _make_valid_safe_plan(task_id=task_id)
+        safe["repair_groups"][0]["related_files"] = [""]
+        safe["repair_groups"][0]["returned_related_files"] = 1
+        safe["repair_groups"][0]["total_related_files"] = 1
+        safe["repair_groups"][0]["related_files_truncated"] = False
+        _insert_raw_repair_row(
+            task_id, json.dumps(safe, ensure_ascii=False),
+        )
+        response = client.get(f"/api/check/{task_id}/repair-plan")
+        assert response.status_code == 500
+        assert response.json()["detail"]["error_code"] == REPAIR_PLAN_INTERNAL_ERROR
+
+
+# ===========================================================================
+# Sixth-round: Path normalization before deduplication
+# ===========================================================================
+
+class TestPathNormalization:
+    """Verify _sanitize_file_path normalizes paths to canonical form
+    before deduplication."""
+
+    def test_backslash_normalized(self):
+        """src\\config.py → src/config.py."""
+        assert _sanitize_file_path("src\\config.py") == "src/config.py"
+
+    def test_dot_slash_normalized(self):
+        """./src/config.py → src/config.py."""
+        assert _sanitize_file_path("./src/config.py") == "src/config.py"
+
+    def test_double_slash_normalized(self):
+        """src//config.py → src/config.py."""
+        assert _sanitize_file_path("src//config.py") == "src/config.py"
+
+    def test_multiple_normalizations_combined(self):
+        """./src//config\\..py segments are handled correctly."""
+        # ./src//config.py → src/config.py
+        assert _sanitize_file_path("./src//config.py") == "src/config.py"
+
+    def test_all_variants_deduplicate(self, test_db):
+        """['src\\\\config.py', 'src/config.py', './src/config.py',
+        'src//config.py'] → ['src/config.py'].
+
+        All four variants normalize to the same canonical path and
+        must be deduplicated to a single entry."""
+        task_id = _make_task()
+        plan = {
+            "schema_version": REPAIR_SCHEMA_VERSION,
+            "policy_version": POLICY_VERSION,
+            "repair_scope": REPAIR_SCOPE,
+            "task_id": task_id,
+            "plan_status": "complete",
+            "summary": {
+                "total_repair_groups": 1, "blocking_repair_groups": 1,
+                "manual_review_required": False, "coverage_warning": False,
+                "groups_truncated": False,
+            },
+            "repair_groups": [{
+                "group_id": "RG001",
+                "action_code": ACTION_REVOKE_OR_ROTATE_SECRET,
+                "priority": 1, "blocking": True,
+                "highest_severity": "critical", "highest_confidence": "high",
+                "title": "Test", "description": "Test",
+                "related_rule_ids": ["R001_GITHUB_TOKEN"],
+                "related_files": [
+                    "src\\config.py",
+                    "src/config.py",
+                    "./src/config.py",
+                    "src//config.py",
+                ],
+                "total_related_files": 4, "returned_related_files": 4,
+                "related_files_truncated": False, "finding_count": 1,
+                "steps": ["step1"], "commands": [], "safety_notes": ["note"],
+                "verification_steps": ["verify1"],
+            }],
+            "verification_steps": ["step1"],
+            "agent_prompt": "",
+            "source_scan_updated_at": "2026-01-01T00:00:00Z",
+            "source_assessment_updated_at": "2026-01-01T00:00:00Z",
+            "source_assessment_policy_version": "p0-6-v1",
+            "created_at": None, "updated_at": None,
+        }
+        safe = serialize_repair_plan(
+            task_id=task_id,
+            repair_plan=plan,
+            source_scan_updated_at="2026-01-01T00:00:00Z",
+            source_assessment_updated_at="2026-01-01T00:00:00Z",
+            source_assessment_policy_version="p0-6-v1",
+            created_at="2026-01-01T00:00:00Z",
+            updated_at="2026-01-01T00:00:00Z",
+        )
+        files = safe["repair_groups"][0]["related_files"]
+        assert files == ["src/config.py"]
+        assert safe["repair_groups"][0]["returned_related_files"] == 1
+        assert safe["repair_groups"][0]["total_related_files"] == 1
+
+    def test_read_rejects_backslash(self, test_db):
+        """Corrupted DB with backslash in related_files →
+        RepairPlanInternalError (path not in canonical form)."""
+        task_id = _make_task()
+        safe = _make_valid_safe_plan(task_id=task_id)
+        safe["repair_groups"][0]["related_files"] = ["src\\config.py"]
+        safe["repair_groups"][0]["returned_related_files"] = 1
+        safe["repair_groups"][0]["total_related_files"] = 1
+        safe["repair_groups"][0]["related_files_truncated"] = False
+        _insert_raw_repair_row(
+            task_id, json.dumps(safe, ensure_ascii=False),
+        )
+        with pytest.raises(RepairPlanInternalError):
+            get_repair_result(task_id)
+
+    def test_read_rejects_dot_slash(self, test_db):
+        """Corrupted DB with ./ prefix in related_files →
+        RepairPlanInternalError (path not in canonical form)."""
+        task_id = _make_task()
+        safe = _make_valid_safe_plan(task_id=task_id)
+        safe["repair_groups"][0]["related_files"] = ["./config.py"]
+        safe["repair_groups"][0]["returned_related_files"] = 1
+        safe["repair_groups"][0]["total_related_files"] = 1
+        safe["repair_groups"][0]["related_files_truncated"] = False
+        _insert_raw_repair_row(
+            task_id, json.dumps(safe, ensure_ascii=False),
+        )
+        with pytest.raises(RepairPlanInternalError):
+            get_repair_result(task_id)
+
+    def test_read_rejects_double_slash(self, test_db):
+        """Corrupted DB with // in related_files →
+        RepairPlanInternalError (path not in canonical form)."""
+        task_id = _make_task()
+        safe = _make_valid_safe_plan(task_id=task_id)
+        safe["repair_groups"][0]["related_files"] = ["src//config.py"]
+        safe["repair_groups"][0]["returned_related_files"] = 1
+        safe["repair_groups"][0]["total_related_files"] = 1
+        safe["repair_groups"][0]["related_files_truncated"] = False
+        _insert_raw_repair_row(
+            task_id, json.dumps(safe, ensure_ascii=False),
+        )
+        with pytest.raises(RepairPlanInternalError):
+            get_repair_result(task_id)
+
