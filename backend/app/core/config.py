@@ -4,11 +4,48 @@ Sensitive values (GitHub Token, LLM API Key) are read from environment variables
 and NEVER hardcoded. This module is the single source of truth for all limits.
 """
 
+import posixpath
+from pathlib import PurePosixPath
 from typing import Literal
 from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
+
+
+def validate_production_database_url(database_url: str) -> None:
+    """Require a canonical persistent SQLite file inside Docker's /data."""
+    parsed = urlsplit(database_url)
+    if (
+        parsed.scheme != "sqlite"
+        or parsed.netloc
+        or parsed.query
+        or parsed.fragment
+        or not database_url.startswith("sqlite:////")
+    ):
+        raise ValueError(
+            "production database_url must be a SQLite .db file under /data"
+        )
+
+    raw_path = database_url.removeprefix("sqlite:///")
+    path = PurePosixPath(raw_path)
+    normalized_path = PurePosixPath(posixpath.normpath(str(path)))
+    if (
+        not path.is_absolute()
+        or ".." in path.parts
+        or normalized_path == PurePosixPath("/data")
+        or normalized_path.suffix != ".db"
+    ):
+        raise ValueError(
+            "production database_url must be a SQLite .db file under /data"
+        )
+
+    try:
+        normalized_path.relative_to(PurePosixPath("/data"))
+    except ValueError as exc:
+        raise ValueError(
+            "production database_url must be a SQLite .db file under /data"
+        ) from exc
 
 
 class Settings(BaseSettings):
@@ -214,10 +251,7 @@ class Settings(BaseSettings):
             raise ValueError(
                 "production_config_confirmed must be true in production"
             )
-        if self.database_url == "sqlite:///./vibecheck.db":
-            raise ValueError(
-                "production database_url must use an explicit persistent path"
-            )
+        validate_production_database_url(self.database_url)
         if "*" in self.trusted_hosts:
             raise ValueError("wildcard trusted host is forbidden in production")
         if "127.0.0.1" not in self.trusted_hosts:
@@ -237,7 +271,11 @@ class Settings(BaseSettings):
 
         return self
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    model_config = {
+        "env_file": ".env",
+        "env_file_encoding": "utf-8",
+        "hide_input_in_errors": True,
+    }
 
 
 settings = Settings()

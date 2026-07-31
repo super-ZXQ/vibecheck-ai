@@ -39,6 +39,14 @@ _local = threading.local()
 # Lock for DDL operations
 _init_lock = threading.Lock()
 _initialized = False
+_REQUIRED_TABLES = frozenset(
+    {
+        "tasks",
+        "scan_results",
+        "assessment_results",
+        "repair_results",
+    }
+)
 
 
 def _get_db_path() -> str:
@@ -206,14 +214,21 @@ def check_database_ready() -> None:
     """Raise when the database is unavailable or not initialized."""
     conn = _get_connection()
     try:
-        row = conn.execute(
+        rows = conn.execute(
             """
-            SELECT 1
+            SELECT name
             FROM sqlite_master
-            WHERE type = 'table' AND name = 'tasks'
+            WHERE type = 'table'
+              AND name IN (
+                  'tasks',
+                  'scan_results',
+                  'assessment_results',
+                  'repair_results'
+              )
             """
-        ).fetchone()
-        if row is None:
+        ).fetchall()
+        present_tables = {row["name"] for row in rows}
+        if present_tables != _REQUIRED_TABLES:
             raise RuntimeError("database schema is not initialized")
     finally:
         conn.close()

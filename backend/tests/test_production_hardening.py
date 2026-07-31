@@ -46,13 +46,44 @@ class TestStrictProductionConfiguration:
                 database_url="sqlite:////data/vibecheck.db",
             )
 
-    def test_production_rejects_default_database_path(self):
-        with pytest.raises(ValidationError, match="persistent path"):
-            Settings(
-                _env_file=None,
-                app_env="production",
-                production_config_confirmed=True,
-            )
+    @pytest.mark.parametrize(
+        "database_url",
+        [
+            "sqlite:///relative.db",
+            "sqlite:///./relative.db",
+            "sqlite:///../escape.db",
+            "sqlite:////tmp/vibecheck.db",
+            "sqlite:////data/../tmp/vibecheck.db",
+            "sqlite:////data",
+            "sqlite:///:memory:",
+            "postgresql://example",
+        ],
+    )
+    def test_production_rejects_non_persistent_database_urls(
+        self,
+        database_url,
+    ):
+        with pytest.raises(ValidationError, match="SQLite .db file under /data"):
+            make_production_settings(database_url=database_url)
+
+    @pytest.mark.parametrize(
+        "database_url",
+        [
+            "sqlite:////data/vibecheck.db",
+            "sqlite:////data/vibecheck-production.db",
+        ],
+    )
+    def test_production_accepts_persistent_database_urls(self, database_url):
+        configured = make_production_settings(database_url=database_url)
+        assert configured.database_url == database_url
+
+    def test_development_keeps_relative_sqlite_path(self):
+        configured = Settings(
+            _env_file=None,
+            app_env="development",
+            database_url="sqlite:///./vibecheck.db",
+        )
+        assert configured.database_url == "sqlite:///./vibecheck.db"
 
     def test_production_rejects_remote_http_cors_origin(self):
         with pytest.raises(ValidationError, match="must use HTTPS"):
@@ -156,3 +187,60 @@ class TestReadiness:
         assert response.status_code == 503
         assert response.json() == {"status": "not_ready"}
         assert "sensitive" not in response.text
+
+    @pytest.mark.parametrize(
+        "missing_table",
+        [
+            "tasks",
+            "scan_results",
+            "assessment_results",
+            "repair_results",
+        ],
+    )
+    def test_not_ready_when_required_table_is_missing(
+        self,
+        test_db,
+        missing_table,
+    ):
+        import app.db.database as database
+
+        conn = database._get_connection()
+        try:
+            conn.execute("PRAGMA foreign_keys=OFF")
+            conn.execute(f"DROP TABLE {missing_table}")
+            conn.commit()
+        finally:
+            conn.close()
+
+        production_app = create_app(make_production_settings())
+        response = TestClient(production_app).get("/api/ready")
+
+        assert response.status_code == 503
+        assert response.json() == {"status": "not_ready"}
+        assert missing_table not in response.text
+
+    def test_not_ready_when_database_connection_fails(self, monkeypatch):
+        def fail_readiness() -> None:
+            raise OSError("C:\\sensitive\\database\\path")
+
+        monkeypatch.setattr(
+            main_module,
+            "check_database_ready",
+            fail_readiness,
+        )
+        production_app = create_app(make_production_settings())
+        response = TestClient(production_app).get("/api/ready")
+
+        assert response.status_code == 503
+        assert response.json() == {"status": "not_ready"}
+        assert "sensitive" not in response.text
+
+    def test_not_ready_when_database_is_corrupt(self, test_db):
+        test_db.write_bytes(b"not a sqlite database")
+
+        production_app = create_app(make_production_settings())
+        response = TestClient(production_app).get("/api/ready")
+
+        assert response.status_code == 503
+        assert response.json() == {"status": "not_ready"}
+        assert "sqlite" not in response.text.lower()
