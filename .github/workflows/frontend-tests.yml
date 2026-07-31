@@ -1,0 +1,57 @@
+name: Frontend Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  frontend-tests:
+    runs-on: ubuntu-latest
+
+    env:
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Check production source boundaries
+        working-directory: frontend
+        run: npm run check:test-hooks
+
+      - name: Run unit tests with configured API URL
+        working-directory: frontend
+        run: npm run test:unit
+
+      - name: Run unit tests without configured API URL
+        working-directory: frontend
+        run: env -u NEXT_PUBLIC_API_BASE_URL npm run test:unit
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+      - name: Install Playwright browsers
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Playwright tests
+        working-directory: frontend
+        run: npx playwright test
+
+      - name: Run development Strict Mode tests
+        working-directory: frontend
+        run: npm run test:e2e:dev

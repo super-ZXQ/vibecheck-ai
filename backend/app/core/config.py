@@ -4,6 +4,8 @@ Sensitive values (GitHub Token, LLM API Key) are read from environment variables
 and NEVER hardcoded. This module is the single source of truth for all limits.
 """
 
+from urllib.parse import urlsplit
+
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
 
@@ -112,6 +114,59 @@ class Settings(BaseSettings):
     # --- Task queue ---
     max_pending_tasks: int = 5  # max pending tasks in queue
     max_running_tasks: int = 1  # only 1 task runs at a time (MVP)
+
+    # --- CORS (P0-8) ---
+    # Only the configured origins are allowed. The wildcard "*" is
+    # explicitly forbidden. Origins come from the CORS_ALLOWED_ORIGINS
+    # environment variable (JSON array string) or the default list.
+    cors_allowed_origins: list[str] = [
+        "http://localhost:3000",
+    ]
+
+    @field_validator("cors_allowed_origins", mode="before")
+    @classmethod
+    def validate_cors_allowed_origins(cls, value: object) -> list[str]:
+        """Accept only a non-empty, deterministic list of pure HTTP origins."""
+        if not isinstance(value, list) or not value:
+            raise ValueError("cors_allowed_origins must be a non-empty list")
+
+        origins: list[str] = []
+        seen: set[str] = set()
+        for origin in value:
+            if (
+                not isinstance(origin, str)
+                or not origin
+                or origin != origin.strip()
+                or any(char.isspace() for char in origin)
+            ):
+                raise ValueError("each CORS origin must be a non-empty string")
+            if origin == "*":
+                raise ValueError("wildcard CORS origin is forbidden")
+
+            parsed = urlsplit(origin)
+            try:
+                parsed.port
+            except ValueError as exc:
+                raise ValueError("CORS origin has an invalid port") from exc
+
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.netloc
+                or parsed.hostname is None
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.path
+                or parsed.query
+                or parsed.fragment
+                or origin != f"{parsed.scheme}://{parsed.netloc}"
+            ):
+                raise ValueError("CORS entries must be pure HTTP(S) origins")
+
+            if origin not in seen:
+                seen.add(origin)
+                origins.append(origin)
+
+        return origins
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

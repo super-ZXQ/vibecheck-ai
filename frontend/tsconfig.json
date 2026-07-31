@@ -35,6 +35,10 @@
     ".next/types/**/*.ts"
   ],
   "exclude": [
-    "node_modules"
+    "node_modules",
+    "e2e",
+    "dev-e2e",
+    "playwright.config.ts",
+    "playwright.dev.config.ts"
   ]
 }

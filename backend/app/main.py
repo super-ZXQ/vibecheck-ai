@@ -12,10 +12,12 @@ Lifecycle:
 import logging
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.check import router as check_router
 from app.api.assessment import router as assessment_router
 from app.api.repair import router as repair_router
+from app.core.config import settings
 from app.db.database import init_db
 from app.services.task_manager import mark_stale_tasks_as_failed
 
@@ -25,6 +27,17 @@ app = FastAPI(
     title="VibeCheck",
     description="项目上线体检工具 — 面向 Vibe Coding 与 AI 编程初学者",
     version="0.1.0",
+)
+
+# --- CORS (P0-8) ---
+# Restricted origins from configuration. Wildcard "*" is forbidden.
+# Credentials are disabled. Only GET, POST, OPTIONS are allowed.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_allowed_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Accept"],
 )
 
 # Include API routes

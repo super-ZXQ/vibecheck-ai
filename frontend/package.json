@@ -5,7 +5,10 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "check:test-hooks": "node scripts/check-test-hooks.mjs",
+    "test:unit": "node --test test/*.test.mjs",
+    "test:e2e:dev": "playwright test --config=playwright.dev.config.ts"
   },
   "dependencies": {
     "next": "14.2.4",
@@ -13,6 +16,7 @@
     "react-dom": "18.3.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.0",
     "@types/node": "20.14.9",
     "@types/react": "18.3.3",
     "@types/react-dom": "18.3.0",
