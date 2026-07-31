@@ -12,6 +12,7 @@
 "use client";
 
 import Link from "next/link";
+import { useParams } from "next/navigation";
 import { useEffect } from "react";
 
 import { CheckProgress } from "@/components/CheckProgress";
@@ -25,11 +26,8 @@ import { useCheckTask } from "@/hooks/use-check-task";
 const UUID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-interface CheckPageProps {
-  params: { task_id: string };
-}
-
-export default function CheckPage({ params }: CheckPageProps) {
+export default function CheckPage() {
+  const params = useParams<{ task_id: string }>();
   const taskId = params.task_id;
   const isValidUuid = UUID_REGEX.test(taskId);
 

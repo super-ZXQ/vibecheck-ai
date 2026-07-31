@@ -4,13 +4,18 @@ Sensitive values (GitHub Token, LLM API Key) are read from environment variables
 and NEVER hardcoded. This module is the single source of truth for all limits.
 """
 
+from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
+    # --- Runtime environment ---
+    app_env: Literal["development", "test", "production"] = "development"
+    production_config_confirmed: bool = False
+
     # --- GitHub download ---
     github_token: str | None = None  # Optional, read from env GITHUB_TOKEN
     download_timeout: int = 60  # seconds
@@ -122,6 +127,11 @@ class Settings(BaseSettings):
     cors_allowed_origins: list[str] = [
         "http://localhost:3000",
     ]
+    trusted_hosts: list[str] = [
+        "localhost",
+        "127.0.0.1",
+        "testserver",
+    ]
 
     @field_validator("cors_allowed_origins", mode="before")
     @classmethod
@@ -167,6 +177,61 @@ class Settings(BaseSettings):
                 origins.append(origin)
 
         return origins
+
+    @field_validator("trusted_hosts", mode="before")
+    @classmethod
+    def validate_trusted_hosts(cls, value: object) -> list[str]:
+        """Allow only an explicit non-empty host list; never trust all hosts."""
+        if not isinstance(value, list) or not value:
+            raise ValueError("trusted_hosts must be a non-empty list")
+
+        hosts: list[str] = []
+        seen: set[str] = set()
+        for host in value:
+            if (
+                not isinstance(host, str)
+                or not host
+                or host != host.strip()
+                or any(char.isspace() for char in host)
+                or host == "*"
+                or "://" in host
+                or "/" in host
+                or "@" in host
+            ):
+                raise ValueError("each trusted host must be an explicit host name")
+            if host not in seen:
+                seen.add(host)
+                hosts.append(host)
+        return hosts
+
+    @model_validator(mode="after")
+    def validate_production_configuration(self) -> "Settings":
+        """Fail closed when production starts with development defaults."""
+        if self.app_env != "production":
+            return self
+
+        if not self.production_config_confirmed:
+            raise ValueError(
+                "production_config_confirmed must be true in production"
+            )
+        if self.database_url == "sqlite:///./vibecheck.db":
+            raise ValueError(
+                "production database_url must use an explicit persistent path"
+            )
+        if "*" in self.trusted_hosts:
+            raise ValueError("wildcard trusted host is forbidden in production")
+
+        for origin in self.cors_allowed_origins:
+            parsed = urlsplit(origin)
+            if (
+                parsed.scheme != "https"
+                and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}
+            ):
+                raise ValueError(
+                    "production CORS origins must use HTTPS except localhost"
+                )
+
+        return self
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
