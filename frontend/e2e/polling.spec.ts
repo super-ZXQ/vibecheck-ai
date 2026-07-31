@@ -58,6 +58,11 @@ test.describe("Progress change", () => {
 
 test.describe("Failed state", () => {
   test("displays fixed safe error message for failed task", async ({ page }) => {
+    let submissions = 0;
+    await page.route(`${API_BASE}/api/check`, (route) => {
+      submissions++;
+      route.abort("failed");
+    });
     await mockTaskStatusSequence(page, [mockFailedStatus]);
 
     await page.goto(`/check/${TEST_TASK_ID}`);
@@ -67,6 +72,11 @@ test.describe("Failed state", () => {
 
     // Verify the backend's desensitized error_message is displayed
     await expect(page.locator(".error-box")).toContainText("仓库不存在或无法访问");
+
+    await page.getByRole("link", { name: "重新检测" }).click();
+    await expect(page).toHaveURL("/");
+    await expect(page.getByLabel("GitHub 仓库地址")).toHaveValue("");
+    expect(submissions).toBe(0);
   });
 
   test("falls back to error_code mapping when error_message is null", async ({ page }) => {
@@ -86,7 +96,49 @@ test.describe("Failed state", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Test 8: Network error and retry
+// HTTP polling failures
+// ---------------------------------------------------------------------------
+
+test.describe("HTTP polling failures", () => {
+  const scenarios = [
+    { status: 404, errorCode: "TASK_NOT_FOUND", expected: "任务不存在" },
+    { status: 422, errorCode: "INVALID_TASK_ID", expected: "任务ID格式无效" },
+    { status: 500, errorCode: "INTERNAL_ERROR", expected: "内部错误" },
+  ];
+
+  for (const scenario of scenarios) {
+    test(`${scenario.status} stops immediately with a fixed mapping`, async ({
+      page,
+    }) => {
+      let statusRequests = 0;
+      const untrustedMessage = ["server detail ", "must not ", "be rendered"].join("");
+      await page.route(`${API_BASE}/api/check/${TEST_TASK_ID}`, (route) => {
+        statusRequests++;
+        route.fulfill({
+          status: scenario.status,
+          contentType: "application/json",
+          body: JSON.stringify({
+            detail: {
+              error_code: scenario.errorCode,
+              error_message: untrustedMessage,
+            },
+          }),
+        });
+      });
+
+      await page.goto(`/check/${TEST_TASK_ID}`);
+
+      await expect(page.locator(".page-title")).toContainText("检测失败");
+      await expect(page.locator(".error-box")).toContainText(scenario.expected);
+      await expect(page.locator("body")).not.toContainText(untrustedMessage);
+      await page.waitForTimeout(2500);
+      expect(statusRequests).toBe(1);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Network error and retry
 // ---------------------------------------------------------------------------
 
 test.describe("Network error retry", () => {
@@ -117,6 +169,22 @@ test.describe("Network error retry", () => {
     // Verify at least 2 polls occurred (first failed, second succeeded)
     expect(callCount).toBeGreaterThanOrEqual(2);
   });
+
+  test("persistent network errors end in timeout", async ({ page }) => {
+    await page.clock.install();
+    let callCount = 0;
+    await page.route(`${API_BASE}/api/check/${TEST_TASK_ID}`, (route) => {
+      callCount++;
+      route.abort("failed");
+    });
+
+    await page.goto(`/check/${TEST_TASK_ID}`);
+    await expect.poll(() => callCount).toBeGreaterThanOrEqual(1);
+
+    await page.clock.fastForward(300_001);
+    await expect(page.locator(".page-title")).toContainText("检测超时");
+    expect(callCount).toBeGreaterThanOrEqual(2);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -145,6 +213,52 @@ test.describe("Poll timeout", () => {
     await page.clock.fastForward(300_001);
     await expect(page.locator(".page-title")).toContainText("检测超时");
     await expect(page.locator(".error-box")).toContainText("检测超时");
+    await page.getByRole("link", { name: "重新检测" }).click();
+    await expect(page).toHaveURL("/");
+    await expect(page.getByLabel("GitHub 仓库地址")).toHaveValue("");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task ID changes
+// ---------------------------------------------------------------------------
+
+test.describe("Task ID changes", () => {
+  test("stops the old task and polls only the new task", async ({ page }) => {
+    const nextTaskId = "12345678-1234-1234-1234-123456789abc";
+    let oldTaskRequests = 0;
+    let newTaskRequests = 0;
+
+    await page.route(`${API_BASE}/api/check/${TEST_TASK_ID}`, (route) => {
+      oldTaskRequests++;
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(mockPendingStatus),
+      });
+    });
+    await page.route(`${API_BASE}/api/check/${nextTaskId}`, (route) => {
+      newTaskRequests++;
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          ...mockFailedStatus,
+          task_id: nextTaskId,
+        }),
+      });
+    });
+
+    await page.goto(`/check/${TEST_TASK_ID}`);
+    await expect(page.locator(".card")).toContainText("排队中");
+    const oldCountAtNavigation = oldTaskRequests;
+
+    await page.goto(`/check/${nextTaskId}`);
+    await expect(page.locator(".page-title")).toContainText("检测失败");
+    await page.waitForTimeout(2500);
+
+    expect(oldTaskRequests).toBe(oldCountAtNavigation);
+    expect(newTaskRequests).toBe(1);
   });
 });
 

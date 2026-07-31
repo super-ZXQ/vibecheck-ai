@@ -28,6 +28,14 @@ jobs:
         working-directory: frontend
         run: npm ci
 
+      - name: Check production source boundaries
+        working-directory: frontend
+        run: npm run check:test-hooks
+
+      - name: Run unit tests
+        working-directory: frontend
+        run: npm run test:unit
+
       - name: Build
         working-directory: frontend
         run: npm run build
@@ -39,3 +47,7 @@ jobs:
       - name: Run Playwright tests
         working-directory: frontend
         run: npx playwright test
+
+      - name: Run development Strict Mode tests
+        working-directory: frontend
+        run: npm run test:e2e:dev
