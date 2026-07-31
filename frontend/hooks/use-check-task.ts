@@ -70,8 +70,10 @@ export interface UseCheckTaskResult {
 
 interface PollingSession {
   controller: AbortController;
-  timer: ReturnType<typeof setTimeout> | null;
+  pollTimer: ReturnType<typeof setTimeout> | null;
+  deadlineTimer: ReturnType<typeof setTimeout> | null;
   startedAt: number;
+  taskId: string | null;
 }
 
 export function useCheckTask(options?: UseCheckTaskOptions): UseCheckTaskResult {
@@ -95,16 +97,27 @@ export function useCheckTask(options?: UseCheckTaskOptions): UseCheckTaskResult 
   const activeSessionRef = useRef<PollingSession | null>(null);
   const isMountedRef = useRef(true);
 
-  const stopSession = useCallback((session: PollingSession) => {
-    if (session.timer) {
-      clearTimeout(session.timer);
-      session.timer = null;
+  const clearSessionTimers = useCallback((session: PollingSession) => {
+    if (session.pollTimer !== null) {
+      clearTimeout(session.pollTimer);
+      session.pollTimer = null;
     }
-    session.controller.abort();
-    if (activeSessionRef.current === session) {
-      activeSessionRef.current = null;
+    if (session.deadlineTimer !== null) {
+      clearTimeout(session.deadlineTimer);
+      session.deadlineTimer = null;
     }
   }, []);
+
+  const stopSession = useCallback(
+    (session: PollingSession) => {
+      clearSessionTimers(session);
+      session.controller.abort();
+      if (activeSessionRef.current === session) {
+        activeSessionRef.current = null;
+      }
+    },
+    [clearSessionTimers],
+  );
 
   const stopActiveSession = useCallback(() => {
     const session = activeSessionRef.current;
@@ -119,6 +132,36 @@ export function useCheckTask(options?: UseCheckTaskOptions): UseCheckTaskResult 
       activeSessionRef.current === session &&
       !session.controller.signal.aborted,
     [],
+  );
+
+  const expireSession = useCallback(
+    (session: PollingSession) => {
+      if (!isSessionActive(session)) return;
+
+      clearSessionTimers(session);
+      session.controller.abort();
+      if (activeSessionRef.current === session) {
+        activeSessionRef.current = null;
+      }
+      setState("timeout");
+    },
+    [clearSessionTimers, isSessionActive],
+  );
+
+  const startPollingDeadline = useCallback(
+    (session: PollingSession) => {
+      const remainingMs = Math.max(
+        0,
+        pollTimeoutMs - (Date.now() - session.startedAt),
+      );
+      const deadlineTimer = setTimeout(() => {
+        if (session.deadlineTimer !== deadlineTimer) return;
+        session.deadlineTimer = null;
+        expireSession(session);
+      }, remainingMs);
+      session.deadlineTimer = deadlineTimer;
+    },
+    [expireSession, pollTimeoutMs],
   );
 
   useEffect(() => {
@@ -210,6 +253,38 @@ export function useCheckTask(options?: UseCheckTaskOptions): UseCheckTaskResult 
 
   const pollOnce = useCallback(
     async (id: string, session: PollingSession) => {
+      if (!isSessionActive(session)) return;
+      if (Date.now() - session.startedAt >= pollTimeoutMs) {
+        expireSession(session);
+        return;
+      }
+
+      const scheduleNextPoll = () => {
+        if (!isSessionActive(session)) return;
+        const remainingMs =
+          pollTimeoutMs - (Date.now() - session.startedAt);
+        if (remainingMs <= 0) {
+          expireSession(session);
+          return;
+        }
+
+        const pollTimer = setTimeout(
+          () => {
+            if (session.pollTimer !== pollTimer) return;
+            session.pollTimer = null;
+            if (Date.now() - session.startedAt >= pollTimeoutMs) {
+              expireSession(session);
+              return;
+            }
+            if (isSessionActive(session)) {
+              void pollOnce(id, session);
+            }
+          },
+          Math.min(pollIntervalMs, remainingMs),
+        );
+        session.pollTimer = pollTimer;
+      };
+
       try {
         const status = await getTaskStatus(id, session.controller.signal);
         if (!isSessionActive(session)) return;
@@ -217,6 +292,7 @@ export function useCheckTask(options?: UseCheckTaskOptions): UseCheckTaskResult 
         setTaskStatus(status);
 
         if (status.status === "completed") {
+          clearSessionTimers(session);
           await loadResults(id, session);
           return;
         }
@@ -230,18 +306,7 @@ export function useCheckTask(options?: UseCheckTaskOptions): UseCheckTaskResult 
           return;
         }
 
-        if (Date.now() - session.startedAt >= pollTimeoutMs) {
-          stopSession(session);
-          setState("timeout");
-          return;
-        }
-
-        session.timer = setTimeout(() => {
-          session.timer = null;
-          if (isSessionActive(session)) {
-            void pollOnce(id, session);
-          }
-        }, pollIntervalMs);
+        scheduleNextPoll();
       } catch (err) {
         if (err instanceof ApiAbortError || !isSessionActive(session)) {
           return;
@@ -251,17 +316,7 @@ export function useCheckTask(options?: UseCheckTaskOptions): UseCheckTaskResult 
           err instanceof ApiNetworkError ||
           err instanceof ApiRequestTimeoutError
         ) {
-          if (Date.now() - session.startedAt >= pollTimeoutMs) {
-            stopSession(session);
-            setState("timeout");
-            return;
-          }
-          session.timer = setTimeout(() => {
-            session.timer = null;
-            if (isSessionActive(session)) {
-              void pollOnce(id, session);
-            }
-          }, pollIntervalMs);
+          scheduleNextPoll();
           return;
         }
 
@@ -279,6 +334,8 @@ export function useCheckTask(options?: UseCheckTaskOptions): UseCheckTaskResult 
       }
     },
     [
+      clearSessionTimers,
+      expireSession,
       isSessionActive,
       loadResults,
       pollIntervalMs,
@@ -297,10 +354,13 @@ export function useCheckTask(options?: UseCheckTaskOptions): UseCheckTaskResult 
 
       const session: PollingSession = {
         controller: new AbortController(),
-        timer: null,
+        pollTimer: null,
+        deadlineTimer: null,
         startedAt: Date.now(),
+        taskId: existingTaskId,
       };
       activeSessionRef.current = session;
+      startPollingDeadline(session);
       setState("polling");
       void pollOnce(existingTaskId, session);
 
@@ -308,7 +368,13 @@ export function useCheckTask(options?: UseCheckTaskOptions): UseCheckTaskResult 
         stopSession(session);
       };
     },
-    [pollOnce, resetResults, stopActiveSession, stopSession],
+    [
+      pollOnce,
+      resetResults,
+      startPollingDeadline,
+      stopActiveSession,
+      stopSession,
+    ],
   );
 
   const submit = useCallback(
@@ -321,8 +387,10 @@ export function useCheckTask(options?: UseCheckTaskOptions): UseCheckTaskResult 
 
       const session: PollingSession = {
         controller: new AbortController(),
-        timer: null,
+        pollTimer: null,
+        deadlineTimer: null,
         startedAt: Date.now(),
+        taskId: null,
       };
       activeSessionRef.current = session;
 
@@ -332,6 +400,8 @@ export function useCheckTask(options?: UseCheckTaskOptions): UseCheckTaskResult 
 
         setTaskId(response.task_id);
         session.startedAt = Date.now();
+        session.taskId = response.task_id;
+        startPollingDeadline(session);
         setState("polling");
         void pollOnce(response.task_id, session);
       } catch (err) {
@@ -361,6 +431,7 @@ export function useCheckTask(options?: UseCheckTaskOptions): UseCheckTaskResult 
       isSessionActive,
       pollOnce,
       resetResults,
+      startPollingDeadline,
       stopActiveSession,
       stopSession,
     ],

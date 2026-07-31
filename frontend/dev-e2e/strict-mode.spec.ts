@@ -125,3 +125,27 @@ test("page unload aborts the Strict Mode session without a later poll", async ({
   await expect(page.locator(".error-box")).toHaveCount(0);
   expect(statusRequests).toBe(countAfterNavigation);
 });
+
+test("Strict Mode replay leaves one effective hard deadline", async ({
+  page,
+}) => {
+  await page.clock.install();
+  let statusRequests = 0;
+
+  await page.route(`${API_BASE}/api/check/${TEST_TASK_ID}`, () => {
+    statusRequests++;
+  });
+
+  await page.goto(`/check/${TEST_TASK_ID}`);
+  await expect.poll(() => statusRequests).toBeGreaterThanOrEqual(1);
+
+  await page.clock.fastForward(299_000);
+  await expect(page.locator(".page-title")).toHaveText("检测进行中");
+
+  await page.clock.fastForward(1_000);
+  await expect(page.locator(".page-title")).toHaveText("检测超时");
+
+  const requestsAtDeadline = statusRequests;
+  await page.clock.fastForward(30_000);
+  expect(statusRequests).toBe(requestsAtDeadline);
+});

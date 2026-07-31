@@ -7,6 +7,8 @@ import {
   TEST_TASK_ID,
   mockAssessment,
   mockCompletedStatus,
+  mockFailedStatus,
+  mockPendingStatus,
   mockRepairPlan,
   mockScanResult,
 } from "./fixtures";
@@ -112,25 +114,148 @@ test("one status request timeout schedules another poll and can recover", async 
   expect(statusRequests).toBeGreaterThanOrEqual(2);
 });
 
-test("persistent status request timeouts end at the total polling timeout", async ({
+test("the hard deadline aborts the active status request and stops later polls", async ({
   page,
 }) => {
   await page.clock.install();
   let statusRequests = 0;
-  await page.route(`${API_BASE}/api/check/${TEST_TASK_ID}`, () => {
+  let failedStatusRequests = 0;
+  let firstStatusRoute: Route | null = null;
+
+  page.on("requestfailed", (request) => {
+    if (request.url() === `${API_BASE}/api/check/${TEST_TASK_ID}`) {
+      failedStatusRequests++;
+    }
+  });
+  await page.route(`${API_BASE}/api/check/${TEST_TASK_ID}`, (route) => {
     statusRequests++;
+    if (statusRequests === 1) {
+      firstStatusRoute = route;
+    }
   });
 
   await page.goto(`/check/${TEST_TASK_ID}`);
   await expect.poll(() => statusRequests).toBe(1);
 
-  await page.clock.fastForward(10_001);
-  await page.clock.fastForward(2_001);
-  await expect.poll(() => statusRequests).toBeGreaterThanOrEqual(2);
-  await page.clock.fastForward(288_000);
+  await page.clock.fastForward(1);
+  if (!firstStatusRoute) throw new Error("Expected the initial status request");
+  await fulfillJson(firstStatusRoute, mockPendingStatus);
+
+  await page.clock.fastForward(298_999);
+  await expect(page.locator(".page-title")).toHaveText("检测进行中");
+  const failuresBeforeDeadline = failedStatusRequests;
+
+  await page.clock.fastForward(1_000);
 
   await expect(page.locator(".page-title")).toHaveText("检测超时");
-  expect(statusRequests).toBeGreaterThanOrEqual(2);
+  await expect
+    .poll(() => failedStatusRequests)
+    .toBeGreaterThan(failuresBeforeDeadline);
+
+  const requestsAtDeadline = statusRequests;
+  await page.clock.fastForward(30_000);
+  expect(statusRequests).toBe(requestsAtDeadline);
+});
+
+test("completion before the hard deadline keeps result loading alive", async ({
+  page,
+}) => {
+  await page.clock.install();
+  let statusRequests = 0;
+  let firstStatusRoute: Route | null = null;
+  let activeStatusRoute: Route | null = null;
+  const resultRoutes = new Map<string, Route>();
+
+  await page.route(`${API_BASE}/api/check/${TEST_TASK_ID}`, (route) => {
+    statusRequests++;
+    if (statusRequests === 1) {
+      firstStatusRoute = route;
+    } else {
+      activeStatusRoute = route;
+    }
+  });
+  for (const endpoint of Object.values(RESULT_ENDPOINTS)) {
+    await page.route(
+      `${API_BASE}/api/check/${TEST_TASK_ID}/${endpoint.path}`,
+      (route) => {
+        resultRoutes.set(endpoint.path, route);
+      },
+    );
+  }
+
+  await page.goto(`/check/${TEST_TASK_ID}`);
+  await expect.poll(() => statusRequests).toBe(1);
+
+  await page.clock.fastForward(1);
+  if (!firstStatusRoute) throw new Error("Expected the initial status request");
+  await fulfillJson(firstStatusRoute, mockPendingStatus);
+
+  await page.clock.fastForward(290_000);
+  await expect.poll(() => activeStatusRoute).not.toBeNull();
+  await page.clock.fastForward(8_999);
+
+  if (!activeStatusRoute) throw new Error("Expected an active status request");
+  await fulfillJson(activeStatusRoute, mockCompletedStatus);
+  await expect.poll(() => resultRoutes.size).toBe(3);
+
+  await page.clock.fastForward(2_000);
+  await Promise.all(
+    Object.values(RESULT_ENDPOINTS).map((endpoint) => {
+      const route = resultRoutes.get(endpoint.path);
+      if (!route) throw new Error(`Missing ${endpoint.path} request`);
+      return fulfillJson(route, endpoint.body);
+    }),
+  );
+
+  await expect(page.locator(".tabs")).toBeVisible();
+  await expect(page.locator(".page-title")).toHaveText("检测结果");
+});
+
+test("failed status clears the hard deadline", async ({ page }) => {
+  await page.clock.install();
+  let statusRequests = 0;
+  await page.route(`${API_BASE}/api/check/${TEST_TASK_ID}`, (route) => {
+    statusRequests++;
+    return fulfillJson(route, mockFailedStatus);
+  });
+
+  await page.goto(`/check/${TEST_TASK_ID}`);
+  await expect(page.locator(".page-title")).toHaveText("检测失败");
+  const requestsAfterFailure = statusRequests;
+
+  await page.clock.fastForward(300_001);
+
+  await expect(page.locator(".page-title")).toHaveText("检测失败");
+  expect(statusRequests).toBe(requestsAfterFailure);
+});
+
+test("an old task deadline cannot stop the replacement task session", async ({
+  page,
+}) => {
+  await page.clock.install();
+  const nextTaskId = "12345678-1234-1234-1234-123456789abc";
+  let oldTaskRequests = 0;
+  let newTaskRequests = 0;
+
+  await page.route(`${API_BASE}/api/check/${TEST_TASK_ID}`, () => {
+    oldTaskRequests++;
+  });
+  await page.route(`${API_BASE}/api/check/${nextTaskId}`, () => {
+    newTaskRequests++;
+  });
+
+  await page.goto(`/check/${TEST_TASK_ID}`);
+  await expect.poll(() => oldTaskRequests).toBe(1);
+  await page.clock.fastForward(1_000);
+
+  await page.goto(`/check/${nextTaskId}`);
+  await expect.poll(() => newTaskRequests).toBe(1);
+  const oldRequestsAfterReplacement = oldTaskRequests;
+
+  await page.clock.fastForward(299_000);
+
+  await expect(page.locator(".page-title")).toHaveText("检测进行中");
+  expect(oldTaskRequests).toBe(oldRequestsAfterReplacement);
 });
 
 for (const [hungResult, endpoint] of Object.entries(RESULT_ENDPOINTS)) {
@@ -178,6 +303,7 @@ for (const [hungResult, endpoint] of Object.entries(RESULT_ENDPOINTS)) {
 test("caller abort on page unload stays silent and sends no later request", async ({
   page,
 }) => {
+  await page.clock.install();
   let statusRequests = 0;
   await page.route(`${API_BASE}/api/check/${TEST_TASK_ID}`, () => {
     statusRequests++;
@@ -187,7 +313,7 @@ test("caller abort on page unload stays silent and sends no later request", asyn
   await expect.poll(() => statusRequests).toBe(1);
 
   await page.goto("/");
-  await page.waitForTimeout(2_500);
+  await page.clock.fastForward(300_001);
 
   await expect(page.locator(".error-box")).toHaveCount(0);
   expect(statusRequests).toBe(1);
