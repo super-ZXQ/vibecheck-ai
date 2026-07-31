@@ -223,6 +223,5 @@ export interface RepairPlan {
 export interface ApiErrorBody {
   detail: {
     error_code: string;
-    error_message?: string;
   };
 }

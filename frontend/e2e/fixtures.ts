@@ -14,19 +14,6 @@ import type { Page, Route } from "@playwright/test";
 export const TEST_TASK_ID = "550e8400-e29b-41d4-a716-446655440000";
 export const API_BASE = "http://localhost:8000";
 
-/**
- * Set the API base URL for E2E tests via a test-only window property.
- * This ensures tests work even when the Next.js dev server doesn't
- * properly inline NEXT_PUBLIC_API_BASE_URL.
- *
- * Must be called BEFORE page.goto() in each test.
- */
-export async function setupTestApi(page: Page): Promise<void> {
-  await page.addInitScript(
-    `window.__TEST_API_BASE_URL__ = ${JSON.stringify(API_BASE)};`,
-  );
-}
-
 // ---------------------------------------------------------------------------
 // Mock task status responses
 // ---------------------------------------------------------------------------

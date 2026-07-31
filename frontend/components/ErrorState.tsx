@@ -3,8 +3,8 @@
  *
  * Never renders raw response bodies, exception repr, stack traces,
  * temp paths, or credential-like content. The message passed in is
- * always a pre-sanitized fixed string from error-messages.ts or the
- * backend's desensitized error_message field.
+ * always a pre-sanitized fixed string or a desensitized failed-task
+ * status message.
  */
 
 interface ErrorStateProps {

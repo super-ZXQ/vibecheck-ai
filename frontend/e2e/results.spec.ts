@@ -16,7 +16,6 @@ import {
   mockCompletedStatus,
   mockScanResult,
   mockTaskStatusSequence,
-  setupTestApi,
 } from "./fixtures";
 
 // ---------------------------------------------------------------------------
@@ -25,7 +24,6 @@ import {
 
 test.describe("All results success", () => {
   test("displays all three tabs with content after completed", async ({ page }) => {
-    await setupTestApi(page);
     await mockTaskStatusSequence(page, [mockCompletedStatus]);
     await mockAllResults(page);
 
@@ -61,7 +59,6 @@ test.describe("All results success", () => {
 
 test.describe("Assessment legacy 409", () => {
   test("marks assessment tab as unavailable, other tabs normal", async ({ page }) => {
-    await setupTestApi(page);
     await mockTaskStatusSequence(page, [mockCompletedStatus]);
     // Scan result → 200, Assessment → 409, Repair → 200
     await mockAllResults(page, {
@@ -101,7 +98,6 @@ test.describe("Assessment legacy 409", () => {
 
 test.describe("Repair plan legacy 409", () => {
   test("marks repair tab as unavailable, other tabs normal", async ({ page }) => {
-    await setupTestApi(page);
     await mockTaskStatusSequence(page, [mockCompletedStatus]);
     // Scan result → 200, Assessment → 200, Repair → 409
     await mockAllResults(page, {
@@ -141,7 +137,6 @@ test.describe("Repair plan legacy 409", () => {
 
 test.describe("Findings pagination", () => {
   test("paginates findings with 25 per page by default", async ({ page }) => {
-    await setupTestApi(page);
     await mockTaskStatusSequence(page, [mockCompletedStatus]);
     // mockScanResult has 30 findings
     await mockAllResults(page, {
@@ -172,7 +167,6 @@ test.describe("Findings pagination", () => {
   });
 
   test("switches to 50 per page", async ({ page }) => {
-    await setupTestApi(page);
     await mockTaskStatusSequence(page, [mockCompletedStatus]);
     await mockAllResults(page, {
       scanResultBody: mockScanResult,

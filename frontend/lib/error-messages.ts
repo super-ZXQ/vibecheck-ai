@@ -1,13 +1,17 @@
 /**
  * Complete error code → Chinese message mapping.
  *
- * Based on backend/app/core/error_codes.py — all 27 public error codes.
+ * Based on the public codes returned by the backend API routes.
  * Unknown error codes fall back to a fixed generic message.
  * No raw exception text, stack traces, temp paths, or credential patterns
  * are ever displayed.
  */
 
 const ERROR_MESSAGES: Record<string, string> = {
+  // Task lookup
+  TASK_NOT_FOUND: "任务不存在。",
+  INVALID_TASK_ID: "任务ID格式无效。",
+
   // URL validation
   INVALID_REPO_URL: "仓库地址格式无效，请输入合法的 GitHub 公开仓库地址。",
 

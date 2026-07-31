@@ -21,7 +21,6 @@ import {
   mockPendingStatus,
   mockRunningStatus,
   mockTaskStatusSequence,
-  setupTestApi,
 } from "./fixtures";
 
 // ---------------------------------------------------------------------------
@@ -30,8 +29,6 @@ import {
 
 test.describe("Progress change", () => {
   test("shows progress from queued to completed", async ({ page }) => {
-    await setupTestApi(page);
-
     // Sequence: pending → running → completed
     await mockTaskStatusSequence(page, [
       mockPendingStatus,
@@ -61,7 +58,6 @@ test.describe("Progress change", () => {
 
 test.describe("Failed state", () => {
   test("displays fixed safe error message for failed task", async ({ page }) => {
-    await setupTestApi(page);
     await mockTaskStatusSequence(page, [mockFailedStatus]);
 
     await page.goto(`/check/${TEST_TASK_ID}`);
@@ -74,7 +70,6 @@ test.describe("Failed state", () => {
   });
 
   test("falls back to error_code mapping when error_message is null", async ({ page }) => {
-    await setupTestApi(page);
     const failedWithoutMessage = {
       ...mockFailedStatus,
       error_message: null,
@@ -96,8 +91,6 @@ test.describe("Failed state", () => {
 
 test.describe("Network error retry", () => {
   test("retries polling after network error and eventually succeeds", async ({ page }) => {
-    await setupTestApi(page);
-
     let callCount = 0;
 
     await page.route(`${API_BASE}/api/check/${TEST_TASK_ID}`, (route) => {
@@ -133,7 +126,6 @@ test.describe("Network error retry", () => {
 test.describe("Poll timeout", () => {
   test("enters timeout state without waiting five minutes", async ({ page }) => {
     await page.clock.install();
-    await setupTestApi(page);
 
     // Mock status to always return pending (never completes)
     await page.route(`${API_BASE}/api/check/${TEST_TASK_ID}`, (route) => {
@@ -162,8 +154,6 @@ test.describe("Poll timeout", () => {
 
 test.describe("Page unload stops polling", () => {
   test("stops polling when navigating away from check page", async ({ page }) => {
-    await setupTestApi(page);
-
     let pollCount = 0;
 
     await page.route(`${API_BASE}/api/check/${TEST_TASK_ID}`, (route) => {
@@ -200,8 +190,6 @@ test.describe("Page unload stops polling", () => {
 
 test.describe("No overlapping requests", () => {
   test("does not send overlapping poll requests", async ({ page }) => {
-    await setupTestApi(page);
-
     let inFlight = false;
     let overlapDetected = false;
     let totalRequests = 0;

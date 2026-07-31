@@ -19,7 +19,6 @@ import {
   mockRunningStatus,
   mockScanResult,
   mockTaskStatusSequence,
-  setupTestApi,
 } from "./fixtures";
 
 // ---------------------------------------------------------------------------
@@ -28,8 +27,6 @@ import {
 
 test.describe("Agent prompt copy", () => {
   test("copies agent prompt only on user click", async ({ page, context }) => {
-    await setupTestApi(page);
-
     // Grant clipboard permissions
     await context.grantPermissions(["clipboard-read", "clipboard-write"]);
 
@@ -69,7 +66,6 @@ test.describe("Agent prompt copy", () => {
   });
 
   test("does not auto-copy agent prompt on page load", async ({ page, context }) => {
-    await setupTestApi(page);
     await context.grantPermissions(["clipboard-read", "clipboard-write"]);
 
     // Set initial clipboard content to verify it's not overwritten
@@ -101,8 +97,6 @@ test.describe("Agent prompt copy", () => {
 
 test.describe("Page refresh recovery", () => {
   test("recovers polling state when navigating directly to check page", async ({ page }) => {
-    await setupTestApi(page);
-
     // Simulate page refresh: navigate directly to /check/{task_id}
     // The page should start polling automatically.
     await mockTaskStatusSequence(page, [
@@ -137,8 +131,6 @@ test.describe("Page refresh recovery", () => {
   });
 
   test("accepts valid UUID format task_id", async ({ page }) => {
-    await setupTestApi(page);
-
     // Use a valid UUID format
     const validUuid = "12345678-1234-1234-1234-123456789abc";
 

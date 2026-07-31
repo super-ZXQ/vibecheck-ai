@@ -24,6 +24,10 @@ import type {
   TaskStatusResponse,
 } from "./types";
 import { NETWORK_ERROR_MESSAGE } from "./error-messages";
+import {
+  ApiConfigError,
+  getApiBaseUrl,
+} from "./api-config.mjs";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -31,56 +35,22 @@ import { NETWORK_ERROR_MESSAGE } from "./error-messages";
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 
-/**
- * Read the API base URL at call time (not import time).
- * If missing, throws ApiConfigError — never falls back to localhost.
- */
-function getApiBaseUrl(): string {
-  // E2E test overrides (never active in production)
-  if (typeof window !== "undefined") {
-    const forceErr = (window as unknown as Record<string, unknown>).__TEST_FORCE_CONFIG_ERROR__;
-    if (forceErr === true) {
-      throw new ApiConfigError();
-    }
-    // Test-only API base URL override. Allows E2E tests to work
-    // even when Next.js dev server doesn't inline NEXT_PUBLIC_API_BASE_URL.
-    const testUrl = (window as unknown as Record<string, unknown>).__TEST_API_BASE_URL__;
-    if (typeof testUrl === "string" && testUrl.trim() !== "") {
-      return testUrl.replace(/\/+$/, "");
-    }
-  }
-
-  const url = process.env.NEXT_PUBLIC_API_BASE_URL;
-  if (!url || url.trim() === "") {
-    throw new ApiConfigError();
-  }
-  return url.replace(/\/+$/, ""); // strip trailing slashes
-}
-
 // ---------------------------------------------------------------------------
 // Custom error types
 // ---------------------------------------------------------------------------
 
-/** Thrown when NEXT_PUBLIC_API_BASE_URL is not configured. */
-export class ApiConfigError extends Error {
-  constructor() {
-    super("API_BASE_URL_NOT_CONFIGURED");
-    this.name = "ApiConfigError";
-  }
-}
+export { ApiConfigError };
 
 /** Thrown when the server returns a non-2xx HTTP status. */
 export class ApiHttpError extends Error {
   readonly statusCode: number;
   readonly errorCode: string | null;
-  readonly errorMessage: string | null;
 
-  constructor(statusCode: number, errorCode: string | null, errorMessage: string | null) {
+  constructor(statusCode: number, errorCode: string | null) {
     super(errorCode ?? "HTTP_ERROR");
     this.name = "ApiHttpError";
     this.statusCode = statusCode;
     this.errorCode = errorCode;
-    this.errorMessage = errorMessage;
   }
 }
 
@@ -182,26 +152,22 @@ async function apiFetch<T>(path: string, options: FetchOptions): Promise<T> {
     if (!response.ok) {
       // Parse error body — only read detail.error_code.
       let errorCode: string | null = null;
-      let errorMessage: string | null = null;
       try {
         const body = (await response.json()) as ApiErrorBody;
         if (body?.detail?.error_code) {
           errorCode = body.detail.error_code;
         }
-        if (body?.detail?.error_message) {
-          errorMessage = body.detail.error_message;
-        }
       } catch {
         // JSON parse failed — errorCode stays null, will use generic message.
       }
-      throw new ApiHttpError(response.status, errorCode, errorMessage);
+      throw new ApiHttpError(response.status, errorCode);
     }
 
     // Parse successful JSON. If this fails, treat as internal error.
     try {
       return (await response.json()) as T;
     } catch {
-      throw new ApiHttpError(500, "INTERNAL_ERROR", null);
+      throw new ApiHttpError(500, "INTERNAL_ERROR");
     }
   } finally {
     // --- Cleanup: timeout + event listener ---

@@ -17,7 +17,11 @@ import {
   ApiNetworkError,
   submitCheck,
 } from "@/lib/api";
-import { getErrorMessage } from "@/lib/error-messages";
+import {
+  CONFIG_ERROR_MESSAGE,
+  getErrorMessage,
+  NETWORK_ERROR_MESSAGE,
+} from "@/lib/error-messages";
 
 export default function Home() {
   const router = useRouter();
@@ -39,14 +43,11 @@ export default function Home() {
       router.push(`/check/${response.task_id}`);
     } catch (err) {
       if (err instanceof ApiConfigError) {
-        setError(
-          "后端 API 地址未配置，请检查环境变量 NEXT_PUBLIC_API_BASE_URL。",
-        );
+        setError(CONFIG_ERROR_MESSAGE);
       } else if (err instanceof ApiHttpError) {
-        // Priority: backend error_message (already desensitized) → error_code mapping
-        setError(err.errorMessage || getErrorMessage(err.errorCode));
+        setError(getErrorMessage(err.errorCode));
       } else if (err instanceof ApiNetworkError) {
-        setError("网络连接失败，请检查网络后重试。");
+        setError(NETWORK_ERROR_MESSAGE);
       } else {
         setError(getErrorMessage(null));
       }
