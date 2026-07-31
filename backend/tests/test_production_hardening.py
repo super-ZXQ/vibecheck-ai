@@ -31,7 +31,7 @@ def make_production_settings(**overrides: object) -> Settings:
         "production_config_confirmed": True,
         "database_url": "sqlite:////data/vibecheck.db",
         "cors_allowed_origins": ["https://vibecheck.example"],
-        "trusted_hosts": ["vibecheck.example", "testserver"],
+        "trusted_hosts": ["127.0.0.1", "vibecheck.example", "testserver"],
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)
@@ -64,6 +64,21 @@ class TestStrictProductionConfiguration:
         with pytest.raises(ValidationError, match="explicit host name"):
             make_production_settings(trusted_hosts=["*"])
 
+    def test_production_requires_loopback_healthcheck_host(self):
+        with pytest.raises(ValidationError, match="must include 127.0.0.1"):
+            make_production_settings(
+                trusted_hosts=["vibecheck.example"],
+            )
+
+    def test_production_accepts_loopback_and_public_hosts(self):
+        configured = make_production_settings(
+            trusted_hosts=["127.0.0.1", "vibecheck.example.com"],
+        )
+        assert configured.trusted_hosts == [
+            "127.0.0.1",
+            "vibecheck.example.com",
+        ]
+
     def test_localhost_http_is_available_for_local_production_verification(self):
         configured = make_production_settings(
             cors_allowed_origins=["http://localhost:3000"],
@@ -89,6 +104,14 @@ class TestProductionApplicationSurface:
             headers={"Host": "attacker.example"},
         )
         assert response.status_code == 400
+
+    def test_loopback_healthcheck_host_is_accepted(self, test_db):
+        production_app = create_app(make_production_settings())
+        response = TestClient(production_app).get(
+            "/api/ready",
+            headers={"Host": "127.0.0.1"},
+        )
+        assert response.status_code == 200
 
     def test_security_headers_are_present_on_api_and_error_responses(self):
         production_app = create_app(make_production_settings())

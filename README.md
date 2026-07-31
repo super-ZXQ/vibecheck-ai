@@ -74,5 +74,11 @@ curl http://localhost:3000/health
 
 `NEXT_PUBLIC_API_BASE_URL` 会在前端镜像构建时固化，部署地址变化后必须重新
 构建前端镜像。面向非本机访问时，应在服务前放置 TLS 反向代理，并把
-`CORS_ALLOWED_ORIGINS` 与 `TRUSTED_HOSTS` 改成实际 HTTPS 域名。生产配置
+`CORS_ALLOWED_ORIGINS` 改成实际 HTTPS Origin，并将公网 Host 追加到
+`TRUSTED_HOSTS`。不得删除 `127.0.0.1`，否则后端会在启动时拒绝配置，容器
+健康检查也无法通过。
+
+后端使用内存中的 `/tmp` 保存下载的压缩包和解压目录；两者与运行开销可能
+同时占用临时空间。`BACKEND_TMPFS_SIZE` 不得低于最大压缩包（50 MB）与最大
+解压大小（200 MB）之和，并应保留额外余量，默认值为 `320m`。生产配置
 缺失、使用默认数据库路径或对远程来源使用 HTTP 时，后端会拒绝启动。

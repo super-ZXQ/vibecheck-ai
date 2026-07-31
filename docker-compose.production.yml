@@ -22,7 +22,7 @@ services:
       - backend_data:/data
     read_only: true
     tmpfs:
-      - /tmp:size=64m,mode=1777
+      - /tmp:size=${BACKEND_TMPFS_SIZE:-320m},mode=1777
     cap_drop:
       - ALL
     security_opt:

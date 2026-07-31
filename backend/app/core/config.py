@@ -220,6 +220,10 @@ class Settings(BaseSettings):
             )
         if "*" in self.trusted_hosts:
             raise ValueError("wildcard trusted host is forbidden in production")
+        if "127.0.0.1" not in self.trusted_hosts:
+            raise ValueError(
+                "production trusted_hosts must include 127.0.0.1"
+            )
 
         for origin in self.cors_allowed_origins:
             parsed = urlsplit(origin)
