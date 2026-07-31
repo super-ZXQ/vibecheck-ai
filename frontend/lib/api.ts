@@ -62,7 +62,15 @@ export class ApiNetworkError extends Error {
   }
 }
 
-/** Thrown when a request is aborted (timeout or caller abort). */
+/** Thrown when a single request exceeds its timeout. */
+export class ApiRequestTimeoutError extends Error {
+  constructor() {
+    super("REQUEST_TIMEOUT");
+    this.name = "ApiRequestTimeoutError";
+  }
+}
+
+/** Thrown when a request is aborted by its caller. */
 export class ApiAbortError extends Error {
   constructor() {
     super("ABORTED");
@@ -100,12 +108,20 @@ async function apiFetch<T>(path: string, options: FetchOptions): Promise<T> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const internalController = new AbortController();
   const internalSignal = internalController.signal;
+  let abortCause: "caller" | "timeout" | null = null;
+
+  const abort = (cause: "caller" | "timeout") => {
+    if (abortCause === null) {
+      abortCause = cause;
+    }
+    internalController.abort();
+  };
 
   // --- Set up timeout ---
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
   if (timeoutMs > 0) {
     timeoutId = setTimeout(() => {
-      internalController.abort();
+      abort("timeout");
     }, timeoutMs);
   }
 
@@ -118,7 +134,7 @@ async function apiFetch<T>(path: string, options: FetchOptions): Promise<T> {
       throw new ApiAbortError();
     }
     callerAbortListener = () => {
-      internalController.abort();
+      abort("caller");
     };
     options.signal.addEventListener("abort", callerAbortListener, { once: true });
   }
@@ -144,6 +160,9 @@ async function apiFetch<T>(path: string, options: FetchOptions): Promise<T> {
     } catch (err) {
       // fetch throws TypeError on network failure or abort.
       if (internalSignal.aborted) {
+        if (abortCause === "timeout") {
+          throw new ApiRequestTimeoutError();
+        }
         throw new ApiAbortError();
       }
       throw new ApiNetworkError();

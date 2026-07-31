@@ -15,6 +15,7 @@ import {
   ApiConfigError,
   ApiHttpError,
   ApiNetworkError,
+  ApiRequestTimeoutError,
   submitCheck,
 } from "@/lib/api";
 import {
@@ -46,7 +47,10 @@ export default function Home() {
         setError(CONFIG_ERROR_MESSAGE);
       } else if (err instanceof ApiHttpError) {
         setError(getErrorMessage(err.errorCode));
-      } else if (err instanceof ApiNetworkError) {
+      } else if (
+        err instanceof ApiNetworkError ||
+        err instanceof ApiRequestTimeoutError
+      ) {
         setError(NETWORK_ERROR_MESSAGE);
       } else {
         setError(getErrorMessage(null));

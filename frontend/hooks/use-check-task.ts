@@ -14,6 +14,7 @@ import {
   ApiConfigError,
   ApiHttpError,
   ApiNetworkError,
+  ApiRequestTimeoutError,
   getAssessment,
   getRepairPlan,
   getScanResult,
@@ -151,12 +152,20 @@ export function useCheckTask(options?: UseCheckTaskOptions): UseCheckTaskResult 
       ]);
 
       if (!isSessionActive(session)) return;
+      if (
+        [resultRes, assessmentRes, repairRes].some(
+          (result) =>
+            result.status === "rejected" &&
+            result.reason instanceof ApiAbortError,
+        )
+      ) {
+        return;
+      }
 
       if (resultRes.status === "fulfilled") {
         setScanResult(resultRes.value);
         setScanResultStatus("available");
       } else {
-        if (resultRes.reason instanceof ApiAbortError) return;
         setScanResult(null);
         setScanResultStatus(
           resultRes.reason instanceof ApiHttpError &&
@@ -170,7 +179,6 @@ export function useCheckTask(options?: UseCheckTaskOptions): UseCheckTaskResult 
         setAssessment(assessmentRes.value);
         setAssessmentStatus("available");
       } else {
-        if (assessmentRes.reason instanceof ApiAbortError) return;
         setAssessment(null);
         setAssessmentStatus(
           assessmentRes.reason instanceof ApiHttpError &&
@@ -184,7 +192,6 @@ export function useCheckTask(options?: UseCheckTaskOptions): UseCheckTaskResult 
         setRepairPlan(repairRes.value);
         setRepairPlanStatus("available");
       } else {
-        if (repairRes.reason instanceof ApiAbortError) return;
         setRepairPlan(null);
         setRepairPlanStatus(
           repairRes.reason instanceof ApiHttpError &&
@@ -240,7 +247,10 @@ export function useCheckTask(options?: UseCheckTaskOptions): UseCheckTaskResult 
           return;
         }
 
-        if (err instanceof ApiNetworkError) {
+        if (
+          err instanceof ApiNetworkError ||
+          err instanceof ApiRequestTimeoutError
+        ) {
           if (Date.now() - session.startedAt >= pollTimeoutMs) {
             stopSession(session);
             setState("timeout");
@@ -334,7 +344,10 @@ export function useCheckTask(options?: UseCheckTaskOptions): UseCheckTaskResult 
           message = CONFIG_ERROR_MESSAGE;
         } else if (err instanceof ApiHttpError) {
           message = getErrorMessage(err.errorCode);
-        } else if (err instanceof ApiNetworkError) {
+        } else if (
+          err instanceof ApiNetworkError ||
+          err instanceof ApiRequestTimeoutError
+        ) {
           message = NETWORK_ERROR_MESSAGE;
         } else {
           message = getErrorMessage("INTERNAL_ERROR");
