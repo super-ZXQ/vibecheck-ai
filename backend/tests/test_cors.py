@@ -14,6 +14,9 @@ Verifies the FastAPI CORSMiddleware configuration:
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
+
+from app.core.config import Settings
 
 
 # ---------------------------------------------------------------------------
@@ -242,3 +245,55 @@ class TestCorsNoWildcard:
         from app.core.config import settings
         assert "*" not in settings.cors_allowed_origins
         assert "http://localhost:3000" in settings.cors_allowed_origins
+
+
+class TestCorsOriginConfiguration:
+    """Validate environment-provided origins before middleware consumes them."""
+
+    @pytest.mark.parametrize(
+        "origins",
+        [
+            ["*"],
+            [],
+            [""],
+            ["javascript:alert(1)"],
+            ["http://localhost:3000/path"],
+            ["http://user:pass@localhost:3000"],
+            ["http://localhost:3000?x=1"],
+            ["http://localhost:3000#fragment"],
+            ("http://localhost:3000",),
+            [123],
+        ],
+    )
+    def test_invalid_origins_reject_settings_initialization(self, origins):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, cors_allowed_origins=origins)
+
+    @pytest.mark.parametrize(
+        "origins",
+        [
+            ["http://localhost:3000"],
+            ["https://example.com"],
+            ["http://localhost:3000", "https://example.com"],
+        ],
+    )
+    def test_valid_origins_are_accepted(self, origins):
+        configured = Settings(
+            _env_file=None,
+            cors_allowed_origins=origins,
+        )
+        assert configured.cors_allowed_origins == origins
+
+    def test_duplicate_origins_are_removed_in_first_seen_order(self):
+        configured = Settings(
+            _env_file=None,
+            cors_allowed_origins=[
+                "https://example.com",
+                "http://localhost:3000",
+                "https://example.com",
+            ],
+        )
+        assert configured.cors_allowed_origins == [
+            "https://example.com",
+            "http://localhost:3000",
+        ]
