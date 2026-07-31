@@ -181,9 +181,15 @@ test.describe("Network error retry", () => {
     await page.goto(`/check/${TEST_TASK_ID}`);
     await expect.poll(() => callCount).toBeGreaterThanOrEqual(1);
 
-    await page.clock.fastForward(300_001);
+    await page.clock.fastForward(2_001);
+    await expect.poll(() => callCount).toBeGreaterThanOrEqual(2);
+
+    await page.clock.fastForward(298_000);
     await expect(page.locator(".page-title")).toContainText("检测超时");
-    expect(callCount).toBeGreaterThanOrEqual(2);
+    const callsAtDeadline = callCount;
+
+    await page.clock.fastForward(30_000);
+    expect(callCount).toBe(callsAtDeadline);
   });
 });
 
