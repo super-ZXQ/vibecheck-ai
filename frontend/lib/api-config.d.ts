@@ -1,3 +1,4 @@
 export class ApiConfigError extends Error {}
 
-export function getApiBaseUrl(configuredUrl?: string): string;
+export function normalizeApiBaseUrl(configuredUrl: string | undefined): string;
+export function getApiBaseUrl(): string;

@@ -47,11 +47,7 @@ test.describe("URL submission", () => {
 test.describe("Queue full error", () => {
   test("displays queue full message with real HTTP 429 status", async ({ page }) => {
     // Mock POST /api/check → 429 QUEUE_FULL
-    // The test reads the real HTTP status code from the mocked response.
-    // It does NOT assume 429 — it verifies the actual status returned.
-    let capturedStatus: number | null = null;
     await page.route(`${API_BASE}/api/check`, (route) => {
-      capturedStatus = 429;
       route.fulfill({
         status: 429,
         contentType: "application/json",
@@ -66,10 +62,16 @@ test.describe("Queue full error", () => {
 
     await page.goto("/");
     await page.fill('input[aria-label="GitHub 仓库地址"]', "https://github.com/owner/repo");
+    const responsePromise = page.waitForResponse(
+      (response) =>
+        response.url() === `${API_BASE}/api/check` &&
+        response.request().method() === "POST",
+    );
     await page.click('button[type="submit"]');
+    const response = await responsePromise;
 
-    // Verify the real HTTP status was 429 (read from actual response)
-    expect(capturedStatus).toBe(429);
+    // Verify the HTTP status observed by the browser.
+    expect(response.status()).toBe(429);
 
     // Verify fixed safe error message is displayed
     await expect(page.locator(".error-box")).toContainText("检测队列已满");

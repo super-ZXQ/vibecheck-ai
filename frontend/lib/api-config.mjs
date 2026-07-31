@@ -5,11 +5,13 @@ export class ApiConfigError extends Error {
   }
 }
 
-export function getApiBaseUrl(
-  configuredUrl = process.env.NEXT_PUBLIC_API_BASE_URL,
-) {
+export function normalizeApiBaseUrl(configuredUrl) {
   if (!configuredUrl || configuredUrl.trim() === "") {
     throw new ApiConfigError();
   }
   return configuredUrl.replace(/\/+$/, "");
+}
+
+export function getApiBaseUrl() {
+  return normalizeApiBaseUrl(process.env.NEXT_PUBLIC_API_BASE_URL);
 }

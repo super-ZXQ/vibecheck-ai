@@ -32,9 +32,13 @@ jobs:
         working-directory: frontend
         run: npm run check:test-hooks
 
-      - name: Run unit tests
+      - name: Run unit tests with configured API URL
         working-directory: frontend
         run: npm run test:unit
+
+      - name: Run unit tests without configured API URL
+        working-directory: frontend
+        run: env -u NEXT_PUBLIC_API_BASE_URL npm run test:unit
 
       - name: Build
         working-directory: frontend

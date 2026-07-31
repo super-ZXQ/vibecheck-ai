@@ -59,3 +59,69 @@ test("direct result URL keeps one polling session after Strict Mode replay", asy
   expect(statusRequests).toBeLessThanOrEqual(5);
   expect(overlapAfterReplay).toBe(false);
 });
+
+test("task ID change stops the old Strict Mode polling session", async ({
+  page,
+}) => {
+  const nextTaskId = "12345678-1234-1234-1234-123456789abc";
+  let oldTaskRequests = 0;
+  let newTaskRequests = 0;
+
+  await page.route(`${API_BASE}/api/check/${TEST_TASK_ID}`, (route) => {
+    oldTaskRequests++;
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(mockPendingStatus),
+    });
+  });
+  await page.route(`${API_BASE}/api/check/${nextTaskId}`, (route) => {
+    newTaskRequests++;
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        ...mockPendingStatus,
+        task_id: nextTaskId,
+      }),
+    });
+  });
+  await mockAllResults(page);
+
+  await page.goto(`/check/${TEST_TASK_ID}`);
+  await expect(page.locator(".card")).toContainText("排队中");
+
+  await page.goto(`/check/${nextTaskId}`);
+  await expect.poll(() => newTaskRequests).toBeGreaterThanOrEqual(1);
+  const oldCountAfterNavigation = oldTaskRequests;
+
+  await page.waitForTimeout(2_500);
+
+  expect(oldTaskRequests).toBe(oldCountAfterNavigation);
+  expect(newTaskRequests).toBeGreaterThanOrEqual(1);
+});
+
+test("page unload aborts the Strict Mode session without a later poll", async ({
+  page,
+}) => {
+  let statusRequests = 0;
+
+  await page.route(`${API_BASE}/api/check/${TEST_TASK_ID}`, (route) => {
+    statusRequests++;
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(mockPendingStatus),
+    });
+  });
+
+  await page.goto(`/check/${TEST_TASK_ID}`);
+  await expect(page.locator(".card")).toContainText("排队中");
+
+  await page.goto("/");
+  const countAfterNavigation = statusRequests;
+  await page.waitForTimeout(2_500);
+
+  await expect(page.locator(".error-box")).toHaveCount(0);
+  expect(statusRequests).toBe(countAfterNavigation);
+});
