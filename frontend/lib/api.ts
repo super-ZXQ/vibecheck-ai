@@ -28,6 +28,11 @@ import {
   ApiConfigError,
   getApiBaseUrl,
 } from "./api-config.mjs";
+import {
+  ApiAbortError,
+  ApiRequestTimeoutError,
+  throwAbortOutcome,
+} from "./api-abort.mjs";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -40,6 +45,7 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 // ---------------------------------------------------------------------------
 
 export { ApiConfigError };
+export { ApiAbortError, ApiRequestTimeoutError };
 
 /** Thrown when the server returns a non-2xx HTTP status. */
 export class ApiHttpError extends Error {
@@ -59,22 +65,6 @@ export class ApiNetworkError extends Error {
   constructor() {
     super("NETWORK_ERROR");
     this.name = "ApiNetworkError";
-  }
-}
-
-/** Thrown when a single request exceeds its timeout. */
-export class ApiRequestTimeoutError extends Error {
-  constructor() {
-    super("REQUEST_TIMEOUT");
-    this.name = "ApiRequestTimeoutError";
-  }
-}
-
-/** Thrown when a request is aborted by its caller. */
-export class ApiAbortError extends Error {
-  constructor() {
-    super("ABORTED");
-    this.name = "ApiAbortError";
   }
 }
 
@@ -157,14 +147,9 @@ async function apiFetch<T>(path: string, options: FetchOptions): Promise<T> {
     let response: Response;
     try {
       response = await fetch(url, fetchInit);
-    } catch (err) {
+    } catch {
       // fetch throws TypeError on network failure or abort.
-      if (internalSignal.aborted) {
-        if (abortCause === "timeout") {
-          throw new ApiRequestTimeoutError();
-        }
-        throw new ApiAbortError();
-      }
+      throwAbortOutcome(internalSignal, abortCause);
       throw new ApiNetworkError();
     }
 
@@ -177,6 +162,7 @@ async function apiFetch<T>(path: string, options: FetchOptions): Promise<T> {
           errorCode = body.detail.error_code;
         }
       } catch {
+        throwAbortOutcome(internalSignal, abortCause);
         // JSON parse failed — errorCode stays null, will use generic message.
       }
       throw new ApiHttpError(response.status, errorCode);
@@ -186,6 +172,7 @@ async function apiFetch<T>(path: string, options: FetchOptions): Promise<T> {
     try {
       return (await response.json()) as T;
     } catch {
+      throwAbortOutcome(internalSignal, abortCause);
       throw new ApiHttpError(500, "INTERNAL_ERROR");
     }
   } finally {
