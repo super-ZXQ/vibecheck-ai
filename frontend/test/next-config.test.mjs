@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 const frontendRoot = fileURLToPath(new URL("..", import.meta.url));
+const require = createRequire(import.meta.url);
+const {
+  getProductionApiOrigin,
+} = require("../lib/production-api-origin.cjs");
 
 function loadProductionConfig(apiBaseUrl) {
   const env = {
@@ -56,3 +61,30 @@ test("production Next config enables standalone and removes X-Powered-By", () =>
     reactStrictMode: true,
   });
 });
+
+for (const apiOrigin of [
+  "https://api.example.com",
+  "http://localhost:8000",
+  "http://127.0.0.1:8000",
+  "http://[::1]:8000",
+]) {
+  test(`production API origin accepts ${apiOrigin}`, () => {
+    assert.equal(getProductionApiOrigin(apiOrigin), apiOrigin);
+  });
+}
+
+for (const apiOrigin of [
+  "http://api.example.com",
+  "https://user:pass@example.com",
+  "https://example.com/api",
+  "https://example.com?x=1",
+  "https://example.com#fragment",
+  "javascript:alert(1)",
+]) {
+  test(`production API origin rejects ${apiOrigin}`, () => {
+    assert.throws(
+      () => getProductionApiOrigin(apiOrigin),
+      /NEXT_PUBLIC_API_BASE_URL/,
+    );
+  });
+}

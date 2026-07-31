@@ -1,28 +1,17 @@
 /** @type {import('next').NextConfig} */
 
+const {
+  getProductionApiOrigin,
+  normalizeApiOrigin,
+} = require("./lib/production-api-origin.cjs");
+
 const production = process.env.NODE_ENV === "production";
 const configuredApiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL;
 
 function getConfiguredApiOrigin() {
-  if (!configuredApiBaseUrl) {
-    if (production) {
-      throw new Error("NEXT_PUBLIC_API_BASE_URL is required for production");
-    }
-    return null;
-  }
-
-  const parsed = new URL(configuredApiBaseUrl);
-  if (
-    !["http:", "https:"].includes(parsed.protocol) ||
-    parsed.username ||
-    parsed.password ||
-    parsed.search ||
-    parsed.hash ||
-    (parsed.pathname && parsed.pathname !== "/")
-  ) {
-    throw new Error("NEXT_PUBLIC_API_BASE_URL must be a pure HTTP(S) origin");
-  }
-  return parsed.origin;
+  if (production) return getProductionApiOrigin(configuredApiBaseUrl);
+  if (!configuredApiBaseUrl) return null;
+  return normalizeApiOrigin(configuredApiBaseUrl).origin;
 }
 
 const apiOrigin = getConfiguredApiOrigin();
