@@ -1,6 +1,7 @@
 # === Secrets & Environment ===
 .env
 .env.*
+production.env
 !.env.example
 !.env.sample
 *.pem

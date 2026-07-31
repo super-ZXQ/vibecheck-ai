@@ -1,0 +1,16 @@
+.git
+.gitignore
+.env
+.env.*
+__pycache__
+*.py[cod]
+*.db
+*.sqlite
+*.sqlite3
+.pytest_cache
+.mypy_cache
+.coverage
+htmlcov
+tests
+venv
+.venv

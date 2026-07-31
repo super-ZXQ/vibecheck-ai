@@ -202,6 +202,23 @@ def init_db() -> None:
             conn.close()
 
 
+def check_database_ready() -> None:
+    """Raise when the database is unavailable or not initialized."""
+    conn = _get_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'tasks'
+            """
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("database schema is not initialized")
+    finally:
+        conn.close()
+
+
 def reset_db() -> None:
     """Drop and recreate all tables — for testing only."""
     global _initialized
