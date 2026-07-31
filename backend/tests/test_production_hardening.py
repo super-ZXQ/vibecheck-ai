@@ -125,8 +125,10 @@ class TestProductionApplicationSurface:
         assert production_app.redoc_url is None
         assert production_app.openapi_url is None
 
-        response = TestClient(production_app).get("/docs")
-        assert response.status_code == 404
+        client = TestClient(production_app)
+        for path in ("/docs", "/redoc", "/openapi.json"):
+            response = client.get(path)
+            assert response.status_code == 404
 
     def test_untrusted_host_is_rejected(self):
         production_app = create_app(make_production_settings())
@@ -163,6 +165,72 @@ class TestProductionApplicationSurface:
             assert response.headers["strict-transport-security"] == (
                 "max-age=31536000; includeSubDomains"
             )
+
+    def test_cors_allows_only_configured_origin_without_credentials(self):
+        production_app = create_app(make_production_settings())
+        response = TestClient(production_app).options(
+            "/api/check",
+            headers={
+                "Origin": "https://vibecheck.example",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "Content-Type,Accept",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.headers["access-control-allow-origin"] == (
+            "https://vibecheck.example"
+        )
+        assert "access-control-allow-credentials" not in response.headers
+        allowed_methods = response.headers["access-control-allow-methods"]
+        assert set(allowed_methods.split(", ")) == {"GET", "POST", "OPTIONS"}
+        allowed_headers = response.headers["access-control-allow-headers"].lower()
+        assert "content-type" in allowed_headers
+        assert "accept" in allowed_headers
+        assert "authorization" not in allowed_headers
+
+    def test_cors_does_not_allow_unconfigured_origin(self):
+        production_app = create_app(make_production_settings())
+        response = TestClient(production_app).options(
+            "/api/check",
+            headers={
+                "Origin": "https://attacker.example",
+                "Access-Control-Request-Method": "POST",
+            },
+        )
+
+        assert "access-control-allow-origin" not in response.headers
+
+    def test_invalid_input_responses_do_not_echo_sensitive_values(self, test_db):
+        production_app = create_app(make_production_settings())
+        client = TestClient(production_app)
+        sensitive_url = (
+            "https://" + "sample-user" + ":" + "sample-pass"
+            + "@github.com/owner/repository"
+        )
+
+        invalid_repo = client.post(
+            "/api/check",
+            json={"repo_url": sensitive_url},
+        )
+        invalid_task = client.get("/api/check/not-a-task-id")
+
+        assert invalid_repo.status_code == 400
+        assert invalid_repo.json()["detail"]["error_code"] == "INVALID_REPO_URL"
+        assert sensitive_url not in invalid_repo.text
+        assert invalid_task.status_code == 422
+        assert invalid_task.json()["detail"]["error_code"] == "INVALID_TASK_ID"
+        assert "not-a-task-id" not in invalid_task.text
+        combined = (invalid_repo.text + invalid_task.text).lower()
+        for forbidden in (
+            "traceback",
+            "exception",
+            "sample-user",
+            "sample-pass",
+            "/app/",
+            "c:\\",
+        ):
+            assert forbidden not in combined
 
 
 class TestReadiness:
