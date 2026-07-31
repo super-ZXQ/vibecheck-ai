@@ -131,15 +131,9 @@ test.describe("Network error retry", () => {
 // ---------------------------------------------------------------------------
 
 test.describe("Poll timeout", () => {
-  test("enters timeout state using short test timeout (not 5 minutes)", async ({ page }) => {
+  test("enters timeout state without waiting five minutes", async ({ page }) => {
+    await page.clock.install();
     await setupTestApi(page);
-
-    // Inject a short poll timeout for testing.
-    // Production default remains 300000ms (5 minutes).
-    // This test does NOT wait 5 minutes.
-    await page.addInitScript(() => {
-      (window as unknown as Record<string, unknown>).__TEST_POLL_TIMEOUT_MS__ = 3000;
-    });
 
     // Mock status to always return pending (never completes)
     await page.route(`${API_BASE}/api/check/${TEST_TASK_ID}`, (route) => {
@@ -155,8 +149,9 @@ test.describe("Poll timeout", () => {
     // Verify polling starts
     await expect(page.locator(".card")).toContainText("排队中", { timeout: 10_000 });
 
-    // Wait for timeout state (should take ~4s with 3s timeout + 2s interval)
-    await expect(page.locator(".page-title")).toContainText("检测超时", { timeout: 20_000 });
+    // Jump past the production timeout. Only the due recursive timer fires.
+    await page.clock.fastForward(300_001);
+    await expect(page.locator(".page-title")).toContainText("检测超时");
     await expect(page.locator(".error-box")).toContainText("检测超时");
   });
 });

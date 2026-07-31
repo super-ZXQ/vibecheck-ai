@@ -1,23 +1,8 @@
 /**
  * Task lifecycle hook: submit → poll → load results.
  *
- * State machine (frozen):
- *   idle → submitting → polling → loading_results → completed
- *                                    ↘ failed
- *                                    ↘ timeout
- *
- * Polling rules:
- * - Recursive setTimeout (never setInterval).
- * - Previous request must settle before the next is scheduled.
- * - Page-unload aborts the AbortController and clears the timer.
- * - Terminal states (completed, failed, timeout) stop polling immediately.
- * - timeout does NOT fake a backend "failed" status — it is its own state.
- *
- * Result loading:
- * - Uses Promise.allSettled for /result, /assessment, /repair-plan.
- * - loading_results ends when all three are settled (not all successful).
- * - Each Tab independently tracks: available | unavailable | error.
- * - Legacy 409 on assessment/repair → "unavailable" (not an error).
+ * Polling uses recursive setTimeout. Each session owns its timer and
+ * AbortController so an old effect cleanup cannot stop a newer session.
  */
 
 "use client";
@@ -35,7 +20,11 @@ import {
   getTaskStatus,
   submitCheck,
 } from "@/lib/api";
-import { getErrorMessage } from "@/lib/error-messages";
+import {
+  CONFIG_ERROR_MESSAGE,
+  getErrorMessage,
+  NETWORK_ERROR_MESSAGE,
+} from "@/lib/error-messages";
 import type {
   AssessmentResult,
   RepairPlan,
@@ -43,29 +32,8 @@ import type {
   TaskStatusResponse,
 } from "@/lib/types";
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 const DEFAULT_POLL_INTERVAL_MS = 2000;
 const DEFAULT_POLL_TIMEOUT_MS = 300_000;
-
-/**
- * E2E test override for poll timeout (never set in production).
- * Allows tests to use a shorter timeout without waiting 5 minutes.
- * Production default remains 300000ms.
- */
-function getTestPollTimeout(): number | undefined {
-  if (typeof window !== "undefined") {
-    const val = (window as unknown as Record<string, unknown>).__TEST_POLL_TIMEOUT_MS__;
-    if (typeof val === "number" && val > 0) return val;
-  }
-  return undefined;
-}
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
 
 export type UIState =
   | "idle"
@@ -88,306 +56,79 @@ export interface UseCheckTaskResult {
   taskId: string | null;
   taskStatus: TaskStatusResponse | null;
   errorMessage: string | null;
-
-  // Results (populated when state === "completed")
   scanResult: ScanResult | null;
   scanResultStatus: ResultTabStatus;
   assessment: AssessmentResult | null;
   assessmentStatus: ResultTabStatus;
   repairPlan: RepairPlan | null;
   repairPlanStatus: ResultTabStatus;
-
-  // Actions
   submit: (repoUrl: string) => Promise<void>;
-  startPolling: (existingTaskId: string) => void;
+  startPolling: (existingTaskId: string) => () => void;
   reset: () => void;
 }
 
-// ---------------------------------------------------------------------------
-// Hook
-// ---------------------------------------------------------------------------
+interface PollingSession {
+  controller: AbortController;
+  timer: ReturnType<typeof setTimeout> | null;
+  startedAt: number;
+}
 
 export function useCheckTask(options?: UseCheckTaskOptions): UseCheckTaskResult {
   const pollIntervalMs = options?.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
-  const pollTimeoutMs = options?.pollTimeoutMs ?? getTestPollTimeout() ?? DEFAULT_POLL_TIMEOUT_MS;
+  const pollTimeoutMs = options?.pollTimeoutMs ?? DEFAULT_POLL_TIMEOUT_MS;
 
   const [state, setState] = useState<UIState>("idle");
   const [taskId, setTaskId] = useState<string | null>(null);
   const [taskStatus, setTaskStatus] = useState<TaskStatusResponse | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-
   const [scanResult, setScanResult] = useState<ScanResult | null>(null);
-  const [scanResultStatus, setScanResultStatus] = useState<ResultTabStatus>("unavailable");
+  const [scanResultStatus, setScanResultStatus] =
+    useState<ResultTabStatus>("unavailable");
   const [assessment, setAssessment] = useState<AssessmentResult | null>(null);
-  const [assessmentStatus, setAssessmentStatus] = useState<ResultTabStatus>("unavailable");
+  const [assessmentStatus, setAssessmentStatus] =
+    useState<ResultTabStatus>("unavailable");
   const [repairPlan, setRepairPlan] = useState<RepairPlan | null>(null);
-  const [repairPlanStatus, setRepairPlanStatus] = useState<ResultTabStatus>("unavailable");
+  const [repairPlanStatus, setRepairPlanStatus] =
+    useState<ResultTabStatus>("unavailable");
 
-  // --- Refs for cleanup ---
-  const abortControllerRef = useRef<AbortController | null>(null);
-  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const startTimeRef = useRef<number>(0);
-  const isMountedRef = useRef<boolean>(true);
+  const activeSessionRef = useRef<PollingSession | null>(null);
+  const isMountedRef = useRef(true);
 
-  // --- Cleanup helper ---
-  const cleanup = useCallback(() => {
-    if (pollTimerRef.current) {
-      clearTimeout(pollTimerRef.current);
-      pollTimerRef.current = null;
+  const stopSession = useCallback((session: PollingSession) => {
+    if (session.timer) {
+      clearTimeout(session.timer);
+      session.timer = null;
     }
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      abortControllerRef.current = null;
+    session.controller.abort();
+    if (activeSessionRef.current === session) {
+      activeSessionRef.current = null;
     }
   }, []);
 
-  // --- Cleanup on unmount ---
+  const stopActiveSession = useCallback(() => {
+    const session = activeSessionRef.current;
+    if (session) {
+      stopSession(session);
+    }
+  }, [stopSession]);
+
+  const isSessionActive = useCallback(
+    (session: PollingSession) =>
+      isMountedRef.current &&
+      activeSessionRef.current === session &&
+      !session.controller.signal.aborted,
+    [],
+  );
+
   useEffect(() => {
     isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
-      cleanup();
+      stopActiveSession();
     };
-  }, [cleanup]);
+  }, [stopActiveSession]);
 
-  // --- Load results when task is completed ---
-  const loadResults = useCallback(
-    async (id: string, signal: AbortSignal) => {
-      if (!isMountedRef.current) return;
-      setState("loading_results");
-
-      // Use Promise.allSettled — we care about settled, not success.
-      const [resultRes, assessmentRes, repairRes] = await Promise.allSettled([
-        getScanResult(id, signal),
-        getAssessment(id, signal),
-        getRepairPlan(id, signal),
-      ]);
-
-      if (!isMountedRef.current) return;
-
-      // --- Scan result ---
-      if (resultRes.status === "fulfilled") {
-        setScanResult(resultRes.value);
-        setScanResultStatus("available");
-      } else {
-        const err = resultRes.reason;
-        if (err instanceof ApiHttpError && err.statusCode === 409) {
-          setScanResultStatus("unavailable");
-        } else if (err instanceof ApiAbortError) {
-          // Aborted — don't change state, component is unmounting
-          return;
-        } else {
-          setScanResultStatus("error");
-        }
-        setScanResult(null);
-      }
-
-      // --- Assessment ---
-      if (assessmentRes.status === "fulfilled") {
-        setAssessment(assessmentRes.value);
-        setAssessmentStatus("available");
-      } else {
-        const err = assessmentRes.reason;
-        if (err instanceof ApiHttpError && err.statusCode === 409) {
-          // Legacy 409 → unavailable, not error
-          setAssessmentStatus("unavailable");
-        } else if (err instanceof ApiAbortError) {
-          return;
-        } else {
-          setAssessmentStatus("error");
-        }
-        setAssessment(null);
-      }
-
-      // --- Repair plan ---
-      if (repairRes.status === "fulfilled") {
-        setRepairPlan(repairRes.value);
-        setRepairPlanStatus("available");
-      } else {
-        const err = repairRes.reason;
-        if (err instanceof ApiHttpError && err.statusCode === 409) {
-          // Legacy 409 → unavailable, not error
-          setRepairPlanStatus("unavailable");
-        } else if (err instanceof ApiAbortError) {
-          return;
-        } else {
-          setRepairPlanStatus("error");
-        }
-        setRepairPlan(null);
-      }
-
-      if (!isMountedRef.current) return;
-      setState("completed");
-    },
-    [],
-  );
-
-  // --- Single poll iteration ---
-  const pollOnce = useCallback(
-    async (id: string, signal: AbortSignal) => {
-      try {
-        const status = await getTaskStatus(id, signal);
-        if (!isMountedRef.current) return;
-
-        setTaskStatus(status);
-
-        // Terminal states
-        if (status.status === "completed") {
-          // Stop polling timer but keep AbortController alive for result
-          // loading. Calling cleanup() here would abort the signal,
-          // preventing all result fetches in loadResults().
-          if (pollTimerRef.current) {
-            clearTimeout(pollTimerRef.current);
-            pollTimerRef.current = null;
-          }
-          await loadResults(id, signal);
-          return;
-        }
-
-        if (status.status === "failed") {
-          cleanup();
-          if (!isMountedRef.current) return;
-          // Priority: backend error_message (already desensitized) → error_code mapping
-          const msg =
-            status.error_message ||
-            getErrorMessage(status.error_code);
-          setErrorMessage(msg);
-          setState("failed");
-          return;
-        }
-
-        // Still pending/running — schedule next poll
-        // Check timeout
-        const elapsed = Date.now() - startTimeRef.current;
-        if (elapsed >= pollTimeoutMs) {
-          cleanup();
-          if (!isMountedRef.current) return;
-          setState("timeout");
-          return;
-        }
-
-        // Schedule next poll with recursive setTimeout
-        pollTimerRef.current = setTimeout(() => {
-          if (!isMountedRef.current) return;
-          if (abortControllerRef.current?.signal.aborted) return;
-          pollOnce(id, abortControllerRef.current!.signal);
-        }, pollIntervalMs);
-      } catch (err) {
-        if (err instanceof ApiAbortError) {
-          // Aborted by unmount or cleanup — do nothing
-          return;
-        }
-
-        if (!isMountedRef.current) return;
-
-        // Network error — retry on next interval (don't transition to failed)
-        // Check timeout first
-        const elapsed = Date.now() - startTimeRef.current;
-        if (elapsed >= pollTimeoutMs) {
-          cleanup();
-          setState("timeout");
-          return;
-        }
-
-        // Schedule retry
-        pollTimerRef.current = setTimeout(() => {
-          if (!isMountedRef.current) return;
-          if (abortControllerRef.current?.signal.aborted) return;
-          pollOnce(id, abortControllerRef.current!.signal);
-        }, pollIntervalMs);
-      }
-    },
-    [cleanup, loadResults, pollIntervalMs, pollTimeoutMs],
-  );
-
-  // --- Start polling for an existing task (e.g., page refresh) ---
-  const startPolling = useCallback(
-    (existingTaskId: string) => {
-      if (!isMountedRef.current) return;
-
-      // Clean up any previous polling
-      cleanup();
-
-      // Reset state
-      setTaskId(existingTaskId);
-      setTaskStatus(null);
-      setErrorMessage(null);
-      setScanResult(null);
-      setScanResultStatus("unavailable");
-      setAssessment(null);
-      setAssessmentStatus("unavailable");
-      setRepairPlan(null);
-      setRepairPlanStatus("unavailable");
-
-      // Create new AbortController for this polling session
-      const controller = new AbortController();
-      abortControllerRef.current = controller;
-      startTimeRef.current = Date.now();
-      setState("polling");
-
-      // Start first poll immediately
-      pollOnce(existingTaskId, controller.signal);
-    },
-    [cleanup, pollOnce],
-  );
-
-  // --- Submit a new check ---
-  const submit = useCallback(
-    async (repoUrl: string) => {
-      if (!isMountedRef.current) return;
-
-      cleanup();
-      setState("submitting");
-      setErrorMessage(null);
-
-      // Create AbortController early so unmount during submit also aborts
-      const controller = new AbortController();
-      abortControllerRef.current = controller;
-
-      try {
-        const response = await submitCheck(repoUrl, controller.signal);
-        if (!isMountedRef.current) return;
-
-        setTaskId(response.task_id);
-        startTimeRef.current = Date.now();
-        setState("polling");
-
-        // Start polling
-        pollOnce(response.task_id, controller.signal);
-      } catch (err) {
-        if (err instanceof ApiAbortError) {
-          // Aborted by unmount — do nothing
-          return;
-        }
-
-        if (!isMountedRef.current) return;
-
-        if (err instanceof ApiConfigError) {
-          setErrorMessage("后端 API 地址未配置，请检查环境变量 NEXT_PUBLIC_API_BASE_URL。");
-        } else if (err instanceof ApiHttpError) {
-          // Use backend error_message if available, then error_code mapping
-          const msg =
-            err.errorMessage ||
-            getErrorMessage(err.errorCode);
-          setErrorMessage(msg);
-        } else if (err instanceof ApiNetworkError) {
-          setErrorMessage("网络连接失败，请检查网络后重试。");
-        } else {
-          setErrorMessage(getErrorMessage(null));
-        }
-
-        setState("failed");
-      }
-    },
-    [cleanup, pollOnce],
-  );
-
-  // --- Reset to idle ---
-  const reset = useCallback(() => {
-    cleanup();
-    if (!isMountedRef.current) return;
-    setState("idle");
-    setTaskId(null);
+  const resetResults = useCallback(() => {
     setTaskStatus(null);
     setErrorMessage(null);
     setScanResult(null);
@@ -396,7 +137,229 @@ export function useCheckTask(options?: UseCheckTaskOptions): UseCheckTaskResult 
     setAssessmentStatus("unavailable");
     setRepairPlan(null);
     setRepairPlanStatus("unavailable");
-  }, [cleanup]);
+  }, []);
+
+  const loadResults = useCallback(
+    async (id: string, session: PollingSession) => {
+      if (!isSessionActive(session)) return;
+      setState("loading_results");
+
+      const [resultRes, assessmentRes, repairRes] = await Promise.allSettled([
+        getScanResult(id, session.controller.signal),
+        getAssessment(id, session.controller.signal),
+        getRepairPlan(id, session.controller.signal),
+      ]);
+
+      if (!isSessionActive(session)) return;
+
+      if (resultRes.status === "fulfilled") {
+        setScanResult(resultRes.value);
+        setScanResultStatus("available");
+      } else {
+        if (resultRes.reason instanceof ApiAbortError) return;
+        setScanResult(null);
+        setScanResultStatus(
+          resultRes.reason instanceof ApiHttpError &&
+            resultRes.reason.statusCode === 409
+            ? "unavailable"
+            : "error",
+        );
+      }
+
+      if (assessmentRes.status === "fulfilled") {
+        setAssessment(assessmentRes.value);
+        setAssessmentStatus("available");
+      } else {
+        if (assessmentRes.reason instanceof ApiAbortError) return;
+        setAssessment(null);
+        setAssessmentStatus(
+          assessmentRes.reason instanceof ApiHttpError &&
+            assessmentRes.reason.statusCode === 409
+            ? "unavailable"
+            : "error",
+        );
+      }
+
+      if (repairRes.status === "fulfilled") {
+        setRepairPlan(repairRes.value);
+        setRepairPlanStatus("available");
+      } else {
+        if (repairRes.reason instanceof ApiAbortError) return;
+        setRepairPlan(null);
+        setRepairPlanStatus(
+          repairRes.reason instanceof ApiHttpError &&
+            repairRes.reason.statusCode === 409
+            ? "unavailable"
+            : "error",
+        );
+      }
+
+      if (!isSessionActive(session)) return;
+      stopSession(session);
+      setState("completed");
+    },
+    [isSessionActive, stopSession],
+  );
+
+  const pollOnce = useCallback(
+    async (id: string, session: PollingSession) => {
+      try {
+        const status = await getTaskStatus(id, session.controller.signal);
+        if (!isSessionActive(session)) return;
+
+        setTaskStatus(status);
+
+        if (status.status === "completed") {
+          await loadResults(id, session);
+          return;
+        }
+
+        if (status.status === "failed") {
+          const message =
+            status.error_message || getErrorMessage(status.error_code);
+          stopSession(session);
+          setErrorMessage(message);
+          setState("failed");
+          return;
+        }
+
+        if (Date.now() - session.startedAt >= pollTimeoutMs) {
+          stopSession(session);
+          setState("timeout");
+          return;
+        }
+
+        session.timer = setTimeout(() => {
+          session.timer = null;
+          if (isSessionActive(session)) {
+            void pollOnce(id, session);
+          }
+        }, pollIntervalMs);
+      } catch (err) {
+        if (err instanceof ApiAbortError || !isSessionActive(session)) {
+          return;
+        }
+
+        if (err instanceof ApiNetworkError) {
+          if (Date.now() - session.startedAt >= pollTimeoutMs) {
+            stopSession(session);
+            setState("timeout");
+            return;
+          }
+          session.timer = setTimeout(() => {
+            session.timer = null;
+            if (isSessionActive(session)) {
+              void pollOnce(id, session);
+            }
+          }, pollIntervalMs);
+          return;
+        }
+
+        let message: string;
+        if (err instanceof ApiConfigError) {
+          message = CONFIG_ERROR_MESSAGE;
+        } else if (err instanceof ApiHttpError) {
+          message = getErrorMessage(err.errorCode);
+        } else {
+          message = getErrorMessage("INTERNAL_ERROR");
+        }
+        stopSession(session);
+        setErrorMessage(message);
+        setState("failed");
+      }
+    },
+    [
+      isSessionActive,
+      loadResults,
+      pollIntervalMs,
+      pollTimeoutMs,
+      stopSession,
+    ],
+  );
+
+  const startPolling = useCallback(
+    (existingTaskId: string) => {
+      if (!isMountedRef.current) return () => {};
+
+      stopActiveSession();
+      resetResults();
+      setTaskId(existingTaskId);
+
+      const session: PollingSession = {
+        controller: new AbortController(),
+        timer: null,
+        startedAt: Date.now(),
+      };
+      activeSessionRef.current = session;
+      setState("polling");
+      void pollOnce(existingTaskId, session);
+
+      return () => {
+        stopSession(session);
+      };
+    },
+    [pollOnce, resetResults, stopActiveSession, stopSession],
+  );
+
+  const submit = useCallback(
+    async (repoUrl: string) => {
+      if (!isMountedRef.current) return;
+
+      stopActiveSession();
+      resetResults();
+      setState("submitting");
+
+      const session: PollingSession = {
+        controller: new AbortController(),
+        timer: null,
+        startedAt: Date.now(),
+      };
+      activeSessionRef.current = session;
+
+      try {
+        const response = await submitCheck(repoUrl, session.controller.signal);
+        if (!isSessionActive(session)) return;
+
+        setTaskId(response.task_id);
+        session.startedAt = Date.now();
+        setState("polling");
+        void pollOnce(response.task_id, session);
+      } catch (err) {
+        if (err instanceof ApiAbortError || !isSessionActive(session)) {
+          return;
+        }
+
+        let message: string;
+        if (err instanceof ApiConfigError) {
+          message = CONFIG_ERROR_MESSAGE;
+        } else if (err instanceof ApiHttpError) {
+          message = getErrorMessage(err.errorCode);
+        } else if (err instanceof ApiNetworkError) {
+          message = NETWORK_ERROR_MESSAGE;
+        } else {
+          message = getErrorMessage("INTERNAL_ERROR");
+        }
+        stopSession(session);
+        setErrorMessage(message);
+        setState("failed");
+      }
+    },
+    [
+      isSessionActive,
+      pollOnce,
+      resetResults,
+      stopActiveSession,
+      stopSession,
+    ],
+  );
+
+  const reset = useCallback(() => {
+    stopActiveSession();
+    if (!isMountedRef.current) return;
+    setState("idle");
+    setTaskId(null);
+    resetResults();
+  }, [resetResults, stopActiveSession]);
 
   return {
     state,

@@ -11,7 +11,8 @@
 
 "use client";
 
-import { useEffect, useRef } from "react";
+import Link from "next/link";
+import { useEffect } from "react";
 
 import { CheckProgress } from "@/components/CheckProgress";
 import { ErrorState } from "@/components/ErrorState";
@@ -33,15 +34,13 @@ export default function CheckPage({ params }: CheckPageProps) {
   const isValidUuid = UUID_REGEX.test(taskId);
 
   const hook = useCheckTask();
-  const startedRef = useRef(false);
+  const { startPolling } = hook;
 
-  // Start polling on mount (only if valid UUID)
+  // Each effect setup owns one polling session and stops that same session.
   useEffect(() => {
-    if (!isValidUuid || startedRef.current) return;
-    startedRef.current = true;
-    hook.startPolling(taskId);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isValidUuid, taskId]);
+    if (!isValidUuid) return;
+    return startPolling(taskId);
+  }, [isValidUuid, startPolling, taskId]);
 
   // --- Invalid task_id ---
   if (!isValidUuid) {
@@ -118,6 +117,9 @@ export default function CheckPage({ params }: CheckPageProps) {
       <main className="container">
         <h1 className="page-title">检测失败</h1>
         {errorMessage && <ErrorState message={errorMessage} />}
+        <Link href="/" className="btn btn-primary">
+          重新检测
+        </Link>
       </main>
     );
   }
@@ -128,6 +130,9 @@ export default function CheckPage({ params }: CheckPageProps) {
       <main className="container">
         <h1 className="page-title">检测超时</h1>
         <ErrorState message="检测超时，请稍后重试。" />
+        <Link href="/" className="btn btn-primary">
+          重新检测
+        </Link>
       </main>
     );
   }
