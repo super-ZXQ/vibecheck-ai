@@ -45,9 +45,6 @@ _initialized = False
 # Production data root — can be overridden in tests via monkeypatch.
 _DATA_ROOT = Path("/data")
 
-# Cached validated production database path (avoids repeated filesystem checks).
-_production_validated_path: str | None = None
-
 _REQUIRED_TABLES = frozenset(
     {
         "tasks",
@@ -112,28 +109,45 @@ def validate_production_database_path(
     if not database_path.is_absolute():
         raise ValueError("production database path must be absolute")
 
-    # Resolve data_root (must exist in production).
-    data_root_resolved = data_root.resolve(strict=True)
-
-    # Resolve database_path (parent must exist, file may not exist yet).
-    database_path_resolved = database_path.resolve(strict=False)
-
-    # --- Step 3: Check containment ---
-    try:
-        relative = database_path_resolved.relative_to(data_root_resolved)
-    except ValueError:
+    # Normalize without resolving symlinks so the original path chain remains
+    # observable. Reject traversal before checking each component.
+    if ".." in database_path.parts:
         raise ValueError("production database path is outside the data root")
 
-    # --- Step 4: Check all existing path components for symlinks ---
-    # Walk from data_root to the database file, checking each component.
-    # Even symlinks that point inside data_root are rejected (unified policy).
-    current = data_root_resolved
-    for component in relative.parts:
+    data_root_absolute = Path(os.path.abspath(data_root))
+    database_path_absolute = Path(os.path.abspath(database_path))
+    try:
+        lexical_relative = database_path_absolute.relative_to(
+            data_root_absolute
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "production database path is outside the data root"
+        ) from exc
+
+    # Check the lexical path before resolve() erases symlink components.
+    if data_root_absolute.is_symlink():
+        raise ValueError(
+            "production database path contains a symlink component"
+        )
+    current = data_root_absolute
+    for component in lexical_relative.parts:
         current = current / component
-        if current.exists() and current.is_symlink():
+        if current.is_symlink():
             raise ValueError(
                 "production database path contains a symlink component"
             )
+
+    # Resolve data_root (must exist) and enforce containment against the real
+    # target as a second, independent check.
+    data_root_resolved = data_root_absolute.resolve(strict=True)
+    database_path_resolved = database_path_absolute.resolve(strict=False)
+    try:
+        database_path_resolved.relative_to(data_root_resolved)
+    except ValueError as exc:
+        raise ValueError(
+            "production database path is outside the data root"
+        ) from exc
 
     return database_path_resolved
 
@@ -199,17 +213,12 @@ def _is_production_data_path() -> bool:
 
 def _get_connection() -> sqlite3.Connection:
     """Create a new SQLite connection with proper settings."""
-    global _production_validated_path
-
     if _is_production_data_path():
-        # Validate the path once (symlink / traversal checks).
-        if _production_validated_path is None:
-            validated = validate_production_database_path(
-                settings.database_url,
-                _DATA_ROOT,
-            )
-            _production_validated_path = str(validated)
-        db_path = _production_validated_path
+        validated = validate_production_database_path(
+            settings.database_url,
+            _DATA_ROOT,
+        )
+        db_path = str(validated)
     else:
         db_path = _get_db_path()
 
@@ -217,15 +226,21 @@ def _get_connection() -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
     conn = sqlite3.connect(db_path, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=5000")
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
 
-    # Post-connection verification: confirm the actual opened path
-    # is still inside /data (catches runtime symlink replacement).
-    if _is_production_data_path():
-        _verify_database_list_path(conn, _DATA_ROOT)
+        if _is_production_data_path():
+            _verify_database_list_path(conn, _DATA_ROOT)
+            validate_production_database_path(
+                settings.database_url,
+                _DATA_ROOT,
+            )
+    except Exception:
+        conn.close()
+        raise
 
     return conn
 
@@ -393,7 +408,7 @@ def check_database_ready() -> None:
 
 def reset_db() -> None:
     """Drop and recreate all tables — for testing only."""
-    global _initialized, _production_validated_path
+    global _initialized
     with _init_lock:
         conn = _get_connection()
         try:
@@ -407,7 +422,6 @@ def reset_db() -> None:
         finally:
             conn.close()
         _initialized = False
-        _production_validated_path = None
     # Call init_db() OUTSIDE the lock to avoid deadlock
     # (init_db() also acquires _init_lock — threading.Lock is not reentrant)
     init_db()
