@@ -34,6 +34,7 @@ htmlcov/
 # === Node.js ===
 node_modules/
 .next/
+frontend/next-env.d.ts
 out/
 .npm
 .pnpm-debug.log*
