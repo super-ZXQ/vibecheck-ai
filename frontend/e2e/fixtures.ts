@@ -139,6 +139,7 @@ export const mockScanResult = {
       sensitive_data_security: 30,
       incomplete_content: 0,
       deployability_production: 0,
+      basic_security: 0,
     },
   },
 };
@@ -167,6 +168,7 @@ export const mockMultidimensionalScanResult = {
       sensitive_data_security: 26,
       incomplete_content: 6,
       deployability_production: 0,
+      basic_security: 0,
     },
   },
 };
@@ -194,6 +196,35 @@ export const mockThreeDimensionalScanResult = {
       sensitive_data_security: 26,
       incomplete_content: 6,
       deployability_production: 27,
+      basic_security: 0,
+    },
+  },
+};
+
+export const mockFourDimensionalScanResult = {
+  ...mockThreeDimensionalScanResult,
+  findings: [
+    ...mockThreeDimensionalScanResult.findings,
+    ...Array.from({ length: 27 }, (_, i) => ({
+      ...mockScanResult.findings[i],
+      rule_id: `B${String(i % 5 + 1).padStart(3, "0")}_BASIC_SECURITY`,
+      rule_name: `Basic Security Rule ${i + 1}`,
+      file_path: i === 0 ? "<repository>" : `src/security_${i}.ts`,
+      is_blocking: false,
+      dimension: "basic_security" as const,
+      description: "A high-confidence basic security weakness was detected.",
+      message: "Apply the fixed security recommendation before deployment.",
+    })),
+  ],
+  summary: {
+    ...mockThreeDimensionalScanResult.summary,
+    total_findings: 86,
+    returned_findings: 86,
+    dimension_counts: {
+      sensitive_data_security: 26,
+      incomplete_content: 6,
+      deployability_production: 27,
+      basic_security: 27,
     },
   },
 };

@@ -34,6 +34,7 @@ from app.core.github import DownloadResult, GitHubDownloadError, parse_repo_url
 from app.core.safe_extract import ExtractionResult
 from app.db import database
 from app.scanner.base import (
+    BASIC_SECURITY_DIMENSION,
     DEPLOYABILITY_PRODUCTION_DIMENSION,
     SENSITIVE_DATA_DIMENSION,
     ScanResult,
@@ -186,6 +187,7 @@ class TestPipelineIntegration:
         summary = get_scan_summary(task.id)
         assert summary["dimension_counts"][SENSITIVE_DATA_DIMENSION] == 0
         assert summary["dimension_counts"][DEPLOYABILITY_PRODUCTION_DIMENSION] == 3
+        assert summary["dimension_counts"][BASIC_SECURITY_DIMENSION] == 0
         assert summary["blocking_findings"] == 0
 
     @pytest.mark.asyncio
