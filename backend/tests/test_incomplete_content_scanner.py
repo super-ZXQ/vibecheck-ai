@@ -13,7 +13,10 @@ def _scan(tmp_path, relative_path: str, content: str):
     path = tmp_path / relative_path
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
-    return scan_directory(tmp_path).findings
+    return tuple(
+        finding for finding in scan_directory(tmp_path).findings
+        if finding.dimension == INCOMPLETE_CONTENT_DIMENSION
+    )
 
 
 def _rule_ids(findings):
@@ -196,7 +199,10 @@ def test_rule_limit_sorting_and_repeated_runs_are_deterministic(tmp_path, monkey
     )
     content = "# TODO first\n# FIXME second\n# HACK third\n"
     first = _scan(tmp_path, "src/app.py", content)
-    second = scan_directory(tmp_path).findings
+    second = tuple(
+        finding for finding in scan_directory(tmp_path).findings
+        if finding.dimension == INCOMPLETE_CONTENT_DIMENSION
+    )
     todo_lines = [f.line_start for f in first if f.rule_id == "I001_TODO_COMMENT"]
     assert todo_lines == [1, 2]
     assert first == second

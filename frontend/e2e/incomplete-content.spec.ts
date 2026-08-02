@@ -18,7 +18,7 @@ test("shows dimension counts, filters with fresh pagination, and expands advice"
   await expect(page.locator(".page-title")).toContainText("检测结果", { timeout: 15_000 });
   await expect(page.getByTestId("sensitive-dimension-count")).toContainText("26");
   await expect(page.getByTestId("incomplete-dimension-count")).toContainText("6");
-  await expect(page.getByText("未完成内容暂不计入安全评分。")).toBeVisible();
+  await expect(page.getByText("未完成内容和可部署性暂不计入安全评分。")).toBeVisible();
 
   await page.getByRole("button", { name: "敏感信息", exact: true }).click();
   await expect(page.locator(".findings-table tbody tr")).toHaveCount(25);

@@ -42,6 +42,7 @@ export interface ScanSummary {
   dimension_counts?: {
     sensitive_data_security?: number;
     incomplete_content?: number;
+    deployability_production?: number;
   };
 }
 
@@ -86,7 +87,10 @@ export interface Finding {
   secret_type: string;
   message: string;
   repair_template_key: string;
-  dimension?: "sensitive_data_security" | "incomplete_content";
+  dimension?:
+    | "sensitive_data_security"
+    | "incomplete_content"
+    | "deployability_production";
 }
 
 export interface ScanNotice {

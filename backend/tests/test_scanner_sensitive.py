@@ -17,7 +17,14 @@ from pathlib import Path
 
 import pytest
 
-from app.scanner.base import Finding, FindingType, ScanNotice, ScanResult, Severity
+from app.scanner.base import (
+    Finding,
+    FindingType,
+    SENSITIVE_DATA_DIMENSION,
+    ScanNotice,
+    ScanResult,
+    Severity,
+)
 from app.scanner.default_rules import DEFAULT_RULES
 from app.scanner.rules import (
     EnvExampleFileRule,
@@ -223,6 +230,8 @@ class TestScanDirectory:
 
         # All finding paths should use forward slashes
         for f in result.findings:
+            if f.dimension != SENSITIVE_DATA_DIMENSION:
+                continue
             assert "\\" not in f.file_path
             assert "/" in f.file_path or f.file_path == "settings.py"
 

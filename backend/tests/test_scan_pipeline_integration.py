@@ -33,7 +33,11 @@ from app.core.error_codes import (
 from app.core.github import DownloadResult, GitHubDownloadError, parse_repo_url
 from app.core.safe_extract import ExtractionResult
 from app.db import database
-from app.scanner.base import ScanResult
+from app.scanner.base import (
+    DEPLOYABILITY_PRODUCTION_DIMENSION,
+    SENSITIVE_DATA_DIMENSION,
+    ScanResult,
+)
 from app.services import background_runner, task_manager
 from tests.conftest import SYNTHETIC_GITHUB_TOKEN
 
@@ -154,8 +158,8 @@ class TestPipelineIntegration:
         assert summary["total_files_scanned"] >= 1
 
     @pytest.mark.asyncio
-    async def test_scan_clean_repo_persists_empty(self, test_db, tmp_path):
-        """Pipeline should persist empty result for clean repo."""
+    async def test_scan_clean_repo_persists_non_security_advice(self, test_db, tmp_path):
+        """A security-clean repository may still have deployability advice."""
         task = task_manager.create_task(
             "https://github.com/testuser/cleanrepo",
             "testuser",
@@ -180,7 +184,8 @@ class TestPipelineIntegration:
 
         from app.services.scan_result_service import get_scan_summary
         summary = get_scan_summary(task.id)
-        assert summary["total_findings"] == 0
+        assert summary["dimension_counts"][SENSITIVE_DATA_DIMENSION] == 0
+        assert summary["dimension_counts"][DEPLOYABILITY_PRODUCTION_DIMENSION] == 3
         assert summary["blocking_findings"] == 0
 
     @pytest.mark.asyncio
