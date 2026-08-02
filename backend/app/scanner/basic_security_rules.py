@@ -31,8 +31,19 @@ _HEALTH_ROUTE_RE = re.compile(
     re.IGNORECASE,
 )
 _ROUTE_PATTERNS = (
-    re.compile(r"^\s*@(?:app|router|blueprint)\.(?:get|post|put|patch|delete|route|api_route)\s*\(", re.IGNORECASE),
-    re.compile(r"^\s*(?:app|router)\.(?:get|post|put|patch|delete)\s*\(", re.IGNORECASE),
+    re.compile(
+        r"^\s*@[A-Za-z_][\w.]*\."
+        r"(?:get|post|put|patch|delete|route|api_route)\s*\(\s*['\"]/",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^\s*(?:[A-Za-z_$][\w$]*\.)*"
+        r"(?:app|server|router|api|"
+        r"[A-Za-z_$][\w$]*(?:app|server|router|api)|"
+        r"(?:app|server|router|api)[A-Za-z_$][\w$]+)\."
+        r"(?:get|post|put|patch|delete)\s*\(\s*['\"`]/",
+        re.IGNORECASE,
+    ),
     re.compile(r"^\s*@(?:Get|Post|Put|Patch|Delete|Request)Mapping\b"),
     re.compile(r"^\s*@(?:Get|Post|Put|Patch|Delete)\s*\("),
     re.compile(r"^\s*\[(?:HttpGet|HttpPost|HttpPut|HttpPatch|HttpDelete|Route)\b", re.IGNORECASE),
@@ -51,14 +62,9 @@ _AUTH_SOURCE_RE = re.compile(
     r"OAuth2PasswordBearer|HTTPBearer|passport\.authenticate|jwt_required|"
     r"login_required|permission_classes|authentication_classes|"
     r"@Authorize\b|\bAddAuthentication\s*\(|\bUseAuthentication\s*\(|"
-    r"SecurityFilterChain|@PreAuthorize\b|authenticate_user|current_user|"
-    r"middleware\s*\(\s*['\"]auth|auth:sanctum|Auth::guard|authenticate!",
-    re.IGNORECASE,
-)
-_AUTH_MANIFEST_RE = re.compile(
-    r"jsonwebtoken|passport(?:-jwt)?|authlib|oauthlib|python-jose|pyjwt|"
-    r"spring-security|aspnetcore\.authentication|devise|sanctum|jwt-auth|"
-    r"golang-jwt|ruby-jwt",
+    r"SecurityFilterChain|@PreAuthorize\b|"
+    r"Depends\s*\([^)]*(?:current_user|authenticate)|"
+    r"Auth::guard|authenticate!",
     re.IGNORECASE,
 )
 _VALIDATION_SOURCE_RE = re.compile(
@@ -70,11 +76,6 @@ _VALIDATION_SOURCE_RE = re.compile(
     r"\[(?:Required|StringLength|Range)\b|FluentValidation|\bFormRequest\b",
     re.IGNORECASE,
 )
-_VALIDATION_MANIFEST_RE = re.compile(
-    r"pydantic|zod|joi|express-validator|class-validator|marshmallow|"
-    r"fluentvalidation|go-playground/validator",
-    re.IGNORECASE,
-)
 _RAW_INPUT_RE = re.compile(
     r"\brequest\.(?:body|json|data|args|form|POST|GET|query_params)\b|"
     r"\brequest\.get_json\s*\(|\brequest\.json\s*\(|"
@@ -84,25 +85,24 @@ _RAW_INPUT_RE = re.compile(
     r"\br\.URL\.Query\s*\(",
     re.IGNORECASE,
 )
-_RATE_LIMIT_RE = re.compile(
-    r"slowapi|flask[_-]limiter|django[_-]ratelimit|express-rate-limit|"
+_RATE_LIMIT_USE_RE = re.compile(
+    r"@(?:limiter\.)?(?:limit|rate_limit)\b|\bLimiter\s*\(|"
     r"@Throttle\b|\bthrottle\s*[:(]|Rack::Attack|UseRateLimiter|"
     r"AddRateLimiter|AspNetCoreRateLimit|golang\.org/x/time/rate|"
     r"rate\.NewLimiter|resilience4j-ratelimiter|Bucket4j",
     re.IGNORECASE,
 )
-_RATE_LIMIT_IMPORT_RE = re.compile(
-    r"^\s*(?:import\s+.+?\s+from\s+['\"]express-rate-limit['\"]|"
-    r"(?:const|let|var)\s+\w+\s*=\s*"
-    r"require\s*\(\s*['\"]express-rate-limit['\"]\s*\)|"
-    r"from\s+(?:slowapi|flask_limiter)\b|"
-    r"import\s+(?:slowapi|flask_limiter)\b)",
+_NODE_RATE_LIMIT_IMPORT_RE = re.compile(
+    r"^\s*(?:import\s+([A-Za-z_$][\w$]*)\s+from\s+"
+    r"['\"]express-rate-limit['\"]|"
+    r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*"
+    r"require\s*\(\s*['\"]express-rate-limit['\"]\s*\))",
     re.IGNORECASE | re.MULTILINE,
 )
 _CORS_EXPLICIT_PATTERNS = (
     re.compile(r"allow_origins\s*=\s*[\[(]\s*['\"]\*['\"]", re.IGNORECASE),
     re.compile(r"(?:setHeader|header|add_header)\s*\([^)]*Access-Control-Allow-Origin[^)]*['\"]\*['\"]", re.IGNORECASE),
-    re.compile(r"['\"]Access-Control-Allow-Origin['\"]\s*:\s*['\"]\*['\"]", re.IGNORECASE),
+    re.compile(r"(?:^|[{,])\s*['\"]Access-Control-Allow-Origin['\"]\s*:\s*['\"]\*['\"]", re.IGNORECASE),
     re.compile(r"@CrossOrigin\s*\([^)]*['\"]\*['\"]", re.IGNORECASE),
     re.compile(r"\.AllowAnyOrigin\s*\(", re.IGNORECASE),
     re.compile(r"CORS_ALLOW_ALL_ORIGINS\s*=\s*True\b", re.IGNORECASE),
@@ -110,8 +110,10 @@ _CORS_EXPLICIT_PATTERNS = (
     re.compile(r"allowed-origins\s*[=:]\s*\*", re.IGNORECASE),
 )
 _NODE_CORS_IMPORT_RE = re.compile(
-    r"(?:from\s+['\"]cors['\"]|require\s*\(\s*['\"]cors['\"]\s*\))",
-    re.IGNORECASE,
+    r"^\s*(?:import\s+.+?\s+from\s+['\"]cors['\"]|"
+    r"(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*"
+    r"require\s*\(\s*['\"]cors['\"]\s*\))",
+    re.IGNORECASE | re.MULTILINE,
 )
 _FLASK_CORS_IMPORT_RE = re.compile(r"\bflask_cors\b", re.IGNORECASE)
 _SQL_KEYWORD_RE = re.compile(r"\b(?:SELECT|INSERT|UPDATE|DELETE)\b", re.IGNORECASE)
@@ -127,13 +129,9 @@ _SQL_INPUT_RE = re.compile(
     r"\br\.(?:FormValue|URL\.Query)\b",
     re.IGNORECASE,
 )
-_FORMAT_CALL_RE = re.compile(r"\.format\s*\(|fmt\.Sprintf\s*\(", re.IGNORECASE)
-
-_MANIFEST_NAMES = frozenset({
-    "package.json", "pyproject.toml", "pipfile", "requirements.txt",
-    "pom.xml", "build.gradle", "build.gradle.kts", "gemfile",
-    "composer.json", "go.mod",
-})
+_FORMAT_WRAPPER_RE = re.compile(
+    r"(?:fmt\.Sprintf|String\.format)\s*\(\s*$", re.IGNORECASE
+)
 _CONFIG_SUFFIXES = frozenset({".yml", ".yaml", ".properties", ".toml", ".env"})
 
 _RULE_METADATA: dict[str, tuple[str, Severity, str, str, str]] = {
@@ -224,23 +222,88 @@ def _outside_string(position: int, spans: list[tuple[int, int]]) -> bool:
     return not any(start <= position < end for start, end in spans)
 
 
-def _has_dynamic_sql(line: str, spans: list[tuple[int, int]]) -> bool:
-    if _FORMAT_CALL_RE.search(line):
-        return True
-    for start, end in spans:
-        literal = line[start:end]
-        prefix = line[max(0, start - 2):start].lower()
-        if (
+def _node_rate_limit_aliases(text: str) -> set[str]:
+    aliases: set[str] = set()
+    for match in _NODE_RATE_LIMIT_IMPORT_RE.finditer(text):
+        alias = match.group(1) or match.group(2)
+        aliases.add(alias)
+    return aliases
+
+
+def _call_expression_end(
+    line: str,
+    open_parenthesis: int,
+    spans: list[tuple[int, int]],
+) -> int:
+    depth = 0
+    for index in range(open_parenthesis, len(line)):
+        if not _outside_string(index, spans):
+            continue
+        if line[index] == "(":
+            depth += 1
+        elif line[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return len(line)
+
+
+def _has_dynamic_sql(
+    line: str,
+    spans: list[tuple[int, int]],
+    expression_start: int,
+    expression_end: int,
+) -> bool:
+    relevant_spans = [
+        (start, end) for start, end in spans
+        if expression_start <= start < end <= expression_end
+    ]
+    sql_spans = [
+        (start, end) for start, end in relevant_spans
+        if _SQL_KEYWORD_RE.search(line[start:end])
+    ]
+    input_matches = [
+        (expression_start + match.start(), expression_start + match.end())
+        for match in _SQL_INPUT_RE.finditer(
+            line[expression_start:expression_end]
+        )
+    ]
+    if not sql_spans or not input_matches:
+        return False
+
+    for sql_start, sql_end in sql_spans:
+        literal = line[sql_start:sql_end]
+        prefix = line[max(expression_start, sql_start - 2):sql_start].lower()
+        input_in_literal = any(
+            sql_start <= input_start < sql_end
+            for input_start, _ in input_matches
+        )
+        if input_in_literal and (
             "${" in literal
             or "#{" in literal
             or "{$_" in literal
             or bool(re.search(r"(?:[rubf]{1,2}|\$)$", prefix))
         ):
             return True
-    return any(
-        char == "+" and _outside_string(index, spans)
-        for index, char in enumerate(line)
-    )
+
+        after_literal = line[sql_end:expression_end]
+        before_literal = line[expression_start:sql_start]
+        if any(input_start >= sql_end for input_start, _ in input_matches):
+            if re.match(r"\s*\.format\s*\(", after_literal):
+                return True
+            if _FORMAT_WRAPPER_RE.search(before_literal):
+                return True
+
+        for input_start, input_end in input_matches:
+            if sql_end <= input_start:
+                between = line[sql_end:input_start]
+            elif input_end <= sql_start:
+                between = line[input_end:sql_start]
+            else:
+                continue
+            if "+" in between and "," not in between:
+                return True
+    return False
 
 
 class BasicSecurityProbe(RepositoryProbe):
@@ -259,19 +322,6 @@ class BasicSecurityProbe(RepositoryProbe):
         if _is_excluded_path(file_path):
             return
         path = PurePosixPath(file_path)
-        name = path.name.lower()
-        text = "\n".join(lines)
-
-        if name in _MANIFEST_NAMES or name.startswith("requirements"):
-            self.auth_detected = self.auth_detected or bool(
-                _AUTH_MANIFEST_RE.search(text)
-            )
-            self.validation_detected = self.validation_detected or bool(
-                _VALIDATION_MANIFEST_RE.search(text)
-            )
-            self.rate_limit_detected = self.rate_limit_detected or bool(
-                _RATE_LIMIT_RE.search(text)
-            )
 
         if is_incomplete_source_file(file_path):
             self._observe_source(file_path, lines)
@@ -297,9 +347,13 @@ class BasicSecurityProbe(RepositoryProbe):
         self.validation_detected = self.validation_detected or bool(
             _VALIDATION_SOURCE_RE.search(bare_text)
         )
+        rate_aliases = _node_rate_limit_aliases(raw_text)
+        rate_alias_used = any(
+            re.search(rf"\b{re.escape(alias)}\s*\(", bare_text)
+            for alias in rate_aliases
+        )
         self.rate_limit_detected = self.rate_limit_detected or bool(
-            _RATE_LIMIT_RE.search(bare_text)
-            or _RATE_LIMIT_IMPORT_RE.search(raw_text)
+            _RATE_LIMIT_USE_RE.search(bare_text) or rate_alias_used
         )
 
         for line in uncommented:
@@ -316,6 +370,7 @@ class BasicSecurityProbe(RepositoryProbe):
             node_cors,
             flask_cors,
             code_lines=bare,
+            string_spans=strings,
         )
 
         limit = settings.scan_max_findings_per_rule_per_file
@@ -323,12 +378,22 @@ class BasicSecurityProbe(RepositoryProbe):
         for index, line in enumerate(uncommented):
             if added >= limit:
                 break
-            if not (_SQL_KEYWORD_RE.search(line) and _SQL_INPUT_RE.search(line)):
-                continue
-            sink = _SQL_SINK_RE.search(line)
-            if sink is None or not _outside_string(sink.start(), strings[index]):
-                continue
-            if not _has_dynamic_sql(line, strings[index]):
+            dynamic_sql = False
+            for sink in _SQL_SINK_RE.finditer(line):
+                if not _outside_string(sink.start(), strings[index]):
+                    continue
+                expression_end = _call_expression_end(
+                    line, sink.end() - 1, strings[index]
+                )
+                if _has_dynamic_sql(
+                    line,
+                    strings[index],
+                    sink.start(),
+                    expression_end,
+                ):
+                    dynamic_sql = True
+                    break
+            if not dynamic_sql:
                 continue
             self.sql_findings.append(_finding(
                 "B005_SQL_INJECTION",
@@ -345,6 +410,7 @@ class BasicSecurityProbe(RepositoryProbe):
         node_cors: bool,
         flask_cors: bool,
         code_lines: list[str] | None = None,
+        string_spans: list[list[tuple[int, int]]] | None = None,
     ) -> None:
         limit = settings.scan_max_findings_per_rule_per_file
         added = 0
@@ -354,9 +420,19 @@ class BasicSecurityProbe(RepositoryProbe):
             stripped = line.strip()
             if not stripped or stripped.startswith(("#", "//")):
                 continue
-            explicit = any(pattern.search(line) for pattern in _CORS_EXPLICIT_PATTERNS)
-            node_origin = node_cors and bool(
-                re.search(r"\borigin\s*:\s*['\"]\*['\"]", line, re.IGNORECASE)
+            spans = string_spans[index] if string_spans is not None else []
+            explicit = any(
+                (match := pattern.search(line)) is not None
+                and _outside_string(match.start(), spans)
+                for pattern in _CORS_EXPLICIT_PATTERNS
+            )
+            origin_match = re.search(
+                r"\borigin\s*:\s*['\"]\*['\"]", line, re.IGNORECASE
+            )
+            node_origin = bool(
+                node_cors
+                and origin_match is not None
+                and _outside_string(origin_match.start(), spans)
             )
             code_line = code_lines[index] if code_lines is not None else line
             bare_node = node_cors and bool(

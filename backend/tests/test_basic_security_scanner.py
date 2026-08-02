@@ -51,6 +51,28 @@ def test_api_routes_without_controls_report_auth_and_rate_limit(tmp_path, path, 
     assert "B003_RATE_LIMITING" in ids
 
 
+@pytest.mark.parametrize(
+    ("path", "content"),
+    (
+        ("app.py", '@api_router.get("/items")\ndef items(): return []\n'),
+        ("routes.py", '@bp.route("/items")\ndef items(): return []\n'),
+        ("server.js", 'server.get("/items", handler);\n'),
+    ),
+)
+def test_custom_route_aliases_activate_repository_checks(tmp_path, path, content):
+    _write_repo(tmp_path, {path: content})
+    ids = _rule_ids(tmp_path)
+    assert "B001_API_AUTHENTICATION" in ids
+    assert "B003_RATE_LIMITING" in ids
+
+
+def test_non_route_getter_with_path_like_key_is_not_an_api_route(tmp_path):
+    _write_repo(tmp_path, {"cache.js": 'cache.get("/items");\n'})
+    ids = _rule_ids(tmp_path)
+    assert "B001_API_AUTHENTICATION" not in ids
+    assert "B003_RATE_LIMITING" not in ids
+
+
 def test_health_and_documentation_routes_do_not_activate_repository_checks(tmp_path):
     _write_repo(tmp_path, {
         "app.py": (
@@ -75,12 +97,32 @@ def test_authentication_evidence_suppresses_only_auth_finding(tmp_path):
     assert "B003_RATE_LIMITING" in ids
 
 
-def test_authentication_dependency_is_recognized(tmp_path):
+def test_unused_security_dependencies_do_not_suppress_findings(tmp_path):
     _write_repo(tmp_path, {
-        "package.json": '{"dependencies":{"passport":"1.0.0"}}',
-        "server.js": 'app.get("/items", handler);\n',
+        "package.json": (
+            '{"dependencies":{"passport":"1.0.0","zod":"1.0.0",'
+            '"express-rate-limit":"1.0.0"}}'
+        ),
+        "server.js": (
+            'app.post("/items", handler);\n'
+            'const name = req.body.name;\n'
+        ),
     })
-    assert "B001_API_AUTHENTICATION" not in _rule_ids(tmp_path)
+    ids = _rule_ids(tmp_path)
+    assert "B001_API_AUTHENTICATION" in ids
+    assert "B002_INPUT_VALIDATION" in ids
+    assert "B003_RATE_LIMITING" in ids
+
+
+def test_generic_current_user_name_is_not_authentication_evidence(tmp_path):
+    _write_repo(tmp_path, {
+        "app.py": (
+            "current_user = None\n"
+            '@app.get("/items")\n'
+            "def items(): return []\n"
+        ),
+    })
+    assert "B001_API_AUTHENTICATION" in _rule_ids(tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -118,6 +160,7 @@ def test_rate_limit_evidence_suppresses_rate_finding(tmp_path):
     _write_repo(tmp_path, {
         "server.js": (
             'const rateLimit = require("express-rate-limit");\n'
+            'app.use(rateLimit({ windowMs: 60_000, limit: 100 }));\n'
             'app.get("/items", handler);\n'
         ),
     })
@@ -189,6 +232,16 @@ def test_known_bare_cors_defaults_are_reported(tmp_path, path, content):
     assert "B004_PERMISSIVE_CORS" in _rule_ids(tmp_path)
 
 
+def test_node_wildcard_origin_object_is_reported(tmp_path):
+    _write_repo(tmp_path, {
+        "server.js": (
+            'const cors = require("cors");\n'
+            'app.use(cors({ origin: "*" }));\n'
+        ),
+    })
+    assert "B004_PERMISSIVE_CORS" in _rule_ids(tmp_path)
+
+
 def test_restricted_cors_and_unrelated_strings_are_not_reported(tmp_path):
     _write_repo(tmp_path, {
         "server.js": (
@@ -206,6 +259,17 @@ def test_cors_call_inside_a_string_is_not_reported(tmp_path):
         "server.js": (
             'const cors = require("cors");\n'
             'const example = "app.use(cors())";\n'
+        ),
+    })
+    assert "B004_PERMISSIVE_CORS" not in _rule_ids(tmp_path)
+
+
+def test_cors_configuration_inside_strings_is_not_reported(tmp_path):
+    _write_repo(tmp_path, {
+        "app.py": 'docs = \'allow_origins=["*"]\'\n',
+        "server.js": (
+            'const cors = require("cors");\n'
+            'const example = \'origin: "*"\';\n'
         ),
     })
     assert "B004_PERMISSIVE_CORS" not in _rule_ids(tmp_path)
@@ -244,6 +308,26 @@ def test_parameterized_sql_orm_comments_strings_and_tests_are_not_reported(tmp_p
             'text = "db.query(`SELECT * FROM users WHERE id=${req.query.id}`)"\n'
         ),
         "tests/app.py": 'cursor.execute(f"DELETE FROM users WHERE id={request.args[\'id\']}")\n',
+    })
+    assert "B005_SQL_INJECTION" not in _rule_ids(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    (
+        'label = f"{name}"',
+        'label = "{}".format(name)',
+        "total = left + right",
+    ),
+)
+def test_unrelated_dynamic_expression_does_not_taint_parameterized_sql(
+    tmp_path, suffix
+):
+    _write_repo(tmp_path, {
+        "app.py": (
+            'cursor.execute("SELECT * FROM users WHERE id = ?", '
+            f'(request.args["id"],)); {suffix}\n'
+        ),
     })
     assert "B005_SQL_INJECTION" not in _rule_ids(tmp_path)
 
@@ -295,6 +379,7 @@ def test_probe_state_is_isolated_between_concurrent_scans(tmp_path):
         "app.py": (
             "from fastapi.security import HTTPBearer\n"
             "from slowapi import Limiter\n"
+            "limiter = Limiter(key_func=get_remote_address)\n"
             '@app.get("/items")\ndef items(): return []\n'
         ),
     })
