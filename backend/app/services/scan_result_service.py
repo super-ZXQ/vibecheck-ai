@@ -35,6 +35,7 @@ from app.core.security.desensitize import mask_snippet, mask_untrusted_text
 from app.db.database import _get_connection, init_db, now_iso
 from app.scanner.base import (
     Confidence,
+    DEPLOYABILITY_PRODUCTION_DIMENSION,
     Finding,
     FindingType,
     ScanError,
@@ -361,6 +362,10 @@ def _compute_summary(
         INCOMPLETE_CONTENT_DIMENSION: sum(
             1 for f in findings if f.dimension == INCOMPLETE_CONTENT_DIMENSION
         ),
+        DEPLOYABILITY_PRODUCTION_DIMENSION: sum(
+            1 for f in findings
+            if f.dimension == DEPLOYABILITY_PRODUCTION_DIMENSION
+        ),
     }
     return {
         "total_findings": len(findings),
@@ -382,8 +387,18 @@ def _compute_summary(
     }
 
 
+def _normalize_dimension_counts(
+    raw_counts: Any, *, sensitive_default: Any
+) -> dict[str, Any]:
+    counts = dict(raw_counts) if isinstance(raw_counts, dict) else {}
+    counts.setdefault(SENSITIVE_DATA_DIMENSION, sensitive_default)
+    counts.setdefault(INCOMPLETE_CONTENT_DIMENSION, 0)
+    counts.setdefault(DEPLOYABILITY_PRODUCTION_DIMENSION, 0)
+    return counts
+
+
 def normalize_scan_result_dimensions(scan_result: dict[str, Any]) -> dict[str, Any]:
-    """Add P0-10 dimension defaults to a parsed v1 result without rewriting it."""
+    """Add extensible dimension defaults without rewriting persisted JSON."""
     normalized = dict(scan_result)
     raw_findings = scan_result.get("findings", [])
     findings: list[Any] = []
@@ -400,11 +415,10 @@ def normalize_scan_result_dimensions(scan_result: dict[str, Any]) -> dict[str, A
     raw_summary = scan_result.get("summary", {})
     if isinstance(raw_summary, dict):
         summary = dict(raw_summary)
-        if not isinstance(summary.get("dimension_counts"), dict):
-            summary["dimension_counts"] = {
-                SENSITIVE_DATA_DIMENSION: summary.get("total_findings", len(findings)),
-                INCOMPLETE_CONTENT_DIMENSION: 0,
-            }
+        summary["dimension_counts"] = _normalize_dimension_counts(
+            summary.get("dimension_counts"),
+            sensitive_default=summary.get("total_findings", len(findings)),
+        )
         normalized["summary"] = summary
     return normalized
 
@@ -412,11 +426,10 @@ def normalize_scan_result_dimensions(scan_result: dict[str, Any]) -> dict[str, A
 def normalize_scan_summary_dimensions(summary: dict[str, Any]) -> dict[str, Any]:
     """Add deterministic dimension counts to a legacy summary snapshot."""
     normalized = dict(summary)
-    if not isinstance(normalized.get("dimension_counts"), dict):
-        normalized["dimension_counts"] = {
-            SENSITIVE_DATA_DIMENSION: normalized.get("total_findings", 0),
-            INCOMPLETE_CONTENT_DIMENSION: 0,
-        }
+    normalized["dimension_counts"] = _normalize_dimension_counts(
+        normalized.get("dimension_counts"),
+        sensitive_default=normalized.get("total_findings", 0),
+    )
     return normalized
 
 
