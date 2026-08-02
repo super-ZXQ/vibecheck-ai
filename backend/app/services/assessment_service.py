@@ -1127,13 +1127,18 @@ def assess_scan_result(task_id: str, scan_result: dict[str, Any]) -> dict[str, A
     layer (save_assessment_result) determines the final timestamps.
     """
     raw_findings = scan_result.get("findings", [])
+    if not isinstance(raw_findings, list):
+        raise AssessmentInternalError("Findings is not a list")
+    if any(not isinstance(finding, dict) for finding in raw_findings):
+        raise AssessmentInternalError("Finding is not a dict")
     findings = [
         finding for finding in raw_findings
-        if isinstance(finding, dict)
-        and finding.get("dimension", SENSITIVE_DATA_DIMENSION)
+        if finding.get("dimension", SENSITIVE_DATA_DIMENSION)
         == SENSITIVE_DATA_DIMENSION
     ]
     raw_summary = scan_result.get("summary", {})
+    if not isinstance(raw_summary, dict):
+        raise AssessmentInternalError("Scan summary is not a dict")
     summary = scope_summary_to_sensitive_data(raw_summary, len(findings))
 
     # --- 1. Compute score_breakdown and total deduction ---

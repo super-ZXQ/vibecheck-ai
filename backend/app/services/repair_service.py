@@ -1471,11 +1471,9 @@ def generate_repair_plan(
     findings: list[dict] = []
     has_unknown_template = False
     for raw_f in raw_findings:
-        if (
-            not isinstance(raw_f, dict)
-            or raw_f.get("dimension", SENSITIVE_DATA_DIMENSION)
-            != SENSITIVE_DATA_DIMENSION
-        ):
+        if not isinstance(raw_f, dict):
+            raise RepairPlanInternalError("Finding is not a dict")
+        if raw_f.get("dimension", SENSITIVE_DATA_DIMENSION) != SENSITIVE_DATA_DIMENSION:
             continue
         ff = _extract_finding_fields(raw_f)
         # Sanitize file_path early — before aggregation and prompt

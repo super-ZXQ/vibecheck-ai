@@ -18,8 +18,11 @@ from app.scanner.base import (
     Severity,
 )
 from app.services import task_manager
-from app.services.assessment_service import assess_scan_result
-from app.services.repair_service import generate_repair_plan
+from app.services.assessment_service import AssessmentInternalError, assess_scan_result
+from app.services.repair_service import (
+    RepairPlanInternalError,
+    generate_repair_plan,
+)
 from app.services.scan_result_service import (
     get_scan_result,
     get_scan_summary,
@@ -197,3 +200,29 @@ def test_incomplete_findings_do_not_change_assessment_or_repair_plan():
     assert mixed_plan == baseline_plan
     assert "I001_TODO_COMMENT" not in mixed_plan["agent_prompt"]
     assert mixed_assessment["verdict"] != "blocked"
+
+
+def test_malformed_persisted_findings_fail_closed():
+    task_id = "malformed-dimension-task"
+    scan_result = _scan_dict([], multidimensional=True)
+    scan_result["findings"] = ["not-a-finding"]
+    scan_result["summary"]["total_findings"] = 1
+    scan_result["summary"]["dimension_counts"][SENSITIVE_DATA_DIMENSION] = 1
+
+    with pytest.raises(AssessmentInternalError):
+        assess_scan_result(task_id, scan_result)
+
+    assessment = assess_scan_result(
+        task_id, _scan_dict([], multidimensional=True)
+    )
+    with pytest.raises(RepairPlanInternalError):
+        generate_repair_plan(
+            task_id=task_id,
+            scan_result=scan_result,
+            summary=scan_result["summary"],
+            scan_updated_at="2026-01-01T00:00:00Z",
+            assessment=assessment,
+            assessment_updated_at="2026-01-01T00:00:01Z",
+            assessment_policy_version="p0-6-v1",
+            source_scan_updated_at="2026-01-01T00:00:00Z",
+        )
