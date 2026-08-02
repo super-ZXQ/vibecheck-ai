@@ -105,11 +105,12 @@ function makeFindings(count: number) {
     secret_type: "password",
     message: "Potential hardcoded password",
     repair_template_key: "REPLACE_WITH_ENV_VAR",
+    dimension: "sensitive_data_security" as const,
   }));
 }
 
 export const mockScanResult = {
-  schema_version: 1,
+  schema_version: 2,
   findings: makeFindings(30),
   notices: [
     { rule_id: "R008", message: "Env file detected", file_path: ".env.example" },
@@ -134,6 +135,37 @@ export const mockScanResult = {
     skipped_files_truncated: false,
     returned_scan_errors: 0,
     scan_errors_truncated: false,
+    dimension_counts: {
+      sensitive_data_security: 30,
+      incomplete_content: 0,
+    },
+  },
+};
+
+export const mockMultidimensionalScanResult = {
+  ...mockScanResult,
+  findings: [
+    ...mockScanResult.findings.slice(0, 26),
+    ...Array.from({ length: 6 }, (_, i) => ({
+      ...mockScanResult.findings[i],
+      rule_id: `I00${i % 5 + 1}_INCOMPLETE`,
+      rule_name: `Incomplete Rule ${i + 1}`,
+      file_path: `src/incomplete_${i}.ts`,
+      is_blocking: false,
+      dimension: "incomplete_content" as const,
+      description: "An unfinished construct remains in production source code.",
+      message: "Complete the implementation before shipping.",
+    })),
+  ],
+  summary: {
+    ...mockScanResult.summary,
+    total_findings: 32,
+    blocking_findings: 6,
+    returned_findings: 32,
+    dimension_counts: {
+      sensitive_data_security: 26,
+      incomplete_content: 6,
+    },
   },
 };
 

@@ -51,27 +51,33 @@ _PLACEHOLDER_RETURN_RE = re.compile(
     re.IGNORECASE,
 )
 _UNIMPLEMENTED_PATTERNS = (
-    re.compile(r"^\s*raise\s+NotImplementedError\b"),
-    re.compile(r"^\s*(?:return\s+)?(?:todo|unimplemented)!\s*\("),
-    re.compile(
+    (re.compile(r"^\s*raise\s+NotImplementedError\b"), True),
+    (re.compile(r"^\s*throw\s+new\s+NotImplementedException\s*\("), True),
+    (re.compile(
+        r"^\s*raise\s+[A-Za-z_][\w.]*\s*\("
+        r"\s*(['\"])\s*not\s+implemented\b.*?\1\s*\)",
+        re.IGNORECASE,
+    ), False),
+    (re.compile(r"\b(?:todo|unimplemented)!\s*\("), True),
+    (re.compile(
         r"^\s*throw\s+(?:new\s+)?[A-Za-z_$][\w$]*\s*\("
         r"\s*(['\"])\s*not\s+implemented\b.*?\1\s*\)",
         re.IGNORECASE,
-    ),
-    re.compile(
+    ), False),
+    (re.compile(
         r"^\s*(?:return\s+)?panic\s*\(\s*(['\"])\s*not\s+implemented\b.*?\1\s*\)",
         re.IGNORECASE,
-    ),
+    ), False),
 )
 _DEBUG_BREAKPOINT_PATTERNS = (
-    re.compile(r"^\s*debugger\s*;?\s*$"),
+    re.compile(r"\bdebugger\b\s*;?"),
     re.compile(r"\bbreakpoint\s*\(\s*\)"),
     re.compile(r"\b(?:pdb|ipdb)\.set_trace\s*\(\s*\)"),
 )
 _DEBUG_OUTPUT_PATTERNS = (
     re.compile(r"\bconsole\.log\s*\("),
     re.compile(r"(?<![.\w])print\s*\("),
-    re.compile(r"(?<![.\w])println\s*\("),
+    re.compile(r"(?<![.\w])println!?\s*\("),
 )
 
 
@@ -83,6 +89,16 @@ def is_incomplete_source_file(file_path: str) -> bool:
         return False
     name = path.name.lower()
     if name.endswith((".min.js", ".min.css", ".lock")):
+        return False
+    stem = path.stem.lower()
+    if (
+        name in {"conftest.py", "fixtures.py", "mocks.py"}
+        or stem.startswith("test_")
+        or stem.endswith("_test")
+        or stem.endswith("_spec")
+        or ".test" in stem
+        or ".spec" in stem
+    ):
         return False
     return path.suffix.lower() in SOURCE_EXTENSIONS
 
@@ -251,8 +267,10 @@ class UnimplementedCodeRule(Rule):
         collector = BoundedFindingCollector(settings.scan_max_findings_per_rule_per_file)
         for line_index, line in enumerate(lines):
             code = _code_without_comments(line, comments[line_index])
-            for pattern in _UNIMPLEMENTED_PATTERNS:
-                for match in pattern.finditer(code):
+            code_without_strings = _code_without_strings(code)
+            for pattern, strings_are_not_semantic in _UNIMPLEMENTED_PATTERNS:
+                search_code = code_without_strings if strings_are_not_semantic else code
+                for match in pattern.finditer(search_code):
                     if (
                         PurePosixPath(file_path).suffix.lower() == ".py"
                         and "NotImplementedError" in match.group(0)
