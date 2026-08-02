@@ -51,23 +51,23 @@ _PLACEHOLDER_RETURN_RE = re.compile(
     re.IGNORECASE,
 )
 _UNIMPLEMENTED_PATTERNS = (
-    (re.compile(r"^\s*raise\s+NotImplementedError\b"), True),
-    (re.compile(r"^\s*throw\s+new\s+NotImplementedException\s*\("), True),
-    (re.compile(
+    re.compile(r"^\s*raise\s+NotImplementedError\b"),
+    re.compile(r"^\s*throw\s+new\s+NotImplementedException\s*\("),
+    re.compile(
         r"^\s*raise\s+[A-Za-z_][\w.]*\s*\("
         r"\s*(['\"])\s*not\s+implemented\b.*?\1\s*\)",
         re.IGNORECASE,
-    ), False),
-    (re.compile(r"\b(?:todo|unimplemented)!\s*\("), True),
-    (re.compile(
+    ),
+    re.compile(r"\b(?:todo|unimplemented)!\s*\("),
+    re.compile(
         r"^\s*throw\s+(?:new\s+)?[A-Za-z_$][\w$]*\s*\("
         r"\s*(['\"])\s*not\s+implemented\b.*?\1\s*\)",
         re.IGNORECASE,
-    ), False),
-    (re.compile(
+    ),
+    re.compile(
         r"^\s*(?:return\s+)?panic\s*\(\s*(['\"])\s*not\s+implemented\b.*?\1\s*\)",
         re.IGNORECASE,
-    ), False),
+    ),
 )
 _DEBUG_BREAKPOINT_PATTERNS = (
     re.compile(r"\bdebugger\b\s*;?"),
@@ -76,9 +76,20 @@ _DEBUG_BREAKPOINT_PATTERNS = (
 )
 _DEBUG_OUTPUT_PATTERNS = (
     re.compile(r"\bconsole\.log\s*\("),
+    re.compile(r"\bSystem\.(?:out|err)\.println\s*\("),
     re.compile(r"(?<![.\w])print\s*\("),
     re.compile(r"(?<![.\w])println!?\s*\("),
 )
+
+_PYTHON_TRIPLE_QUOTE_EXTENSIONS = frozenset({".py"})
+_BACKTICK_STRING_EXTENSIONS = frozenset({
+    ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte",
+})
+_ABSTRACT_CLASS_RE = re.compile(
+    r"\b(?:abc\.)?ABC\b|\bmetaclass\s*=\s*(?:abc\.)?ABCMeta\b"
+)
+_PYTHON_DEF_RE = re.compile(r"^(\s*)(?:async\s+)?def\s+[A-Za-z_]\w*\s*\(")
+_PYTHON_CLASS_RE = re.compile(r"^(\s*)class\s+[A-Za-z_]\w*\s*\(([^)]*)\)\s*:")
 
 
 def is_incomplete_source_file(file_path: str) -> bool:
@@ -103,67 +114,132 @@ def is_incomplete_source_file(file_path: str) -> bool:
     return path.suffix.lower() in SOURCE_EXTENSIONS
 
 
-def _find_comment_token(line: str, start: int, tokens: tuple[str, ...]) -> tuple[int, str] | None:
-    """Find a comment token outside single-line string literals."""
-    quote: str | None = None
-    escaped = False
-    index = start
-    while index < len(line):
-        char = line[index]
-        if quote is not None:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == quote:
-                quote = None
-            index += 1
-            continue
-        if char in ("'", '"', "`"):
-            quote = char
-            index += 1
-            continue
-        for token in tokens:
-            if line.startswith(token, index):
-                return index, token
-        index += 1
-    return None
+def _find_unescaped(line: str, delimiter: str, start: int) -> int:
+    """Find a delimiter whose first character is not backslash-escaped."""
+    position = line.find(delimiter, start)
+    while position >= 0:
+        backslashes = 0
+        cursor = position - 1
+        while cursor >= 0 and line[cursor] == "\\":
+            backslashes += 1
+            cursor -= 1
+        if backslashes % 2 == 0:
+            return position
+        position = line.find(delimiter, position + 1)
+    return -1
+
+
+def _analyze_source_lines(
+    file_path: str, lines: list[str]
+) -> tuple[list[list[tuple[int, int, str]]], list[list[tuple[int, int]]]]:
+    """Return comment and string spans using deterministic lexical state."""
+    ext = PurePosixPath(file_path).suffix.lower()
+    comments: list[list[tuple[int, int, str]]] = [[] for _ in lines]
+    strings: list[list[tuple[int, int]]] = [[] for _ in lines]
+    block_comment_end: str | None = None
+    multiline_string_end: str | None = None
+
+    if ext in _HASH_COMMENT_EXTENSIONS:
+        single_comment_tokens = ("#",)
+    elif ext == ".php":
+        single_comment_tokens = ("//", "#")
+    else:
+        single_comment_tokens = ("//",)
+    block_comment_tokens = (("/*", "*/"),)
+    if ext in {".vue", ".svelte"}:
+        block_comment_tokens += (("<!--", "-->"),)
+
+    for index, line in enumerate(lines):
+        pos = 0
+        while pos < len(line):
+            if block_comment_end is not None:
+                end = line.find(block_comment_end, pos)
+                if end < 0:
+                    comments[index].append((pos, len(line), line[pos:]))
+                    break
+                span_end = end + len(block_comment_end)
+                comments[index].append((pos, span_end, line[pos:span_end]))
+                block_comment_end = None
+                pos = span_end
+                continue
+
+            if multiline_string_end is not None:
+                end = _find_unescaped(line, multiline_string_end, pos)
+                if end < 0:
+                    strings[index].append((pos, len(line)))
+                    break
+                span_end = end + len(multiline_string_end)
+                strings[index].append((pos, span_end))
+                multiline_string_end = None
+                pos = span_end
+                continue
+
+            triple_quote = next(
+                (
+                    delimiter for delimiter in ('"""', "'''")
+                    if ext in _PYTHON_TRIPLE_QUOTE_EXTENSIONS
+                    and line.startswith(delimiter, pos)
+                ),
+                None,
+            )
+            if triple_quote is not None:
+                end = _find_unescaped(line, triple_quote, pos + len(triple_quote))
+                if end < 0:
+                    strings[index].append((pos, len(line)))
+                    multiline_string_end = triple_quote
+                    break
+                span_end = end + len(triple_quote)
+                strings[index].append((pos, span_end))
+                pos = span_end
+                continue
+
+            if ext in _BACKTICK_STRING_EXTENSIONS and line[pos] == "`":
+                end = _find_unescaped(line, "`", pos + 1)
+                if end < 0:
+                    strings[index].append((pos, len(line)))
+                    multiline_string_end = "`"
+                    break
+                strings[index].append((pos, end + 1))
+                pos = end + 1
+                continue
+
+            if line[pos] in ("'", '"'):
+                end = _find_unescaped(line, line[pos], pos + 1)
+                span_end = len(line) if end < 0 else end + 1
+                strings[index].append((pos, span_end))
+                pos = span_end
+                continue
+
+            matched_block = next(
+                (
+                    (start_token, end_token)
+                    for start_token, end_token in block_comment_tokens
+                    if line.startswith(start_token, pos)
+                ),
+                None,
+            )
+            if matched_block is not None:
+                start_token, end_token = matched_block
+                end = line.find(end_token, pos + len(start_token))
+                if end < 0:
+                    comments[index].append((pos, len(line), line[pos:]))
+                    block_comment_end = end_token
+                    break
+                span_end = end + len(end_token)
+                comments[index].append((pos, span_end, line[pos:span_end]))
+                pos = span_end
+                continue
+
+            if any(line.startswith(token, pos) for token in single_comment_tokens):
+                comments[index].append((pos, len(line), line[pos:]))
+                break
+            pos += 1
+    return comments, strings
 
 
 def _comment_segments(file_path: str, lines: list[str]) -> list[list[tuple[int, int, str]]]:
     """Extract conservative comment segments with their source columns."""
-    ext = PurePosixPath(file_path).suffix.lower()
-    result: list[list[tuple[int, int, str]]] = [[] for _ in lines]
-    in_block = False
-    for index, line in enumerate(lines):
-        pos = 0
-        while pos < len(line):
-            if in_block:
-                end = line.find("*/", pos)
-                if end < 0:
-                    result[index].append((pos, len(line), line[pos:]))
-                    break
-                result[index].append((pos, end + 2, line[pos:end + 2]))
-                in_block = False
-                pos = end + 2
-                continue
-
-            tokens = ("#",) if ext in _HASH_COMMENT_EXTENSIONS else ("//", "/*")
-            located = _find_comment_token(line, pos, tokens)
-            if located is None:
-                break
-            start, token = located
-            if token != "/*":
-                result[index].append((start, len(line), line[start:]))
-                break
-            end = line.find("*/", start + 2)
-            if end < 0:
-                result[index].append((start, len(line), line[start:]))
-                in_block = True
-                break
-            result[index].append((start, end + 2, line[start:end + 2]))
-            pos = end + 2
-    return result
+    return _analyze_source_lines(file_path, lines)[0]
 
 
 def _code_without_comments(line: str, comments: list[tuple[int, int, str]]) -> str:
@@ -173,27 +249,47 @@ def _code_without_comments(line: str, comments: list[tuple[int, int, str]]) -> s
     return "".join(chars)
 
 
-def _code_without_strings(line: str) -> str:
-    """Replace quoted string contents so code-like text is not executed as a rule."""
+def _code_without_strings(line: str, spans: list[tuple[int, int]]) -> str:
+    """Replace lexer-provided string spans while retaining source columns."""
     chars = list(line)
-    quote: str | None = None
-    escaped = False
-    for index, char in enumerate(line):
-        if quote is None:
-            if char in ("'", '"', "`"):
-                quote = char
-            continue
-        if escaped:
-            chars[index] = " "
-            escaped = False
-        elif char == "\\":
-            chars[index] = " "
-            escaped = True
-        elif char == quote:
-            quote = None
-        else:
-            chars[index] = " "
+    for start, end in spans:
+        chars[start:end] = " " * (end - start)
     return "".join(chars)
+
+
+def _position_in_spans(position: int, spans: list[tuple[int, int]]) -> bool:
+    return any(start <= position < end for start, end in spans)
+
+
+def _indent_width(value: str) -> int:
+    return len(value.expandtabs(8))
+
+
+def _is_explicit_abstract_python_context(lines: list[str], line_index: int) -> bool:
+    """Recognize explicit abstract methods/classes without importing target code."""
+    current_indent = _indent_width(lines[line_index]) - _indent_width(lines[line_index].lstrip())
+    method_index: int | None = None
+    method_indent = -1
+    for previous in range(line_index - 1, -1, -1):
+        match = _PYTHON_DEF_RE.match(lines[previous])
+        if match and _indent_width(match.group(1)) < current_indent:
+            method_index = previous
+            method_indent = _indent_width(match.group(1))
+            break
+    if method_index is None:
+        return False
+
+    decorator_index = method_index - 1
+    while decorator_index >= 0 and lines[decorator_index].lstrip().startswith("@"):
+        if re.search(r"@(?:abc\.)?abstractmethod\b", lines[decorator_index]):
+            return True
+        decorator_index -= 1
+
+    for previous in range(method_index - 1, -1, -1):
+        match = _PYTHON_CLASS_RE.match(lines[previous])
+        if match and _indent_width(match.group(1)) < method_indent:
+            return bool(_ABSTRACT_CLASS_RE.search(match.group(2)))
+    return False
 
 
 def _content_finding(
@@ -263,21 +359,18 @@ class UnimplementedCodeRule(Rule):
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
         if not is_incomplete_source_file(file_path):
             return []
-        comments = _comment_segments(file_path, lines)
+        comments, strings = _analyze_source_lines(file_path, lines)
         collector = BoundedFindingCollector(settings.scan_max_findings_per_rule_per_file)
         for line_index, line in enumerate(lines):
             code = _code_without_comments(line, comments[line_index])
-            code_without_strings = _code_without_strings(code)
-            for pattern, strings_are_not_semantic in _UNIMPLEMENTED_PATTERNS:
-                search_code = code_without_strings if strings_are_not_semantic else code
-                for match in pattern.finditer(search_code):
+            for pattern in _UNIMPLEMENTED_PATTERNS:
+                for match in pattern.finditer(code):
+                    if _position_in_spans(match.start(), strings[line_index]):
+                        continue
                     if (
                         PurePosixPath(file_path).suffix.lower() == ".py"
                         and "NotImplementedError" in match.group(0)
-                        and any(
-                            "@abstractmethod" in lines[previous]
-                            for previous in range(max(0, line_index - 6), line_index)
-                        )
+                        and _is_explicit_abstract_python_context(lines, line_index)
                     ):
                         continue
                     if not collector.should_accept(False, self.severity, self.confidence,
@@ -343,11 +436,12 @@ class DebugBreakpointRule(Rule):
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
         if not is_incomplete_source_file(file_path):
             return []
-        comments = _comment_segments(file_path, lines)
+        comments, strings = _analyze_source_lines(file_path, lines)
         collector = BoundedFindingCollector(settings.scan_max_findings_per_rule_per_file)
         for line_index, line in enumerate(lines):
             code = _code_without_strings(
-                _code_without_comments(line, comments[line_index])
+                _code_without_comments(line, comments[line_index]),
+                strings[line_index],
             )
             for pattern in _DEBUG_BREAKPOINT_PATTERNS:
                 for match in pattern.finditer(code):
@@ -376,12 +470,13 @@ class ExcessiveDebugOutputRule(Rule):
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
         if not is_incomplete_source_file(file_path):
             return []
-        comments = _comment_segments(file_path, lines)
+        comments, strings = _analyze_source_lines(file_path, lines)
         count = 0
         first_line = 0
         for line_index, line in enumerate(lines):
             code = _code_without_strings(
-                _code_without_comments(line, comments[line_index])
+                _code_without_comments(line, comments[line_index]),
+                strings[line_index],
             )
             line_count = sum(len(pattern.findall(code)) for pattern in _DEBUG_OUTPUT_PATTERNS)
             if line_count and not first_line:

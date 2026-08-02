@@ -31,6 +31,28 @@ def test_todo_markers_are_detected_only_in_source_comments(tmp_path):
     assert all(not f.is_blocking for f in findings)
 
 
+def test_multiline_string_literals_do_not_produce_findings(tmp_path):
+    _scan(
+        tmp_path,
+        "src/help.py",
+        'HELP = """\n# TODO shown in help\nbreakpoint()\n'
+        'raise RuntimeError("not implemented")\n'
+        + "\n".join("print(value)" for _ in range(6))
+        + '\n"""\n',
+    )
+    findings = _scan(
+        tmp_path,
+        "src/help.ts",
+        "const help = `\n// FIXME shown to users\ndebugger;\n"
+        + "\n".join("console.log(value);" for _ in range(6))
+        + "\n`;\n",
+    )
+    assert not any(
+        finding.dimension == INCOMPLETE_CONTENT_DIMENSION
+        for finding in findings
+    )
+
+
 def test_unimplemented_constructs_across_languages(tmp_path):
     _scan(tmp_path, "src/service.py", "def run():\n    raise NotImplementedError()\n")
     _scan(tmp_path, "src/service.rs", "todo!();\nlet value = unimplemented!();\n")
@@ -74,6 +96,21 @@ def test_abstract_not_implemented_and_string_literals_are_not_reported(tmp_path)
     assert "I002_UNIMPLEMENTED_CODE" not in _rule_ids(findings)
 
 
+def test_explicit_abstract_base_classes_are_not_reported(tmp_path):
+    findings = _scan(
+        tmp_path,
+        "src/base.py",
+        "from abc import ABC, ABCMeta\n"
+        "class Base(ABC):\n"
+        "    def run(self):\n"
+        "        raise NotImplementedError\n"
+        "class MetaBase(metaclass=ABCMeta):\n"
+        "    def save(self):\n"
+        "        raise NotImplementedError\n",
+    )
+    assert "I002_UNIMPLEMENTED_CODE" not in _rule_ids(findings)
+
+
 def test_placeholder_return_requires_adjacent_explicit_comment(tmp_path):
     findings = _scan(
         tmp_path,
@@ -107,6 +144,29 @@ def test_excessive_debug_output_threshold_is_six(tmp_path):
     assert len(excessive) == 1
     assert excessive[0].finding_type.value == "file"
     assert excessive[0].snippet_masked == "<debug-output-count:6>"
+
+
+def test_java_system_out_println_threshold_is_six(tmp_path):
+    five = _scan(
+        tmp_path,
+        "src/Five.java",
+        "\n".join('System.out.println("debug");' for _ in range(5)),
+    )
+    six = _scan(
+        tmp_path,
+        "src/Six.java",
+        "\n".join('System.out.println("debug");' for _ in range(6)),
+    )
+    assert not any(
+        finding.rule_id == "I005_EXCESSIVE_DEBUG_OUTPUT"
+        and finding.file_path == "src/Five.java"
+        for finding in five
+    )
+    assert sum(
+        finding.rule_id == "I005_EXCESSIVE_DEBUG_OUTPUT"
+        and finding.file_path == "src/Six.java"
+        for finding in six
+    ) == 1
 
 
 def test_non_source_and_non_production_paths_are_excluded(tmp_path):
