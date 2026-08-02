@@ -34,6 +34,7 @@ from typing import Any, Optional
 from app.core.security.desensitize import mask_snippet, mask_untrusted_text
 from app.db.database import _get_connection, init_db, now_iso
 from app.scanner.base import (
+    BASIC_SECURITY_DIMENSION,
     Confidence,
     DEPLOYABILITY_PRODUCTION_DIMENSION,
     Finding,
@@ -366,6 +367,9 @@ def _compute_summary(
             1 for f in findings
             if f.dimension == DEPLOYABILITY_PRODUCTION_DIMENSION
         ),
+        BASIC_SECURITY_DIMENSION: sum(
+            1 for f in findings if f.dimension == BASIC_SECURITY_DIMENSION
+        ),
     }
     return {
         "total_findings": len(findings),
@@ -394,6 +398,7 @@ def _normalize_dimension_counts(
     counts.setdefault(SENSITIVE_DATA_DIMENSION, sensitive_default)
     counts.setdefault(INCOMPLETE_CONTENT_DIMENSION, 0)
     counts.setdefault(DEPLOYABILITY_PRODUCTION_DIMENSION, 0)
+    counts.setdefault(BASIC_SECURITY_DIMENSION, 0)
     return counts
 
 
