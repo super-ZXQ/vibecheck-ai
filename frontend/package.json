@@ -8,7 +8,7 @@
     "start": "node .next/standalone/server.js",
     "check:test-hooks": "node scripts/check-test-hooks.mjs",
     "test:unit": "node --test test/*.test.mjs",
-    "test:e2e:dev": "playwright test --config=playwright.dev.config.ts"
+    "test:e2e:dev": "node scripts/run-dev-e2e.mjs"
   },
   "dependencies": {
     "next": "16.2.12",
