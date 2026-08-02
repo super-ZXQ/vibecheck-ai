@@ -1,5 +1,5 @@
 /**
- * ScanResults — findings table with pagination + collapsible sections.
+ * ScanResults — dimension summary, filtered findings, and collapsible details.
  *
  * Pagination:
  * - Default 25 items per page, switchable to 50.
@@ -14,7 +14,7 @@
 
 "use client";
 
-import { useState } from "react";
+import { Fragment, useState } from "react";
 
 import type { ScanResult } from "@/lib/types";
 
@@ -38,42 +38,106 @@ const SEVERITY_LABELS: Record<string, string> = {
   info: "信息",
 };
 
+const SENSITIVE_DIMENSION = "sensitive_data_security";
+const INCOMPLETE_DIMENSION = "incomplete_content";
+
+type FindingFilter = "all" | typeof SENSITIVE_DIMENSION | typeof INCOMPLETE_DIMENSION;
+
+function findingDimension(dimension: string | undefined) {
+  return dimension ?? SENSITIVE_DIMENSION;
+}
+
 export function ScanResults({ scanResult }: ScanResultsProps) {
   const [pageSize, setPageSize] = useState<number>(25);
   const [currentPage, setCurrentPage] = useState<number>(0);
+  const [filter, setFilter] = useState<FindingFilter>("all");
+  const [expandedFinding, setExpandedFinding] = useState<string | null>(null);
 
   const findings = scanResult.findings;
-  const totalPages = Math.max(1, Math.ceil(findings.length / pageSize));
+  const counts = scanResult.summary.dimension_counts;
+  const sensitiveCount = counts?.sensitive_data_security
+    ?? findings.filter((finding) => findingDimension(finding.dimension) === SENSITIVE_DIMENSION).length;
+  const incompleteCount = counts?.incomplete_content
+    ?? findings.filter((finding) => findingDimension(finding.dimension) === INCOMPLETE_DIMENSION).length;
+  const filteredFindings = filter === "all"
+    ? findings
+    : findings.filter((finding) => findingDimension(finding.dimension) === filter);
+  const totalPages = Math.max(1, Math.ceil(filteredFindings.length / pageSize));
   const safePage = Math.min(currentPage, totalPages - 1);
   const startIndex = safePage * pageSize;
-  const endIndex = Math.min(startIndex + pageSize, findings.length);
-  const pageFindings = findings.slice(startIndex, endIndex);
+  const endIndex = Math.min(startIndex + pageSize, filteredFindings.length);
+  const pageFindings = filteredFindings.slice(startIndex, endIndex);
+
+  const selectFilter = (nextFilter: FindingFilter) => {
+    setFilter(nextFilter);
+    setCurrentPage(0);
+    setExpandedFinding(null);
+  };
 
   return (
     <div>
+      <div className="dimension-summary" aria-label="扫描维度摘要">
+        <div className="dimension-card" data-testid="sensitive-dimension-count">
+          <span>敏感信息安全</span>
+          <strong>{sensitiveCount}</strong>
+        </div>
+        <div className="dimension-card" data-testid="incomplete-dimension-count">
+          <span>未完成内容</span>
+          <strong>{incompleteCount}</strong>
+        </div>
+      </div>
+      <p className="dimension-score-notice">未完成内容暂不计入安全评分。</p>
+
       {/* --- Findings --- */}
       <h3 style={{ fontSize: "1.1rem", marginBottom: "0.75rem" }}>
         发现问题 ({findings.length})
       </h3>
 
-      {findings.length === 0 ? (
-        <div className="empty-state">未发现敏感信息问题。</div>
+      <div className="dimension-filters" aria-label="按扫描维度筛选">
+        {([
+          ["all", "全部"],
+          [SENSITIVE_DIMENSION, "敏感信息"],
+          [INCOMPLETE_DIMENSION, "未完成内容"],
+        ] as const).map(([value, label]) => (
+          <button
+            key={value}
+            type="button"
+            className={`dimension-filter${filter === value ? " dimension-filter-active" : ""}`}
+            aria-pressed={filter === value}
+            onClick={() => selectFilter(value)}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {filteredFindings.length === 0 ? (
+        <div className="empty-state">
+          {findings.length === 0 ? "未发现扫描问题。" : "当前维度没有发现问题。"}
+        </div>
       ) : (
         <>
           <table className="findings-table">
             <thead>
               <tr>
                 <th>严重程度</th>
+                <th>维度</th>
                 <th>规则</th>
                 <th>文件</th>
                 <th>行号</th>
                 <th>代码片段</th>
                 <th>阻断</th>
+                <th>建议</th>
               </tr>
             </thead>
             <tbody>
-              {pageFindings.map((f, i) => (
-                <tr key={`${f.rule_id}-${startIndex + i}`}>
+              {pageFindings.map((f, i) => {
+                const findingKey = `${f.rule_id}-${f.file_path}-${f.line_start}-${startIndex + i}`;
+                const isExpanded = expandedFinding === findingKey;
+                const dimension = findingDimension(f.dimension);
+                return (
+                <Fragment key={findingKey}>
+                <tr>
                   <td>
                     <span
                       className={`severity-badge ${
@@ -81,6 +145,11 @@ export function ScanResults({ scanResult }: ScanResultsProps) {
                       }`}
                     >
                       {SEVERITY_LABELS[f.severity] ?? f.severity}
+                    </span>
+                  </td>
+                  <td>
+                    <span className={`dimension-badge dimension-${dimension}`}>
+                      {dimension === INCOMPLETE_DIMENSION ? "未完成内容" : "敏感信息"}
                     </span>
                   </td>
                   <td>{f.rule_name}</td>
@@ -95,8 +164,8 @@ export function ScanResults({ scanResult }: ScanResultsProps) {
                     {f.file_path}
                   </td>
                   <td>
-                    {f.line_start}
-                    {f.line_end !== f.line_start ? `-${f.line_end}` : ""}
+                    {f.line_start ?? "-"}
+                    {f.line_start !== null && f.line_end !== f.line_start ? `-${f.line_end}` : ""}
                   </td>
                   <td
                     style={{
@@ -119,8 +188,29 @@ export function ScanResults({ scanResult }: ScanResultsProps) {
                       <span style={{ color: "#94a3b8" }}>否</span>
                     )}
                   </td>
+                  <td>
+                    <button
+                      type="button"
+                      className="finding-detail-button"
+                      aria-expanded={isExpanded}
+                      onClick={() => setExpandedFinding(isExpanded ? null : findingKey)}
+                    >
+                      {isExpanded ? "收起建议" : "查看建议"}
+                    </button>
+                  </td>
                 </tr>
-              ))}
+                {isExpanded && (
+                  <tr className="finding-detail-row">
+                    <td colSpan={8}>
+                      <strong>说明：</strong>{f.description}
+                      <br />
+                      <strong>处理建议：</strong>{f.message}
+                    </td>
+                  </tr>
+                )}
+                </Fragment>
+                );
+              })}
             </tbody>
           </table>
 
@@ -128,7 +218,7 @@ export function ScanResults({ scanResult }: ScanResultsProps) {
           <div className="pagination">
             <div>
               <span style={{ fontSize: "0.85rem", color: "#64748b" }}>
-                第 {startIndex + 1}-{endIndex} 条 / 共 {findings.length} 条
+                第 {startIndex + 1}-{endIndex} 条 / 共 {filteredFindings.length} 条
               </span>
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>

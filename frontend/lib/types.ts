@@ -39,6 +39,10 @@ export interface ScanSummary {
   skipped_files_truncated: boolean;
   returned_scan_errors: number;
   scan_errors_truncated: boolean;
+  dimension_counts?: {
+    sensitive_data_security?: number;
+    incomplete_content?: number;
+  };
 }
 
 export interface TaskStatusResponse {
@@ -70,10 +74,10 @@ export interface Finding {
   severity: string; // "critical" | "high" | "medium" | "low" | "info"
   confidence: string; // "high" | "medium" | "low"
   file_path: string;
-  line_start: number;
-  line_end: number;
-  column_start: number;
-  column_end: number;
+  line_start: number | null;
+  line_end: number | null;
+  column_start: number | null;
+  column_end: number | null;
   snippet_masked: string;
   is_blocking: boolean;
   finding_type: string;
@@ -82,6 +86,7 @@ export interface Finding {
   secret_type: string;
   message: string;
   repair_template_key: string;
+  dimension?: "sensitive_data_security" | "incomplete_content";
 }
 
 export interface ScanNotice {
