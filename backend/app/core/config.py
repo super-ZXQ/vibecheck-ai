@@ -4,13 +4,55 @@ Sensitive values (GitHub Token, LLM API Key) are read from environment variables
 and NEVER hardcoded. This module is the single source of truth for all limits.
 """
 
+import posixpath
+from pathlib import PurePosixPath
+from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 
+def validate_production_database_url(database_url: str) -> None:
+    """Require a canonical persistent SQLite file inside Docker's /data."""
+    parsed = urlsplit(database_url)
+    if (
+        parsed.scheme != "sqlite"
+        or parsed.netloc
+        or parsed.query
+        or parsed.fragment
+        or not database_url.startswith("sqlite:////")
+    ):
+        raise ValueError(
+            "production database_url must be a SQLite .db file under /data"
+        )
+
+    raw_path = database_url.removeprefix("sqlite:///")
+    path = PurePosixPath(raw_path)
+    normalized_path = PurePosixPath(posixpath.normpath(str(path)))
+    if (
+        not path.is_absolute()
+        or ".." in path.parts
+        or normalized_path == PurePosixPath("/data")
+        or normalized_path.suffix != ".db"
+    ):
+        raise ValueError(
+            "production database_url must be a SQLite .db file under /data"
+        )
+
+    try:
+        normalized_path.relative_to(PurePosixPath("/data"))
+    except ValueError as exc:
+        raise ValueError(
+            "production database_url must be a SQLite .db file under /data"
+        ) from exc
+
+
 class Settings(BaseSettings):
+    # --- Runtime environment ---
+    app_env: Literal["development", "test", "production"] = "development"
+    production_config_confirmed: bool = False
+
     # --- GitHub download ---
     github_token: str | None = None  # Optional, read from env GITHUB_TOKEN
     download_timeout: int = 60  # seconds
@@ -122,6 +164,11 @@ class Settings(BaseSettings):
     cors_allowed_origins: list[str] = [
         "http://localhost:3000",
     ]
+    trusted_hosts: list[str] = [
+        "localhost",
+        "127.0.0.1",
+        "testserver",
+    ]
 
     @field_validator("cors_allowed_origins", mode="before")
     @classmethod
@@ -168,7 +215,67 @@ class Settings(BaseSettings):
 
         return origins
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    @field_validator("trusted_hosts", mode="before")
+    @classmethod
+    def validate_trusted_hosts(cls, value: object) -> list[str]:
+        """Allow only an explicit non-empty host list; never trust all hosts."""
+        if not isinstance(value, list) or not value:
+            raise ValueError("trusted_hosts must be a non-empty list")
+
+        hosts: list[str] = []
+        seen: set[str] = set()
+        for host in value:
+            if (
+                not isinstance(host, str)
+                or not host
+                or host != host.strip()
+                or any(char.isspace() for char in host)
+                or host == "*"
+                or "://" in host
+                or "/" in host
+                or "@" in host
+            ):
+                raise ValueError("each trusted host must be an explicit host name")
+            if host not in seen:
+                seen.add(host)
+                hosts.append(host)
+        return hosts
+
+    @model_validator(mode="after")
+    def validate_production_configuration(self) -> "Settings":
+        """Fail closed when production starts with development defaults."""
+        if self.app_env != "production":
+            return self
+
+        if not self.production_config_confirmed:
+            raise ValueError(
+                "production_config_confirmed must be true in production"
+            )
+        validate_production_database_url(self.database_url)
+        if "*" in self.trusted_hosts:
+            raise ValueError("wildcard trusted host is forbidden in production")
+        if "127.0.0.1" not in self.trusted_hosts:
+            raise ValueError(
+                "production trusted_hosts must include 127.0.0.1"
+            )
+
+        for origin in self.cors_allowed_origins:
+            parsed = urlsplit(origin)
+            if (
+                parsed.scheme != "https"
+                and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}
+            ):
+                raise ValueError(
+                    "production CORS origins must use HTTPS except localhost"
+                )
+
+        return self
+
+    model_config = {
+        "env_file": ".env",
+        "env_file_encoding": "utf-8",
+        "hide_input_in_errors": True,
+    }
 
 
 settings = Settings()

@@ -51,3 +51,37 @@ cd backend
 pip install -r requirements.txt
 pytest -v
 ```
+
+## 生产模式
+
+生产模式使用独立的只读、非 root 多阶段镜像，不挂载源代码，也不会启动
+Next.js 开发服务器。
+
+```bash
+# 1. 复制并检查公开地址、CORS 与 Host 白名单
+cp production.env.example production.env
+
+# 2. 构建并启动生产栈
+docker compose \
+  --env-file production.env \
+  -f docker-compose.production.yml \
+  up --build -d
+
+# 3. 验证就绪状态
+curl http://localhost:8000/api/ready
+curl http://localhost:3000/health
+```
+
+`NEXT_PUBLIC_API_BASE_URL` 会在前端镜像构建时固化，部署地址变化后必须重新
+构建前端镜像。面向非本机访问时，应在服务前放置 TLS 反向代理，并把
+`CORS_ALLOWED_ORIGINS` 改成实际 HTTPS Origin，并将公网 Host 追加到
+`TRUSTED_HOSTS`。不得删除 `127.0.0.1`，否则后端会在启动时拒绝配置，容器
+健康检查也无法通过。
+
+后端使用内存中的 `/tmp` 保存下载的压缩包和解压目录；两者与运行开销可能
+同时占用临时空间。`BACKEND_TMPFS_SIZE` 不得低于最大压缩包（50 MB）与最大
+解压大小（200 MB）之和，并应保留额外余量，默认值为 `320m`。生产配置
+缺失、使用默认数据库路径或对远程来源使用 HTTP 时，后端会拒绝启动。
+
+生产响应会发送 HSTS 头，但浏览器只会在服务经过 HTTPS 反向代理访问时执行
+HSTS；本机 HTTP 验收仅用于确认响应头存在，不能替代真实 TLS 部署验证。

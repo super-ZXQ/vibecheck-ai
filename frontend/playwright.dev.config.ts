@@ -23,17 +23,8 @@ export default defineConfig({
     timeout: 15_000,
   },
   use: {
-    baseURL: "http://localhost:3001",
+    baseURL: "http://127.0.0.1:3001",
     trace: "on-first-retry",
-  },
-  webServer: {
-    command: "npm run dev -- --port 3001",
-    url: "http://localhost:3001",
-    reuseExistingServer: false,
-    timeout: 120_000,
-    env: {
-      NEXT_PUBLIC_API_BASE_URL: "http://localhost:8000",
-    },
   },
   projects: [
     {

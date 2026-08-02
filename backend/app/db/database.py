@@ -26,8 +26,10 @@ Tables:
                       lightweight polling queries. Never contains raw secrets.
 """
 
+import os
 import sqlite3
 import threading
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -40,6 +42,156 @@ _local = threading.local()
 _init_lock = threading.Lock()
 _initialized = False
 
+# Production data root — can be overridden in tests via monkeypatch.
+_DATA_ROOT = Path("/data")
+
+_REQUIRED_TABLES = frozenset(
+    {
+        "tasks",
+        "scan_results",
+        "assessment_results",
+        "repair_results",
+    }
+)
+
+
+# ---------------------------------------------------------------------------
+# Production database path validation (symlink / traversal defence)
+# ---------------------------------------------------------------------------
+
+def validate_production_database_path(
+    database_url: str,
+    data_root: Path = Path("/data"),
+) -> Path:
+    """Validate the production database path against symlink and traversal attacks.
+
+    Complements the URL lexical validation in config.py with runtime
+    real-path checks.  Returns the resolved database path on success.
+
+    Raises ValueError on any validation failure.  Error messages never
+    include the full database path.
+
+    Checks performed:
+      1. URL-decode the path and reject encoded path-traversal characters.
+      2. Resolve data_root (must exist) and database path (parent must exist).
+      3. Require the resolved database path to be inside data_root.
+      4. Walk every existing path component from data_root to the database
+         file and reject if any component is a symlink — even if the
+         symlink target is inside data_root (unified rejection policy).
+    """
+    # --- Step 1: Extract and URL-decode the path ---
+    if not database_url.startswith("sqlite:///"):
+        raise ValueError("production database_url must use the sqlite scheme")
+
+    raw_path = database_url.removeprefix("sqlite:///")
+
+    # Reject encoded dangerous characters in the raw URL.
+    lower_raw = raw_path.lower()
+    for encoded in ("%2e", "%2f", "%5c", "%00"):
+        if encoded in lower_raw:
+            raise ValueError(
+                "production database path contains forbidden encoded character"
+            )
+
+    # URL-decode the path.
+    decoded_path = urllib.parse.unquote(raw_path)
+
+    # Check decoded path for dangerous content.
+    if "\x00" in decoded_path:
+        raise ValueError("production database path contains NUL character")
+    # On POSIX, backslash is not a path separator and could be used to confuse path validation.  On Windows, backslashes are valid path separators.
+    if os.name != "nt" and "\\" in decoded_path:
+        raise ValueError("production database path contains backslash")
+
+    # --- Step 2: Use real Path for resolution ---
+    database_path = Path(decoded_path)
+
+    if not database_path.is_absolute():
+        raise ValueError("production database path must be absolute")
+
+    # Normalize without resolving symlinks so the original path chain remains
+    # observable. Reject traversal before checking each component.
+    if ".." in database_path.parts:
+        raise ValueError("production database path is outside the data root")
+
+    data_root_absolute = Path(os.path.abspath(data_root))
+    database_path_absolute = Path(os.path.abspath(database_path))
+    try:
+        lexical_relative = database_path_absolute.relative_to(
+            data_root_absolute
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "production database path is outside the data root"
+        ) from exc
+
+    # Check the lexical path before resolve() erases symlink components.
+    if data_root_absolute.is_symlink():
+        raise ValueError(
+            "production database path contains a symlink component"
+        )
+    current = data_root_absolute
+    for component in lexical_relative.parts:
+        current = current / component
+        if current.is_symlink():
+            raise ValueError(
+                "production database path contains a symlink component"
+            )
+
+    # Resolve data_root (must exist) and enforce containment against the real
+    # target as a second, independent check.
+    data_root_resolved = data_root_absolute.resolve(strict=True)
+    database_path_resolved = database_path_absolute.resolve(strict=False)
+    try:
+        database_path_resolved.relative_to(data_root_resolved)
+    except ValueError as exc:
+        raise ValueError(
+            "production database path is outside the data root"
+        ) from exc
+
+    return database_path_resolved
+
+
+def _verify_database_list_path(
+    conn: sqlite3.Connection,
+    data_root: Path | None = None,
+) -> None:
+    """Verify the actual opened database path via PRAGMA database_list.
+
+    After SQLite opens the database, confirm the real file path is still
+    inside data_root.  This catches runtime symlink replacement that
+    occurs after the initial path validation.
+
+    Raises ValueError if the connection's main database is outside
+    data_root.  Error messages never include the full database path.
+    """
+    if data_root is None:
+        data_root = _DATA_ROOT
+
+    data_root_resolved = data_root.resolve(strict=True)
+
+    rows = conn.execute("PRAGMA database_list").fetchall()
+    for row in rows:
+        if row["name"] == "main":
+            db_file = row["file"]
+            if not db_file:
+                # In-memory database — must not happen in production.
+                raise ValueError("production database is in-memory")
+            db_path = Path(db_file).resolve(strict=False)
+            try:
+                db_path.relative_to(data_root_resolved)
+            except ValueError:
+                raise ValueError(
+                    "production database connection opened outside the data root"
+                )
+            return
+
+    raise ValueError("production database connection has no main database")
+
+
+# ---------------------------------------------------------------------------
+# Connection management
+# ---------------------------------------------------------------------------
 
 def _get_db_path() -> str:
     """Extract the filesystem path from the database_url setting."""
@@ -51,17 +203,45 @@ def _get_db_path() -> str:
     return url
 
 
+def _is_production_data_path() -> bool:
+    """Return True when production mode with a /data SQLite path is active."""
+    return (
+        settings.app_env == "production"
+        and settings.database_url.startswith("sqlite:////data/")
+    )
+
+
 def _get_connection() -> sqlite3.Connection:
     """Create a new SQLite connection with proper settings."""
-    db_path = _get_db_path()
+    if _is_production_data_path():
+        validated = validate_production_database_path(
+            settings.database_url,
+            _DATA_ROOT,
+        )
+        db_path = str(validated)
+    else:
+        db_path = _get_db_path()
+
     # Ensure parent directory exists
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
     conn = sqlite3.connect(db_path, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=5000")
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
+
+        if _is_production_data_path():
+            _verify_database_list_path(conn, _DATA_ROOT)
+            validate_production_database_path(
+                settings.database_url,
+                _DATA_ROOT,
+            )
+    except Exception:
+        conn.close()
+        raise
+
     return conn
 
 
@@ -200,6 +380,30 @@ def init_db() -> None:
             _initialized = True
         finally:
             conn.close()
+
+
+def check_database_ready() -> None:
+    """Raise when the database is unavailable or not initialized."""
+    conn = _get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name IN (
+                  'tasks',
+                  'scan_results',
+                  'assessment_results',
+                  'repair_results'
+              )
+            """
+        ).fetchall()
+        present_tables = {row["name"] for row in rows}
+        if present_tables != _REQUIRED_TABLES:
+            raise RuntimeError("database schema is not initialized")
+    finally:
+        conn.close()
 
 
 def reset_db() -> None:

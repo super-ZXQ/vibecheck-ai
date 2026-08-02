@@ -28,6 +28,10 @@ jobs:
         working-directory: frontend
         run: npm ci
 
+      - name: Reject high or critical dependency vulnerabilities
+        working-directory: frontend
+        run: npm audit --audit-level=high
+
       - name: Check production source boundaries
         working-directory: frontend
         run: npm run check:test-hooks
@@ -55,3 +59,61 @@ jobs:
       - name: Run development Strict Mode tests
         working-directory: frontend
         run: npm run test:e2e:dev
+
+      - name: Verify dev E2E lifecycle (POSIX SIGTERM process group cleanup)
+        working-directory: frontend
+        run: |
+          # Start dev E2E in background, wait until Playwright is running,
+          # then send SIGTERM and verify exit code 143 plus port release.
+          set -m  # enable job control for process groups
+          npm run test:e2e:dev -- \
+            --grep "direct result URL keeps one polling session" \
+            --reporter=line &
+          CHILD_PID=$!
+
+          PLAYWRIGHT_PID=""
+          for attempt in {1..120}; do
+            PLAYWRIGHT_PID="$(
+              ps -eo pid=,pgid=,args= | awk -v pgid="$CHILD_PID" '
+                $2 == pgid && $0 ~ /playwright.*test/ { print $1; exit }
+              '
+            )"
+            if [[ -n "$PLAYWRIGHT_PID" ]]; then
+              break
+            fi
+            if ! kill -0 "$CHILD_PID" 2>/dev/null; then
+              echo "FAIL: dev E2E exited before Playwright started"
+              wait "$CHILD_PID" || true
+              exit 1
+            fi
+            sleep 0.25
+          done
+          if [[ -z "$PLAYWRIGHT_PID" ]]; then
+            echo "FAIL: Playwright did not start within 30 seconds"
+            kill -TERM -"$CHILD_PID" 2>/dev/null || true
+            wait "$CHILD_PID" || true
+            exit 1
+          fi
+
+          kill -TERM -$CHILD_PID 2>/dev/null || kill -TERM $CHILD_PID 2>/dev/null || true
+          set +e
+          wait "$CHILD_PID"
+          EXIT_CODE=$?
+          set -e
+          echo "Exit code: $EXIT_CODE"
+          if [[ "$EXIT_CODE" -ne 143 ]]; then
+            echo "FAIL: expected SIGTERM exit code 143"
+            exit 1
+          fi
+          # Verify port 3001 is free
+          if ss -tlnp | grep ":3001 "; then
+            echo "FAIL: port 3001 still in use after SIGTERM"
+            exit 1
+          fi
+          # Verify no orphaned Next.js or Node processes
+          if pgrep -f "next dev" | grep -v $$; then
+            echo "FAIL: orphaned next dev process found"
+            pkill -f "next dev" || true
+            exit 1
+          fi
+          echo "POSIX process group cleanup verified"
