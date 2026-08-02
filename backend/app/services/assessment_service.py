@@ -50,6 +50,11 @@ from typing import Any, Optional
 from app.core.config import settings
 from app.core.security.desensitize import mask_untrusted_text
 from app.db.database import _get_connection, init_db, now_iso
+from app.scanner.base import SENSITIVE_DATA_DIMENSION
+from app.services.scan_result_service import (
+    normalize_scan_result_dimensions,
+    scope_summary_to_sensitive_data,
+)
 from app.services.assessment_policy import (
     ASSESSMENT_SCHEMA_VERSION,
     ASSESSMENT_SCOPE,
@@ -1121,8 +1126,20 @@ def assess_scan_result(task_id: str, scan_result: dict[str, Any]) -> dict[str, A
     Note: created_at and updated_at are set to None — the persistence
     layer (save_assessment_result) determines the final timestamps.
     """
-    findings = scan_result.get("findings", [])
-    summary = scan_result.get("summary", {})
+    raw_findings = scan_result.get("findings", [])
+    if not isinstance(raw_findings, list):
+        raise AssessmentInternalError("Findings is not a list")
+    if any(not isinstance(finding, dict) for finding in raw_findings):
+        raise AssessmentInternalError("Finding is not a dict")
+    findings = [
+        finding for finding in raw_findings
+        if finding.get("dimension", SENSITIVE_DATA_DIMENSION)
+        == SENSITIVE_DATA_DIMENSION
+    ]
+    raw_summary = scan_result.get("summary", {})
+    if not isinstance(raw_summary, dict):
+        raise AssessmentInternalError("Scan summary is not a dict")
+    summary = scope_summary_to_sensitive_data(raw_summary, len(findings))
 
     # --- 1. Compute score_breakdown and total deduction ---
     score_breakdown, total_deduction = _compute_score_breakdown(findings)
@@ -1203,7 +1220,8 @@ def get_scan_result_with_timestamp(
         ).fetchone()
         if row is None:
             return None
-        return json.loads(row["result_json"]), row["updated_at"]
+        parsed = json.loads(row["result_json"])
+        return normalize_scan_result_dimensions(parsed), row["updated_at"]
     finally:
         conn.close()
 

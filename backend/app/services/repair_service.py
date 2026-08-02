@@ -43,6 +43,12 @@ from typing import Any, Optional
 from app.core.config import settings
 from app.core.security.desensitize import mask_untrusted_text
 from app.db.database import _get_connection, init_db, now_iso
+from app.scanner.base import SENSITIVE_DATA_DIMENSION
+from app.services.scan_result_service import (
+    normalize_scan_result_dimensions,
+    normalize_scan_summary_dimensions,
+    scope_summary_to_sensitive_data,
+)
 from app.services.repair_policy import (
     AGENT_PROMPT_FORBIDDEN_FIELDS,
     AGENT_PROMPT_FORBIDDEN_PATTERNS,
@@ -490,7 +496,11 @@ def _read_scan_result(task_id: str) -> tuple[dict, dict, str]:
     if not isinstance(summary, dict):
         raise RepairPlanInternalError("Scan summary is not a dict")
 
-    return scan_result, summary, scan_updated_at
+    return (
+        normalize_scan_result_dimensions(scan_result),
+        normalize_scan_summary_dimensions(summary),
+        scan_updated_at,
+    )
 
 
 def _read_assessment(task_id: str) -> tuple[dict, str, str, str]:
@@ -1461,10 +1471,16 @@ def generate_repair_plan(
     findings: list[dict] = []
     has_unknown_template = False
     for raw_f in raw_findings:
+        if not isinstance(raw_f, dict):
+            raise RepairPlanInternalError("Finding is not a dict")
+        if raw_f.get("dimension", SENSITIVE_DATA_DIMENSION) != SENSITIVE_DATA_DIMENSION:
+            continue
         ff = _extract_finding_fields(raw_f)
         # Sanitize file_path early — before aggregation and prompt
         ff["file_path"] = _sanitize_file_path(ff["file_path"])
         findings.append(ff)
+
+    summary = scope_summary_to_sensitive_data(summary, len(findings))
 
     # Check for blocking findings
     has_blocking = any(f["is_blocking"] for f in findings)

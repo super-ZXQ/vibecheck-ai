@@ -890,7 +890,7 @@ class TestResultEndpoint:
         response = client.get(f"/api/check/{task.id}/result")
         assert response.status_code == 200
         data = response.json()
-        assert data["schema_version"] == 1
+        assert data["schema_version"] == 2
         assert data["findings"] == []
         assert data["summary"]["total_findings"] == 0
 

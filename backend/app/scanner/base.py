@@ -37,6 +37,10 @@ from typing import Optional
 from app.core.security.desensitize import mask_untrusted_text
 
 
+SENSITIVE_DATA_DIMENSION = "sensitive_data_security"
+INCOMPLETE_CONTENT_DIMENSION = "incomplete_content"
+
+
 # ---------------------------------------------------------------------------
 # --- Enums ---
 # ---------------------------------------------------------------------------
@@ -111,6 +115,7 @@ class Finding:
     secret_type: str
     message: str
     repair_template_key: str
+    dimension: str = SENSITIVE_DATA_DIMENSION
 
     def __post_init__(self) -> None:
         """Sanitize file_path via mask_untrusted_text (self-guarantee).
@@ -216,6 +221,7 @@ class Rule(ABC):
     confidence: Confidence = Confidence.LOW
     is_blocking: bool = False
     finding_type: FindingType = FindingType.CONTENT
+    dimension: str = SENSITIVE_DATA_DIMENSION
 
     def scan_content(self, file_path: str, lines: list[str]) -> list[Finding]:
         """Scan file content line by line. Override for content-type rules.

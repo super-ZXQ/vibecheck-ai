@@ -465,6 +465,7 @@ class TestGetScanResult:
             "returned_notices", "notices_truncated",
             "returned_skipped_files", "skipped_files_truncated",
             "returned_scan_errors", "scan_errors_truncated",
+            "dimension_counts",
         }
         assert set(summary.keys()) == expected_fields
 

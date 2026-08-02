@@ -22,7 +22,7 @@ Security guarantees:
   summary_json is NULL or empty.
 
 Schema version:
-- Current: 1
+- Current: 2
 - Increment when the result_json structure changes in a breaking way.
 """
 
@@ -42,11 +42,13 @@ from app.scanner.base import (
     ScanResult,
     Severity,
     SkippedFile,
+    INCOMPLETE_CONTENT_DIMENSION,
+    SENSITIVE_DATA_DIMENSION,
 )
 
 # --- Constants ---
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Stable field order for Finding serialization (deterministic JSON output).
 _FINDING_FIELDS = (
@@ -67,6 +69,7 @@ _FINDING_FIELDS = (
     "secret_type",
     "message",
     "repair_template_key",
+    "dimension",
 )
 
 # Stable field order for ScanNotice serialization.
@@ -106,6 +109,7 @@ _SUMMARY_FIELDS = (
     "skipped_files_truncated",
     "returned_scan_errors",
     "scan_errors_truncated",
+    "dimension_counts",
 )
 
 # Risk-priority ordering for severity and confidence.
@@ -307,6 +311,7 @@ def _truncate_findings(
     indexed = list(enumerate(findings))
     indexed.sort(key=lambda x: (
         0 if x[1].is_blocking else 1,
+        0 if x[1].dimension == SENSITIVE_DATA_DIMENSION else 1,
         _SEVERITY_ORDER[x[1].severity],
         _CONFIDENCE_ORDER[x[1].confidence],
         x[0],  # original position — stable tiebreaker
@@ -349,6 +354,14 @@ def _compute_summary(
     """
     findings = scan_result.findings
     blocking_count = sum(1 for f in findings if f.is_blocking)
+    dimension_counts = {
+        SENSITIVE_DATA_DIMENSION: sum(
+            1 for f in findings if f.dimension == SENSITIVE_DATA_DIMENSION
+        ),
+        INCOMPLETE_CONTENT_DIMENSION: sum(
+            1 for f in findings if f.dimension == INCOMPLETE_CONTENT_DIMENSION
+        ),
+    }
     return {
         "total_findings": len(findings),
         "blocking_findings": blocking_count,
@@ -365,7 +378,63 @@ def _compute_summary(
         "skipped_files_truncated": skipped_truncated,
         "returned_scan_errors": len(errors_list),
         "scan_errors_truncated": errors_truncated,
+        "dimension_counts": dimension_counts,
     }
+
+
+def normalize_scan_result_dimensions(scan_result: dict[str, Any]) -> dict[str, Any]:
+    """Add P0-10 dimension defaults to a parsed v1 result without rewriting it."""
+    normalized = dict(scan_result)
+    raw_findings = scan_result.get("findings", [])
+    findings: list[Any] = []
+    if isinstance(raw_findings, list):
+        for finding in raw_findings:
+            if isinstance(finding, dict):
+                normalized_finding = dict(finding)
+                normalized_finding.setdefault("dimension", SENSITIVE_DATA_DIMENSION)
+                findings.append(normalized_finding)
+            else:
+                findings.append(finding)
+        normalized["findings"] = findings
+
+    raw_summary = scan_result.get("summary", {})
+    if isinstance(raw_summary, dict):
+        summary = dict(raw_summary)
+        if not isinstance(summary.get("dimension_counts"), dict):
+            summary["dimension_counts"] = {
+                SENSITIVE_DATA_DIMENSION: summary.get("total_findings", len(findings)),
+                INCOMPLETE_CONTENT_DIMENSION: 0,
+            }
+        normalized["summary"] = summary
+    return normalized
+
+
+def normalize_scan_summary_dimensions(summary: dict[str, Any]) -> dict[str, Any]:
+    """Add deterministic dimension counts to a legacy summary snapshot."""
+    normalized = dict(summary)
+    if not isinstance(normalized.get("dimension_counts"), dict):
+        normalized["dimension_counts"] = {
+            SENSITIVE_DATA_DIMENSION: normalized.get("total_findings", 0),
+            INCOMPLETE_CONTENT_DIMENSION: 0,
+        }
+    return normalized
+
+
+def scope_summary_to_sensitive_data(
+    summary: dict[str, Any], returned_sensitive_findings: int
+) -> dict[str, Any]:
+    """Return the legacy security-policy view of a multidimensional summary."""
+    scoped = dict(summary)
+    dimension_counts = summary.get("dimension_counts")
+    if isinstance(dimension_counts, dict):
+        sensitive_total = dimension_counts.get(
+            SENSITIVE_DATA_DIMENSION,
+            summary.get("total_findings", returned_sensitive_findings),
+        )
+        scoped["total_findings"] = sensitive_total
+        scoped["returned_findings"] = returned_sensitive_findings
+        scoped["findings_truncated"] = sensitive_total > returned_sensitive_findings
+    return scoped
 
 
 def serialize_scan_result(scan_result: ScanResult) -> dict:
@@ -388,7 +457,7 @@ def serialize_scan_result(scan_result: ScanResult) -> dict:
     Returns:
         A dict with the fixed top-level structure:
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "findings": [...],
             "notices": [...],
             "skipped_files": [...],
@@ -555,7 +624,8 @@ def get_scan_result(task_id: str) -> Optional[dict]:
         ).fetchone()
         if row is None:
             return None
-        return json.loads(row["result_json"])
+        parsed = json.loads(row["result_json"])
+        return normalize_scan_result_dimensions(parsed)
     finally:
         conn.close()
 
@@ -601,7 +671,7 @@ def get_scan_summary(task_id: str) -> Optional[dict]:
         summary_json = row["summary_json"]
         if summary_json:
             # Normal path — summary_json exists and is valid.
-            return json.loads(summary_json)
+            return normalize_scan_summary_dimensions(json.loads(summary_json))
 
         # Fallback for old records (summary_json is NULL or empty).
         # These are records created before the summary_json column
@@ -614,6 +684,9 @@ def get_scan_summary(task_id: str) -> Optional[dict]:
         if row is None:
             return None
         result_dict = json.loads(row["result_json"])
-        return result_dict.get("summary")
+        summary = result_dict.get("summary")
+        if not isinstance(summary, dict):
+            return summary
+        return normalize_scan_summary_dimensions(summary)
     finally:
         conn.close()
