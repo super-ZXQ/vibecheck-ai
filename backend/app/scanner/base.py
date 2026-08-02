@@ -40,6 +40,7 @@ from app.core.security.desensitize import mask_untrusted_text
 SENSITIVE_DATA_DIMENSION = "sensitive_data_security"
 INCOMPLETE_CONTENT_DIMENSION = "incomplete_content"
 DEPLOYABILITY_PRODUCTION_DIMENSION = "deployability_production"
+BASIC_SECURITY_DIMENSION = "basic_security"
 
 
 # ---------------------------------------------------------------------------

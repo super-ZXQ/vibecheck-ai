@@ -185,7 +185,7 @@ body {
 
 .dimension-summary {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 12px;
   margin-bottom: 10px;
 }
@@ -309,6 +309,11 @@ body {
 .dimension-deployability_production {
   background: #e0f2fe;
   color: #075985;
+}
+
+.dimension-basic_security {
+  background: #dcfce7;
+  color: #166534;
 }
 
 .finding-detail-button {
