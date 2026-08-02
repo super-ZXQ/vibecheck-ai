@@ -14,6 +14,10 @@
  *      SIGTERM -> SIGKILL on a dedicated process group elsewhere).
  *   8. Verify port 3001 is released.
  *   9. Exit with the correct code.
+ *
+ * Shutdown is unified through a single AbortController.  The first SIGINT
+ * or SIGTERM triggers cleanup via the normal finally block; no
+ * process.exit() is called from signal handlers.
  */
 
 import { createRequire } from "node:module";
@@ -34,6 +38,31 @@ const SIGTERM_GRACE_MS = 5_000;
 const POST_KILL_DELAY_MS = 2_000;
 
 // ---------------------------------------------------------------------------
+// Unified shutdown controller
+// ---------------------------------------------------------------------------
+
+/** Single source of truth for shutdown requests. */
+const shutdown = {
+  controller: new AbortController(),
+  exitCode: null, // 130 for SIGINT, 143 for SIGTERM
+  forceCount: 0,
+};
+
+/**
+ * Request a graceful shutdown with the given exit code.
+ * Idempotent — subsequent calls increment forceCount but do not bypass
+ * the ongoing cleanup.  Never calls process.exit() directly.
+ */
+function requestShutdown(code) {
+  if (!shutdown.controller.signal.aborted) {
+    shutdown.exitCode = code;
+    shutdown.controller.abort();
+  } else {
+    shutdown.forceCount++;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -42,6 +71,10 @@ const POST_KILL_DELAY_MS = 2_000;
  *
  * Windows:  uses netstat -ano to check for LISTENING sockets.
  * POSIX:    uses a transient listen probe (bind, close immediately).
+ *
+ * Fail-closed: if netstat exits non-zero or output is empty on Windows,
+ * the port is assumed IN USE (returns false) to prevent starting a
+ * second server on a port we cannot verify is free.
  */
 function isPortFree(host, port) {
   if (process.platform === "win32") {
@@ -50,7 +83,15 @@ function isPortFree(host, port) {
       windowsHide: true,
       maxBuffer: 1024 * 1024,
     });
+    if (result.status !== 0 || result.error) {
+      // netstat failed — fail closed (assume port is in use).
+      return Promise.resolve(false);
+    }
     const output = result.stdout ? result.stdout.toString() : "";
+    if (!output) {
+      // No output — fail closed.
+      return Promise.resolve(false);
+    }
     const lines = output.split("\n");
     for (const line of lines) {
       if (line.includes(`:${port} `) && line.includes("LISTENING")) {
@@ -97,32 +138,58 @@ function resolvePlaywrightCli() {
   }
 }
 
-function waitForServer() {
+/**
+ * Poll BASE_URL until the dev server responds.
+ *
+ * Accepts an AbortSignal — when aborted, the current in-flight request
+ * is destroyed, pending timers are cleared, and the promise rejects.
+ */
+function waitForServer(signal) {
   const deadline = Date.now() + STARTUP_TIMEOUT_MS;
   return new Promise((resolve, reject) => {
+    let timer = null;
+    let currentReq = null;
+
+    function onAbort() {
+      if (timer) clearTimeout(timer);
+      if (currentReq) currentReq.destroy();
+      reject(new Error("dev server startup aborted"));
+    }
+
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+
     function attempt() {
+      if (signal.aborted) return;
       if (Date.now() > deadline) {
+        signal.removeEventListener("abort", onAbort);
         reject(new Error(`dev server did not become ready within ${STARTUP_TIMEOUT_MS}ms`));
         return;
       }
-      const req = request(BASE_URL, (res) => {
+      currentReq = request(BASE_URL, (res) => {
         const code = res.statusCode ?? 0;
         res.resume();
         if (
           (code >= 200 && code < 400) ||
           [400, 401, 402, 403].includes(code)
         ) {
+          signal.removeEventListener("abort", onAbort);
           resolve();
         } else {
-          setTimeout(attempt, 500);
+          timer = setTimeout(attempt, 500);
         }
       });
-      req.once("error", () => setTimeout(attempt, 500));
-      req.setTimeout(3_000, () => {
-        req.destroy();
-        setTimeout(attempt, 500);
+      currentReq.once("error", () => {
+        if (!signal.aborted) timer = setTimeout(attempt, 500);
       });
-      req.end();
+      currentReq.setTimeout(3_000, () => {
+        currentReq.destroy();
+        if (!signal.aborted) timer = setTimeout(attempt, 500);
+      });
+      currentReq.end();
     }
     attempt();
   });
@@ -130,35 +197,55 @@ function waitForServer() {
 
 /**
  * Warm up the /check/[taskId] route so that Turbopack has compiled it
- * before Playwright tries to navigate there.  Without this, the first
- * test request can race with on-demand compilation and intermittently
- * receive a 404.
+ * before Playwright tries to navigate there.
+ *
+ * Accepts an AbortSignal — when aborted, the current request is destroyed
+ * and the promise rejects.  Failure after 30 seconds also rejects.
  */
-function warmupCheckRoute() {
+function warmupCheckRoute(signal) {
   const warmupUrl = `${BASE_URL}/check/550e8400-e29b-41d4-a716-446655440000`;
   const deadline = Date.now() + 30_000;
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
+    let timer = null;
+    let currentReq = null;
+
+    function onAbort() {
+      if (timer) clearTimeout(timer);
+      if (currentReq) currentReq.destroy();
+      reject(new Error("route warmup aborted"));
+    }
+
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+
     function attempt() {
+      if (signal.aborted) return;
       if (Date.now() > deadline) {
-        console.error("[run-dev-e2e] warmup: check route not ready after 30s, continuing");
-        resolve();
+        signal.removeEventListener("abort", onAbort);
+        reject(new Error("route warmup failed: check route not ready after 30s"));
         return;
       }
-      const req = request(warmupUrl, (res) => {
+      currentReq = request(warmupUrl, (res) => {
         const code = res.statusCode ?? 0;
         res.resume();
         if (code >= 200 && code < 400) {
+          signal.removeEventListener("abort", onAbort);
           resolve();
           return;
         }
-        setTimeout(attempt, 1_000);
+        timer = setTimeout(attempt, 1_000);
       });
-      req.once("error", () => setTimeout(attempt, 1_000));
-      req.setTimeout(5_000, () => {
-        req.destroy();
-        setTimeout(attempt, 1_000);
+      currentReq.once("error", () => {
+        if (!signal.aborted) timer = setTimeout(attempt, 1_000);
       });
-      req.end();
+      currentReq.setTimeout(5_000, () => {
+        currentReq.destroy();
+        if (!signal.aborted) timer = setTimeout(attempt, 1_000);
+      });
+      currentReq.end();
     }
     attempt();
   });
@@ -177,6 +264,10 @@ function sleep(ms) {
  *
  * Windows:  taskkill /PID <pid> /T /F  (tree kill, also kills descendants)
  * Other:    SIGTERM the process group, escalate to SIGKILL after grace.
+ *           Always attempts to signal the process group (negative PID),
+ *           even when the main process has already exited, to clean up
+ *           any orphaned children.  ESRCH (process/group does not exist)
+ *           is treated as successful cleanup.
  */
 async function killProcessTree(serverProc) {
   if (!serverProc) {
@@ -209,24 +300,34 @@ async function killProcessTree(serverProc) {
     return;
   }
 
-  // POSIX: signal the process group (negative PID).
-  const exited = serverProc.exitCode !== null;
-  if (!exited) {
-    try {
-      process.kill(-pid, "SIGTERM");
-    } catch {
+  // POSIX: always signal the process group (negative PID), even if the
+  // main process has exited, to catch orphaned children.
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch (err) {
+    // ESRCH means the process group doesn't exist — acceptable.
+    if (err.code !== "ESRCH") {
       try { process.kill(pid, "SIGTERM"); } catch { /* gone */ }
     }
+  }
+
+  // Wait for graceful exit (only meaningful if process hasn't exited yet).
+  if (serverProc.exitCode === null) {
     await new Promise((resolve) => {
       const timer = setTimeout(resolve, SIGTERM_GRACE_MS);
       serverProc.once("exit", () => { clearTimeout(timer); resolve(); });
     });
-    try {
-      process.kill(-pid, "SIGKILL");
-    } catch {
+  }
+
+  // Always escalate to SIGKILL on the process group.
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch (err) {
+    if (err.code !== "ESRCH") {
       try { process.kill(pid, "SIGKILL"); } catch { /* gone */ }
     }
   }
+
   await sleep(POST_KILL_DELAY_MS);
 }
 
@@ -251,20 +352,24 @@ async function waitForPortFree() {
 // ---------------------------------------------------------------------------
 
 async function main() {
+  const signal = shutdown.controller.signal;
+
   // 1. Port pre-check
   if (!(await isPortFree(HOST, PORT))) {
     console.error(
       `[run-dev-e2e] port ${PORT} is already in use - refusing to start`,
     );
-    process.exit(1);
+    return 1;
   }
 
-  // 2. Clear stale .next cache to prevent intermittent 404s on restart
+  // 2. Clear stale .next cache — failure is fatal because stale cache
+  //    causes intermittent 404s that the warmup step is designed to prevent.
   try {
     rmSync(".next", { recursive: true, force: true });
     console.error("[run-dev-e2e] cleared .next cache");
   } catch (err) {
-    console.error(`[run-dev-e2e] could not clear .next: ${err.message}`);
+    console.error(`[run-dev-e2e] fatal: could not clear .next cache: ${err.message}`);
+    return 1;
   }
 
   // 3. Spawn Next dev server directly
@@ -283,38 +388,68 @@ async function main() {
     },
   );
 
-  let serverReady = false;
   let playwrightExitCode = 1;
+  let playwrightProc = null;
 
   try {
-    // 4. Wait for readiness
+    // 4. Wait for readiness (abortable)
     try {
-      await waitForServer();
-      serverReady = true;
+      await waitForServer(signal);
     } catch (error) {
+      if (signal.aborted) {
+        console.error(`[run-dev-e2e] ${error.message}`);
+        return shutdown.exitCode ?? 1;
+      }
       console.error(`[run-dev-e2e] ${error.message}`);
-      process.exitCode = 1;
-      return;
+      return 1;
     }
 
-    // 5. Warm up the /check/[taskId] route
-    await warmupCheckRoute();
+    // 5. Warm up the /check/[taskId] route (abortable, must succeed)
+    try {
+      await warmupCheckRoute(signal);
+    } catch (error) {
+      if (signal.aborted) {
+        console.error(`[run-dev-e2e] ${error.message}`);
+        return shutdown.exitCode ?? 1;
+      }
+      console.error(`[run-dev-e2e] fatal: ${error.message}`);
+      return 1;
+    }
 
     // 6. Run Playwright
     const pwCli = resolvePlaywrightCli();
     const pwArgs = [pwCli, "test", "--config=playwright.dev.config.ts", ...process.argv.slice(2)];
 
     playwrightExitCode = await new Promise((resolve) => {
-      const pw = spawn(process.execPath, pwArgs, {
+      playwrightProc = spawn(process.execPath, pwArgs, {
         cwd: process.cwd(),
         stdio: "inherit",
         env: process.env,
       });
-      pw.on("error", (err) => {
+      playwrightProc.on("error", (err) => {
         console.error(`[run-dev-e2e] failed to launch playwright: ${err.message}`);
+        playwrightProc = null;
         resolve(1);
       });
-      pw.on("exit", (code) => resolve(code ?? 1));
+      playwrightProc.on("exit", (code) => {
+        playwrightProc = null;
+        resolve(code ?? 1);
+      });
+
+      // If already interrupted before Playwright spawned, resolve now.
+      if (signal.aborted) {
+        if (playwrightProc) {
+          try { playwrightProc.kill("SIGTERM"); } catch { /* gone */ }
+        }
+        resolve(shutdown.exitCode ?? 1);
+      }
+
+      // Abort Playwright if shutdown is requested while it's running.
+      signal.addEventListener("abort", () => {
+        if (playwrightProc) {
+          try { playwrightProc.kill("SIGTERM"); } catch { /* gone */ }
+        }
+      }, { once: true });
     });
   } finally {
     // 7. Always clean up the Next process tree
@@ -326,28 +461,31 @@ async function main() {
       console.error(
         `[run-dev-e2e] port ${PORT} is still in use after cleanup - reporting failure`,
       );
-      process.exitCode = 1;
-      return;
+      return 1;
     }
   }
 
-  // 9. Propagate Playwright exit code
-  process.exitCode = playwrightExitCode;
+  // 9. Propagate exit code: signal interruption takes priority
+  if (signal.aborted && shutdown.exitCode !== null) {
+    return shutdown.exitCode;
+  }
+  return playwrightExitCode;
 }
 
-let interrupted = false;
+// Signal handlers — never call process.exit(); just request shutdown.
 process.on("SIGINT", () => {
-  if (interrupted) process.exit(130);
-  interrupted = true;
-  console.error("\n[run-dev-e2e] interrupted - cleaning up dev server...");
+  console.error("\n[run-dev-e2e] interrupted (SIGINT) - cleaning up...");
+  requestShutdown(130);
 });
 process.on("SIGTERM", () => {
-  if (interrupted) process.exit(143);
-  interrupted = true;
-  console.error("\n[run-dev-e2e] terminated - cleaning up dev server...");
+  console.error("\n[run-dev-e2e] terminated (SIGTERM) - cleaning up...");
+  requestShutdown(143);
 });
 
 main()
+  .then((code) => {
+    process.exitCode = code;
+  })
   .catch((error) => {
     console.error(`[run-dev-e2e] fatal: ${error?.stack ?? error}`);
     process.exitCode = 1;

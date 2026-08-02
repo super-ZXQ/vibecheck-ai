@@ -59,3 +59,29 @@ jobs:
       - name: Run development Strict Mode tests
         working-directory: frontend
         run: npm run test:e2e:dev
+
+      - name: Verify dev E2E lifecycle (POSIX SIGTERM process group cleanup)
+        working-directory: frontend
+        run: |
+          # Start dev E2E in background, send SIGTERM during Playwright phase,
+          # then verify exit code 143 and port 3001 release.
+          set -m  # enable job control for process groups
+          npm run test:e2e:dev -- --grep "__NO_MATCHING_TEST__" --reporter=line &
+          CHILD_PID=$!
+          sleep 30
+          kill -TERM -$CHILD_PID 2>/dev/null || kill -TERM $CHILD_PID 2>/dev/null || true
+          wait $CHILD_PID
+          EXIT_CODE=$?
+          echo "Exit code: $EXIT_CODE"
+          # Verify port 3001 is free
+          if ss -tlnp | grep ":3001 "; then
+            echo "FAIL: port 3001 still in use after SIGTERM"
+            exit 1
+          fi
+          # Verify no orphaned Next.js or Node processes
+          if pgrep -f "next dev" | grep -v $$; then
+            echo "FAIL: orphaned next dev process found"
+            pkill -f "next dev" || true
+            exit 1
+          fi
+          echo "POSIX process group cleanup verified"
