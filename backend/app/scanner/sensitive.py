@@ -220,6 +220,12 @@ def scan_directory(
     if rules is None:
         rules = DEFAULT_RULES
 
+    repository_probes = [
+        probe
+        for rule in rules
+        if (probe := rule.create_repository_probe()) is not None
+    ]
+
     # Resolve the root once — all files must be inside this resolved path.
     root_resolved = root_dir.resolve()
 
@@ -344,6 +350,9 @@ def scan_directory(
 
             lines = content.splitlines()
 
+            for probe in repository_probes:
+                probe.observe_file(safe_path, lines)
+
             # --- No line limit: scan full content ---
             total_files_scanned += 1
             total_lines_scanned += len(lines)
@@ -374,6 +383,9 @@ def scan_directory(
             # --- Deduplicate findings for this file ---
             deduped = _deduplicate_findings(file_findings)
             all_findings.extend(deduped)
+
+    for probe in repository_probes:
+        all_findings.extend(probe.finalize())
 
     # --- Stable sorting of all result collections ---
     # Findings: sort by file_path, line_start, column_start, rule_priority, rule_id

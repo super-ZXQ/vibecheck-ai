@@ -39,6 +39,7 @@ from app.core.security.desensitize import mask_untrusted_text
 
 SENSITIVE_DATA_DIMENSION = "sensitive_data_security"
 INCOMPLETE_CONTENT_DIMENSION = "incomplete_content"
+DEPLOYABILITY_PRODUCTION_DIMENSION = "deployability_production"
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +196,21 @@ class ScanResult:
     total_lines_scanned: int
 
 
+class RepositoryProbe(ABC):
+    """Per-scan state for rules that need a repository-wide view.
+
+    A fresh probe is created for every scan. Implementations must retain only
+    bounded derived state and must never expose raw repository content.
+    """
+
+    def observe_file(self, file_path: str, lines: list[str]) -> None:
+        """Observe one validated, decoded repository file."""
+
+    def finalize(self) -> list[Finding]:
+        """Return deterministic repository-level findings."""
+        return []
+
+
 # ---------------------------------------------------------------------------
 # --- Rule abstract class ---
 # ---------------------------------------------------------------------------
@@ -245,4 +261,8 @@ class Rule(ABC):
         Returns:
             A Finding (security issue), a ScanNotice (informational), or None.
         """
+        return None
+
+    def create_repository_probe(self) -> RepositoryProbe | None:
+        """Create isolated repository-level state for one scan, if needed."""
         return None

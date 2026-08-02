@@ -29,6 +29,7 @@ from app.scanner.incomplete_rules import (
     TodoCommentRule,
     UnimplementedCodeRule,
 )
+from app.scanner.deployability_rules import DeployabilityRule
 
 # Ordered list of default rules.
 # Order matters only for readability; actual priority is determined by RULE_PRIORITY_MAP.
@@ -49,6 +50,7 @@ DEFAULT_RULES: list = [
     PlaceholderReturnRule(),         # I003
     DebugBreakpointRule(),           # I004
     ExcessiveDebugOutputRule(),      # I005
+    DeployabilityRule(),             # D001-D010 repository checks
 ]
 
 # Priority map: lower number = higher priority.
@@ -78,4 +80,14 @@ RULE_PRIORITY_MAP: dict[str, int] = {
     "I004_DEBUG_BREAKPOINT": 22,
     "I001_TODO_COMMENT": 23,
     "I005_EXCESSIVE_DEBUG_OUTPUT": 120,
+    "D001_PRODUCTION_START": 200,
+    "D002_ENVIRONMENT_DOCUMENTATION": 201,
+    "D003_DEPENDENCY_LOCK": 202,
+    "D004_DEPLOYMENT_DOCUMENTATION": 203,
+    "D005_DOCKER_MISSING": 204,
+    "D006_DOCKER_MISSING_FROM": 205,
+    "D007_DOCKER_MUTABLE_BASE": 206,
+    "D008_DOCKER_ROOT_USER": 207,
+    "D009_DOCKER_MISSING_START": 208,
+    "D010_INVALID_DEPLOYMENT_CONFIG": 209,
 }
