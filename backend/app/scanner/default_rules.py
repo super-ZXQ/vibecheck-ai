@@ -22,6 +22,13 @@ from app.scanner.rules import (
     PrivateKeyRule,
     ProductionEnvWithSecretRule,
 )
+from app.scanner.incomplete_rules import (
+    DebugBreakpointRule,
+    ExcessiveDebugOutputRule,
+    PlaceholderReturnRule,
+    TodoCommentRule,
+    UnimplementedCodeRule,
+)
 
 # Ordered list of default rules.
 # Order matters only for readability; actual priority is determined by RULE_PRIORITY_MAP.
@@ -37,6 +44,11 @@ DEFAULT_RULES: list = [
     EnvFilePresentRule(),            # R009
     EnvExampleFileRule(),            # R010
     ProductionEnvWithSecretRule(),   # R011
+    TodoCommentRule(),               # I001
+    UnimplementedCodeRule(),         # I002
+    PlaceholderReturnRule(),         # I003
+    DebugBreakpointRule(),           # I004
+    ExcessiveDebugOutputRule(),      # I005
 ]
 
 # Priority map: lower number = higher priority.
@@ -61,4 +73,9 @@ RULE_PRIORITY_MAP: dict[str, int] = {
     "R007_GENERIC_TOKEN_ASSIGNMENT": 8,
     "R008_CONNECTION_STRING": 9,
     "R009_ENV_FILE_PRESENT": 100,  # file-type, doesn't participate in line dedup
+    "I002_UNIMPLEMENTED_CODE": 20,
+    "I003_PLACEHOLDER_RETURN": 21,
+    "I004_DEBUG_BREAKPOINT": 22,
+    "I001_TODO_COMMENT": 23,
+    "I005_EXCESSIVE_DEBUG_OUTPUT": 120,
 }
