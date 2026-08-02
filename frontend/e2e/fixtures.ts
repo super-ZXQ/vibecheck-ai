@@ -138,6 +138,7 @@ export const mockScanResult = {
     dimension_counts: {
       sensitive_data_security: 30,
       incomplete_content: 0,
+      deployability_production: 0,
     },
   },
 };
@@ -165,6 +166,34 @@ export const mockMultidimensionalScanResult = {
     dimension_counts: {
       sensitive_data_security: 26,
       incomplete_content: 6,
+      deployability_production: 0,
+    },
+  },
+};
+
+export const mockThreeDimensionalScanResult = {
+  ...mockMultidimensionalScanResult,
+  findings: [
+    ...mockMultidimensionalScanResult.findings,
+    ...Array.from({ length: 27 }, (_, i) => ({
+      ...mockScanResult.findings[i],
+      rule_id: `D${String(i + 1).padStart(3, "0")}_DEPLOYABILITY`,
+      rule_name: `Deployability Rule ${i + 1}`,
+      file_path: i === 0 ? "<repository>" : `deploy/config_${i}.txt`,
+      is_blocking: false,
+      dimension: "deployability_production" as const,
+      description: "A production deployment prerequisite is missing.",
+      message: "Add the missing production configuration before deployment.",
+    })),
+  ],
+  summary: {
+    ...mockMultidimensionalScanResult.summary,
+    total_findings: 59,
+    returned_findings: 59,
+    dimension_counts: {
+      sensitive_data_security: 26,
+      incomplete_content: 6,
+      deployability_production: 27,
     },
   },
 };

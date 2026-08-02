@@ -10,6 +10,7 @@ from app.db import database
 from app.db.database import _get_connection, now_iso
 from app.scanner.base import (
     Confidence,
+    DEPLOYABILITY_PRODUCTION_DIMENSION,
     Finding,
     FindingType,
     INCOMPLETE_CONTENT_DIMENSION,
@@ -26,6 +27,8 @@ from app.services.repair_service import (
 from app.services.scan_result_service import (
     get_scan_result,
     get_scan_summary,
+    normalize_scan_result_dimensions,
+    normalize_scan_summary_dimensions,
     serialize_scan_result,
 )
 
@@ -42,9 +45,18 @@ def test_db(tmp_path, monkeypatch):
 
 def _finding(dimension: str = SENSITIVE_DATA_DIMENSION) -> Finding:
     incomplete = dimension == INCOMPLETE_CONTENT_DIMENSION
+    deployability = dimension == DEPLOYABILITY_PRODUCTION_DIMENSION
     return Finding(
-        rule_id="I001_TODO_COMMENT" if incomplete else "R006_PASSWORD_ASSIGNMENT",
-        rule_name="Unfinished work comment" if incomplete else "Password Assignment",
+        rule_id=(
+            "D001_PRODUCTION_START" if deployability
+            else "I001_TODO_COMMENT" if incomplete
+            else "R006_PASSWORD_ASSIGNMENT"
+        ),
+        rule_name=(
+            "Missing production start" if deployability
+            else "Unfinished work comment" if incomplete
+            else "Password Assignment"
+        ),
         severity=Severity.MEDIUM,
         confidence=Confidence.HIGH,
         file_path="src/app.py",
@@ -56,11 +68,17 @@ def _finding(dimension: str = SENSITIVE_DATA_DIMENSION) -> Finding:
         is_blocking=False,
         finding_type=FindingType.CONTENT,
         description="Fixed description",
-        category="unfinished_comment" if incomplete else "password",
-        secret_type="" if incomplete else "password",
+        category=(
+            "deployability" if deployability
+            else "unfinished_comment" if incomplete
+            else "password"
+        ),
+        secret_type="" if (incomplete or deployability) else "password",
         message="Fixed advice",
         repair_template_key=(
-            "complete_or_remove_todo_comment" if incomplete else "use_env_var_password"
+            "add_production_start" if deployability
+            else "complete_or_remove_todo_comment" if incomplete
+            else "use_env_var_password"
         ),
         dimension=dimension,
     )
@@ -79,7 +97,14 @@ def _scan_dict(findings: list[dict], *, multidimensional: bool) -> dict:
         finding.get("dimension", SENSITIVE_DATA_DIMENSION) == SENSITIVE_DATA_DIMENSION
         for finding in findings
     )
-    incomplete_count = len(findings) - sensitive_count
+    incomplete_count = sum(
+        finding.get("dimension") == INCOMPLETE_CONTENT_DIMENSION
+        for finding in findings
+    )
+    deployability_count = sum(
+        finding.get("dimension") == DEPLOYABILITY_PRODUCTION_DIMENSION
+        for finding in findings
+    )
     summary = {
         "total_findings": len(findings),
         "blocking_findings": sum(bool(finding["is_blocking"]) for finding in findings),
@@ -101,6 +126,7 @@ def _scan_dict(findings: list[dict], *, multidimensional: bool) -> dict:
         summary["dimension_counts"] = {
             SENSITIVE_DATA_DIMENSION: sensitive_count,
             INCOMPLETE_CONTENT_DIMENSION: incomplete_count,
+            DEPLOYABILITY_PRODUCTION_DIMENSION: deployability_count,
         }
     return {
         "schema_version": 2 if multidimensional else 1,
@@ -114,7 +140,11 @@ def _scan_dict(findings: list[dict], *, multidimensional: bool) -> dict:
 
 def test_v2_serialization_round_trip_fields_and_counts():
     serialized = serialize_scan_result(ScanResult(
-        findings=(_finding(), _finding(INCOMPLETE_CONTENT_DIMENSION)),
+        findings=(
+            _finding(),
+            _finding(INCOMPLETE_CONTENT_DIMENSION),
+            _finding(DEPLOYABILITY_PRODUCTION_DIMENSION),
+        ),
         notices=(), skipped_files=(), scan_errors=(),
         total_files_scanned=1, total_lines_scanned=2,
     ))
@@ -122,12 +152,33 @@ def test_v2_serialization_round_trip_fields_and_counts():
     assert [finding["dimension"] for finding in serialized["findings"]] == [
         SENSITIVE_DATA_DIMENSION,
         INCOMPLETE_CONTENT_DIMENSION,
+        DEPLOYABILITY_PRODUCTION_DIMENSION,
     ]
     assert serialized["summary"]["dimension_counts"] == {
         SENSITIVE_DATA_DIMENSION: 1,
         INCOMPLETE_CONTENT_DIMENSION: 1,
+        DEPLOYABILITY_PRODUCTION_DIMENSION: 1,
     }
     assert json.loads(json.dumps(serialized, sort_keys=True)) == serialized
+
+
+def test_p0_10_v2_results_default_the_new_dimension_to_zero():
+    old_v2 = _scan_dict(
+        [_finding_dict(_finding(INCOMPLETE_CONTENT_DIMENSION))],
+        multidimensional=True,
+    )
+    old_v2["summary"]["dimension_counts"].pop(
+        DEPLOYABILITY_PRODUCTION_DIMENSION
+    )
+    normalized = normalize_scan_result_dimensions(old_v2)
+    normalized_summary = normalize_scan_summary_dimensions(old_v2["summary"])
+    assert normalized["schema_version"] == 2
+    assert normalized["summary"]["dimension_counts"][
+        DEPLOYABILITY_PRODUCTION_DIMENSION
+    ] == 0
+    assert normalized_summary["dimension_counts"][
+        DEPLOYABILITY_PRODUCTION_DIMENSION
+    ] == 0
 
 
 def test_v1_database_read_defaults_to_sensitive_without_rewrite(test_db):
@@ -159,6 +210,7 @@ def test_v1_database_read_defaults_to_sensitive_without_rewrite(test_db):
     assert loaded_summary["dimension_counts"] == {
         SENSITIVE_DATA_DIMENSION: 1,
         INCOMPLETE_CONTENT_DIMENSION: 0,
+        DEPLOYABILITY_PRODUCTION_DIMENSION: 0,
     }
     conn = _get_connection()
     try:
@@ -170,15 +222,18 @@ def test_v1_database_read_defaults_to_sensitive_without_rewrite(test_db):
     assert "dimension" not in stored["findings"][0]
 
 
-def test_incomplete_findings_do_not_change_assessment_or_repair_plan():
+def test_non_security_findings_do_not_change_assessment_or_repair_plan():
     task_id = "dimension-isolation-task"
     sensitive = _finding_dict(_finding())
     incomplete = _finding_dict(_finding(INCOMPLETE_CONTENT_DIMENSION))
+    deployability = _finding_dict(_finding(DEPLOYABILITY_PRODUCTION_DIMENSION))
     legacy_sensitive = dict(sensitive)
     legacy_sensitive.pop("dimension")
 
     baseline_scan = _scan_dict([legacy_sensitive], multidimensional=False)
-    mixed_scan = _scan_dict([sensitive, incomplete], multidimensional=True)
+    mixed_scan = _scan_dict(
+        [sensitive, incomplete, deployability], multidimensional=True
+    )
     baseline_assessment = assess_scan_result(task_id, baseline_scan)
     mixed_assessment = assess_scan_result(task_id, mixed_scan)
     assert mixed_assessment == baseline_assessment
@@ -199,6 +254,7 @@ def test_incomplete_findings_do_not_change_assessment_or_repair_plan():
     mixed_plan = make_plan(mixed_scan, mixed_assessment)
     assert mixed_plan == baseline_plan
     assert "I001_TODO_COMMENT" not in mixed_plan["agent_prompt"]
+    assert "D001_PRODUCTION_START" not in mixed_plan["agent_prompt"]
     assert mixed_assessment["verdict"] != "blocked"
 
 

@@ -32,7 +32,7 @@ import sys
 
 import pytest
 
-from app.scanner.base import Confidence, Severity
+from app.scanner.base import Confidence, SENSITIVE_DATA_DIMENSION, Severity
 from app.scanner.rules import PrivateKeyRule
 from app.scanner.sensitive import scan_directory
 
@@ -464,7 +464,10 @@ class TestMultiFindingAndDeterminism:
         result = scan_directory(tmp_path)
 
         # Check line numbers
-        line_numbers = sorted(f.line_start for f in result.findings)
+        line_numbers = sorted(
+            f.line_start for f in result.findings
+            if f.dimension == SENSITIVE_DATA_DIMENSION
+        )
         assert 1 in line_numbers  # Line 1: GitHub token
         assert 2 in line_numbers  # Line 2: AWS key
         assert 5 in line_numbers  # Line 5: second GitHub token
@@ -598,7 +601,10 @@ class TestEnvTemplateHighConfidenceScan:
         assert len(notices) >= 1
 
         # No security findings
-        assert len(result.findings) == 0
+        assert not any(
+            finding.dimension == SENSITIVE_DATA_DIMENSION
+            for finding in result.findings
+        )
 
     def test_env_example_with_github_token_produces_finding(self, tmp_path):
         """Test 22: .env.example with real GitHub token produces R001 Finding.
@@ -917,7 +923,10 @@ class TestFindingContract:
         result = scan_directory(tmp_path)
 
         assert len(result.findings) >= 1
-        f = result.findings[0]
+        f = next(
+            finding for finding in result.findings
+            if finding.dimension == SENSITIVE_DATA_DIMENSION
+        )
 
         # New fields must exist and be non-empty strings
         assert hasattr(f, "category")
@@ -1714,6 +1723,8 @@ class TestPathSanitization:
 
         # The path should be preserved as-is (relative POSIX)
         for f in result.findings:
+            if f.dimension != SENSITIVE_DATA_DIMENSION:
+                continue
             assert f.file_path == "src/config/settings.py"
 
 
