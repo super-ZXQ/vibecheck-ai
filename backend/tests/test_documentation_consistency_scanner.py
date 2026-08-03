@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -1403,3 +1404,246 @@ def test_npm_run_script_workspace_and_root(tmp_path, command, script_present):
         assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
     else:
         assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+# ---- Round 6 Issue 1: npm run/run-script lifecycle supports server.js ----
+
+@pytest.mark.parametrize(
+    ("command", "script_present", "server_js_present", "should_report"),
+    (
+        ("npm run start", False, True, False),
+        ("npm run-script start", False, True, False),
+        ("npm run restart", False, True, False),
+        ("npm run start", False, False, True),
+        ("npm run-script restart", False, False, True),
+        ("npm run start", True, False, False),
+        ("npm run-script start", True, False, False),
+    ),
+)
+def test_npm_run_lifecycle_supports_server_js(
+    tmp_path, command, script_present, server_js_present, should_report,
+):
+    scripts = {"start": "node app.js"} if script_present else {}
+    files = {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+        "package.json": '{"scripts":' + json.dumps(scripts) + '}',
+    }
+    if server_js_present:
+        files["server.js"] = "console.log('ok')"
+    _write_repo(tmp_path, files)
+    assert ("C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)) == should_report
+
+
+@pytest.mark.parametrize(
+    ("command", "script_present", "server_js_present", "should_report"),
+    (
+        ("npm run start --workspace web", False, True, False),
+        ("npm run-script start --workspace web", False, True, False),
+        ("npm run restart --workspace web", False, True, False),
+        ("npm run start --workspace web", False, False, True),
+        ("npm run-script restart --workspace web", False, False, True),
+        ("npm run start --workspace web", True, False, False),
+    ),
+)
+def test_npm_run_lifecycle_workspace_supports_server_js(
+    tmp_path, command, script_present, server_js_present, should_report,
+):
+    scripts = {"start": "node app.js"} if script_present else {}
+    files = {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+        "packages/web/package.json": '{"name":"web","scripts":' + json.dumps(scripts) + '}',
+    }
+    if server_js_present:
+        files["packages/web/server.js"] = "console.log('ok')"
+    _write_repo(tmp_path, files)
+    assert ("C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)) == should_report
+
+
+# ---- Round 6 Issue 2: archive wrapper workspace path duplication ----
+
+def test_archive_wrapper_workspace_server_js_not_duplicated(tmp_path):
+    _write_repo(tmp_path, {
+        "project-main/README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm start --workspace web\n```\n"
+        ),
+        "project-main/packages/web/package.json": '{"name":"web","version":"1.0.0"}',
+        "project-main/packages/web/server.js": "console.log('ok')\n",
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_archive_wrapper_workspace_missing_server_js_reports(tmp_path):
+    _write_repo(tmp_path, {
+        "project-main/README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm start --workspace web\n```\n"
+        ),
+        "project-main/packages/web/package.json": '{"name":"web","version":"1.0.0"}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_archive_wrapper_workspace_script_start_is_valid(tmp_path):
+    _write_repo(tmp_path, {
+        "project-main/README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm start --workspace web\n```\n"
+        ),
+        "project-main/packages/web/package.json": '{"name":"web","scripts":{"start":"node app.js"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+# ---- Round 6 Issue 3: npm -w=web short param ----
+
+@pytest.mark.parametrize(
+    ("command", "web_has_dev", "api_has_dev", "should_report"),
+    (
+        ("npm run dev -w=web", True, False, False),
+        ("npm run dev -w=web", False, False, True),
+        ("npm -w=web run dev", True, False, False),
+        ("npm -w=web run dev", False, False, True),
+        ("npm run dev -w=web -w=api", True, True, False),
+        ("npm run dev -w=web -w=api", True, False, True),
+        ("npm run dev -w=web -w=api", False, True, True),
+    ),
+)
+def test_npm_short_workspace_equal_param(
+    tmp_path, command, web_has_dev, api_has_dev, should_report,
+):
+    web_scripts = {"dev": "vite"} if web_has_dev else {}
+    api_scripts = {"dev": "vite"} if api_has_dev else {}
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+        "packages/web/package.json": '{"name":"web","scripts":' + json.dumps(web_scripts) + '}',
+        "packages/api/package.json": '{"name":"api","scripts":' + json.dumps(api_scripts) + '}',
+    })
+    assert ("C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)) == should_report
+
+
+# ---- Round 6 Issue 4: Go -C parameter positions and equals form ----
+
+@pytest.mark.parametrize(
+    ("command", "files", "should_report"),
+    (
+        ("go -C=service build ./...", {"service/go.mod": "module app\n"}, False),
+        ("go -C=service build ./...", {}, True),
+        ("go build -C service ./...", {"service/go.mod": "module app\n"}, False),
+        ("go build -C service ./...", {}, True),
+        ("go build -C=service ./...", {"service/go.mod": "module app\n"}, False),
+        ("go build -C=service ./...", {}, True),
+        ("go run -C service main.go", {"service/main.go": "package main\n"}, False),
+        ("go run -C service main.go", {}, True),
+        ("go run -C=service main.go", {"service/main.go": "package main\n"}, False),
+    ),
+)
+def test_go_c_parameter_variations(tmp_path, command, files, should_report):
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+        **files,
+    })
+    assert ("C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)) == should_report
+
+
+# ---- Round 6 Issue 5: multiple pnpm filters conservative skip ----
+
+@pytest.mark.parametrize(
+    ("command", "web_has_dev", "api_has_dev"),
+    (
+        ("pnpm --filter web --filter api dev", True, True),
+        ("pnpm --filter api --filter web dev", True, True),
+        ("pnpm --filter web --filter api dev", True, False),
+        ("pnpm --filter api --filter web dev", False, True),
+        ("pnpm --filter ./packages/web --filter api dev", True, True),
+        ("pnpm --filter api --filter ./packages/web dev", True, True),
+    ),
+)
+def test_multiple_pnpm_filters_skip(tmp_path, command, web_has_dev, api_has_dev):
+    web_scripts = {"dev": "vite"} if web_has_dev else {}
+    api_scripts = {"dev": "vite"} if api_has_dev else {}
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+        "packages/web/package.json": '{"name":"web","scripts":' + json.dumps(web_scripts) + '}',
+        "packages/api/package.json": '{"name":"api","scripts":' + json.dumps(api_scripts) + '}',
+    })
+    # Conservative skip: no C003 regardless of script presence
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_multiple_pnpm_filters_order_independent(tmp_path):
+    """Same selectors in different order must produce the same result."""
+    base_files = {
+        "packages/web/package.json": '{"name":"web","scripts":{"dev":"vite"}}',
+        "packages/api/package.json": '{"name":"api","scripts":{"dev":"vite"}}',
+    }
+    cmd_a = "pnpm --filter web --filter api dev"
+    cmd_b = "pnpm --filter api --filter web dev"
+
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{cmd_a}\n```\n",
+        **base_files,
+    })
+    result_a = "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{cmd_b}\n```\n",
+        **base_files,
+    })
+    result_b = "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+    assert result_a == result_b
+
+
+# ---- Round 6 Issue 6: Go -pgo and unknown parameters ----
+
+@pytest.mark.parametrize(
+    ("command", "should_report"),
+    (
+        ("go build -pgo off ./...", False),
+        ("go build -pgo auto ./...", False),
+        ("go build -pgo profile.pgo ./...", False),
+        ("go build -pgo=off ./...", False),
+        ("go build -pgo=auto ./...", False),
+        ("go build -pgo=profile.pgo ./...", False),
+        ("go build -unknown-flag ./...", False),
+        ("go build -v ./...", False),
+        ("go build -race ./...", False),
+    ),
+)
+def test_go_pgo_and_known_boolean_options(tmp_path, command, should_report):
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+        "go.mod": "module app\n",
+    })
+    assert ("C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)) == should_report
+
+
+def test_go_unknown_flag_does_not_pollute_package_targets(tmp_path):
+    """Unknown flag with a value must not treat the value as a package path."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\ngo build -unknown-flag somevalue ./...\n```\n"
+        ),
+        "go.mod": "module app\n",
+    })
+    # Conservative skip: no C003 despite unknown flag
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_go_pgo_value_not_treated_as_package(tmp_path):
+    """-pgo profile.pgo must not check profile.pgo as a file path."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\ngo build -pgo profile.pgo ./...\n```\n"
+        ),
+        "go.mod": "module app\n",
+    })
+    # profile.pgo is consumed as -pgo value, not treated as a package
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+    # Without go.mod, ./... should still report (pgo value doesn't affect this)
+    (tmp_path / "go.mod").unlink()
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)

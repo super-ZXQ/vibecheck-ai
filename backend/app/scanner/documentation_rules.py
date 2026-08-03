@@ -136,6 +136,12 @@ _GO_VALUE_OPTIONS = frozenset({
     "-gccgoflags", "-gcflags", "-asmflags",
     "-p", "-exec", "-covermode", "-coverpkg", "-buildmode",
     "-installsuffix", "-modfile", "-overlay", "-pkgdir", "-toolexec",
+    "-pgo",
+})
+_GO_BOOLEAN_OPTIONS = frozenset({
+    "-v", "-race", "-cover", "-a", "-n", "-x", "-work",
+    "-modcacherw", "-trimpath", "-buildvcs", "-linkshared",
+    "-msan", "-asan", "-json", "-e", "-fix", "-u", "-d",
 })
 _GO_GLOBAL_VALUE_OPTIONS = frozenset({"-C"})
 _SKIP_COMMAND = object()
@@ -411,6 +417,15 @@ def _parse_workspace_command(
     if manager not in {"npm", "yarn", "pnpm", "bun"}:
         return None
 
+    # Issue 5: multiple pnpm --filter → conservative skip (order-independent)
+    if manager == "pnpm":
+        filter_count = sum(
+            1 for t in tokens[1:]
+            if t == "--filter" or t.startswith("--filter=")
+        )
+        if filter_count > 1:
+            return _SKIP_COMMAND
+
     workspaces: list[str] = []
     selector_type = ""
     remainder: list[str] = []
@@ -436,6 +451,11 @@ def _parse_workspace_command(
                 index += 2
                 continue
         elif manager == "npm" and token.startswith("--workspace="):
+            workspaces.append(token.split("=", 1)[1])
+            selector_type = "npm_workspace"
+            index += 1
+            continue
+        elif manager == "npm" and token.startswith("-w="):
             workspaces.append(token.split("=", 1)[1])
             selector_type = "npm_workspace"
             index += 1
@@ -525,7 +545,6 @@ def _parse_workspace_command(
     # Determine if this is a lifecycle command for workspace validation
     is_lifecycle = (
         manager == "npm"
-        and not has_run
         and lowered_command in _NPM_LIFECYCLE_COMMANDS
     )
 
@@ -640,17 +659,28 @@ def _parse_go_command(
     if tokens[0].lower() != "go":
         return None
 
-    # Issue 3: support global -C <dir> before subcommand
     go_base_dir = base_dir
     index = 1
+
+    # Parse leading -C <dir> or -C=<dir> (global flag before subcommand)
     while index < len(tokens):
         token = tokens[index]
-        if token in _GO_GLOBAL_VALUE_OPTIONS and index + 1 < len(tokens):
-            normalized = _safe_relative_path(base_dir, tokens[index + 1])
+        if token in _GO_GLOBAL_VALUE_OPTIONS:
+            if index + 1 < len(tokens):
+                normalized = _safe_relative_path(go_base_dir, tokens[index + 1])
+                if normalized is None:
+                    return None
+                go_base_dir = normalized
+                index += 2
+                continue
+            return None  # -C without value
+        if token.startswith("-C="):
+            value = token.split("=", 1)[1]
+            normalized = _safe_relative_path(go_base_dir, value)
             if normalized is None:
                 return None
             go_base_dir = normalized
-            index += 2
+            index += 1
             continue
         break
 
@@ -661,6 +691,26 @@ def _parse_go_command(
         return None
     index += 1
 
+    # Parse -C <dir> or -C=<dir> as first argument of build/run
+    if index < len(tokens):
+        token = tokens[index]
+        if token in _GO_GLOBAL_VALUE_OPTIONS:
+            if index + 1 < len(tokens):
+                normalized = _safe_relative_path(go_base_dir, tokens[index + 1])
+                if normalized is None:
+                    return None
+                go_base_dir = normalized
+                index += 2
+            else:
+                return None  # -C without value
+        elif token.startswith("-C="):
+            value = token.split("=", 1)[1]
+            normalized = _safe_relative_path(go_base_dir, value)
+            if normalized is None:
+                return None
+            go_base_dir = normalized
+            index += 1
+
     go_packages: list[str] = []
     package_found = False
     go_file_mode = False
@@ -669,7 +719,6 @@ def _parse_go_command(
         token = tokens[index]
         # For "go run", after finding the first target:
         if subcommand == "run" and package_found:
-            # Issue 4: if first target is a .go file, collect consecutive .go files
             if go_file_mode:
                 if token.endswith(".go"):
                     normalized = _safe_relative_path(go_base_dir, token)
@@ -683,16 +732,24 @@ def _parse_go_command(
             # For directory/import-path targets, rest are program args
             break
         if token.startswith("-") and token != "-":
-            # Issue 3: support -flag=value and -flag value
+            # Handle -flag=value form
             if "=" in token:
+                flag, _ = token.split("=", 1)
+                if flag in _GO_VALUE_OPTIONS or flag in _GO_BOOLEAN_OPTIONS:
+                    index += 1
+                    continue
+                # Unknown flag with =: conservative skip
+                return None
+            # Handle -flag (boolean) form
+            if token in _GO_BOOLEAN_OPTIONS:
                 index += 1
                 continue
+            # Handle -flag value (value option) form
             if token in _GO_VALUE_OPTIONS and index + 1 < len(tokens):
                 index += 2
                 continue
-            # Unknown flag: conservatively treat as boolean (no value)
-            index += 1
-            continue
+            # Unknown flag: conservative skip — do not treat as boolean
+            return None
         # Positional argument: package/path/file
         package_found = True
         if token.endswith(".go"):
@@ -817,7 +874,14 @@ def _parse_command(
         command, re.IGNORECASE,
     )
     if node:
-        return _CommandReference(line_number, "node_script", base_dir, node.group(2))
+        manager = node.group(1).lower()
+        script_name = node.group(2)
+        lowered_script = script_name.lower()
+        if manager == "npm" and lowered_script in _NPM_LIFECYCLE_COMMANDS:
+            return _CommandReference(
+                line_number, "npm_lifecycle", base_dir, lowered_script,
+            )
+        return _CommandReference(line_number, "node_script", base_dir, script_name)
 
     node_shorthand = re.match(
         r"^(npm|pnpm|yarn|bun)\s+([A-Za-z0-9][A-Za-z0-9:_-]*)(?:\s|$)",
@@ -1329,7 +1393,9 @@ class DocumentationConsistencyProbe(RepositoryProbe):
                     else:
                         return False
                 scripts = self.node_scripts.get(directory, set())
-                pkg_path = "/".join(p for p in (root_prefix, directory) if p)
+                # directory is already the full repository-relative path
+                # (includes root_prefix when present) — do not prepend again
+                pkg_path = directory
                 if not self._npm_lifecycle_is_valid(
                     reference.target, scripts, pkg_path,
                 ):
