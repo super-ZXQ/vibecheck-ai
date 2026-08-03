@@ -51,6 +51,7 @@ _REQUIRED_TABLES = frozenset(
         "scan_results",
         "assessment_results",
         "repair_results",
+        "llm_analysis_results",
     }
 )
 
@@ -376,6 +377,32 @@ def init_db() -> None:
                     FOREIGN KEY (task_id) REFERENCES tasks(id)
                 )
             """)
+            # --- llm_analysis_results: one persisted LLM analysis per task (P1-4) ---
+            # analysis_json contains ONLY desensitized explanations and
+            # repair instructions for non-blocking findings. Never stores
+            # raw secrets, original code snippets, or absolute paths.
+            # source = "llm" when LLM produced the analysis, "fallback"
+            # when LLM was unavailable or failed and templates were used.
+            # total_analyzed and total_fallback are redundant columns for
+            # lightweight polling queries.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS llm_analysis_results (
+                    task_id TEXT PRIMARY KEY,
+                    schema_version INTEGER NOT NULL,
+                    analysis_json TEXT NOT NULL,
+                    total_analyzed INTEGER NOT NULL,
+                    total_fallback INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    source_scan_updated_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (task_id) REFERENCES tasks(id)
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_llm_analysis_source
+                ON llm_analysis_results(source)
+            """)
             conn.commit()
             _initialized = True
         finally:
@@ -395,7 +422,8 @@ def check_database_ready() -> None:
                   'tasks',
                   'scan_results',
                   'assessment_results',
-                  'repair_results'
+                  'repair_results',
+                  'llm_analysis_results'
               )
             """
         ).fetchall()
@@ -412,8 +440,9 @@ def reset_db() -> None:
     with _init_lock:
         conn = _get_connection()
         try:
-            # Drop repair_results, assessment_results, and scan_results
-            # first (FK references tasks)
+            # Drop llm_analysis_results, repair_results, assessment_results,
+            # and scan_results first (FK references tasks)
+            conn.execute("DROP TABLE IF EXISTS llm_analysis_results")
             conn.execute("DROP TABLE IF EXISTS repair_results")
             conn.execute("DROP TABLE IF EXISTS assessment_results")
             conn.execute("DROP TABLE IF EXISTS scan_results")

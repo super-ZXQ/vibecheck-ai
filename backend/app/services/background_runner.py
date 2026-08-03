@@ -28,7 +28,10 @@ Non-blocking I/O (P0-5/P0-6/P0-7):
   generate_and_save_repair_plan are synchronous, CPU/IO-bound operations.
   They are executed via asyncio.to_thread so the FastAPI event loop
   stays responsive.
-- No asyncio.wait_for or hard timeout — relies on P0-4 built-in limits.
+- P2-3: Each stage is wrapped in asyncio.wait_for with a configurable
+  timeout. On timeout, the task is marked failed with a specific
+  error code (EXTRACT_TIMEOUT, SCAN_TIMEOUT, ASSESSMENT_TIMEOUT,
+  REPAIR_PLAN_TIMEOUT) and temp files are cleaned up.
 - Cleanup (temp file deletion) only runs AFTER the thread completes,
   guaranteed by await on asyncio.to_thread.
 
@@ -50,21 +53,25 @@ from app.core.error_codes import (
     ASSESSMENT_INTERNAL_ERROR,
     ASSESSMENT_PERSIST_FAILED,
     ASSESSMENT_RESULT_TOO_LARGE,
+    ASSESSMENT_TIMEOUT,
     DOWNLOAD_FAILED,
     DOWNLOAD_TOO_LARGE,
+    EXTRACT_TIMEOUT,
     EXTRACTION_LIMIT_EXCEEDED,
     GITHUB_RATE_LIMITED,
     INTERNAL_ERROR,
     PRIVATE_REPOSITORY,
     REPAIR_PLAN_INTERNAL_ERROR,
     REPAIR_PLAN_PERSIST_FAILED,
+    REPAIR_PLAN_TIMEOUT,
     REPAIR_PLAN_TOO_LARGE,
     REPOSITORY_NOT_FOUND,
-    UNSAFE_ARCHIVE,
-    CLEANUP_FAILED,
     SCAN_INTERNAL_ERROR,
     SCAN_RESULT_PERSIST_FAILED,
     SCAN_RESULT_TOO_LARGE,
+    SCAN_TIMEOUT,
+    UNSAFE_ARCHIVE,
+    CLEANUP_FAILED,
     get_error_message,
 )
 from app.core.github import (
@@ -91,7 +98,9 @@ from app.services.repair_service import (
     generate_and_save_repair_plan,
 )
 from app.services.scan_result_service import save_scan_result, ScanResultTooLargeError
+from app.services.llm_service import generate_and_save_llm_analysis
 from app.services.task_manager import (
+    STAGE_ANALYZING,
     STAGE_ASSESSING,
     STAGE_DOWNLOADING,
     STAGE_EXTRACTING,
@@ -134,7 +143,7 @@ def _map_extraction_error(error: ExtractionError) -> tuple[str, str]:
 
 
 async def _process_task(task_id: str) -> None:
-    """Process a single task: download → extract → scan → assess → repair → complete.
+    """Process a single task: download → extract → scan → assess → repair → analyze → complete.
 
     Pipeline:
     1. Download tarball from GitHub.
@@ -144,7 +153,11 @@ async def _process_task(task_id: str) -> None:
     5. Assess: read persisted scan result, compute score, persist assessment.
     6. Generate repair plan: read persisted scan and assessment, compute
        deterministic repair plan, persist to repair_results.
-    7. Mark task as completed (only after successful repair plan persistence).
+    7. Generate LLM analysis: read persisted scan result, generate
+       plain-language explanations for non-blocking findings, persist
+       to llm_analysis_results. This stage is NON-BLOCKING — failures
+       fall back to templates and never prevent task completion.
+    8. Mark task as completed (only after successful repair plan persistence).
 
     On any failure, marks the task as failed with a desensitized error.
     Temp files are always cleaned up via try/finally — in success, scan
@@ -177,11 +190,23 @@ async def _process_task(task_id: str) -> None:
             # Read the downloaded file into bytes for extraction
             # (max_archive_size is 50MB, acceptable for MVP)
             tarball_bytes = download_result.temp_file.read_bytes()
-            extract_result = safe_extract_to_temp(
-                tarball_bytes,
-                tmp_root=settings.tmp_dir,
+            # P2-3: Wrap extraction in asyncio.wait_for with timeout.
+            extract_result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    safe_extract_to_temp,
+                    tarball_bytes,
+                    tmp_root=settings.tmp_dir,
+                ),
+                timeout=settings.extract_timeout,
             )
             extract_dest = extract_result.dest_dir
+        except asyncio.TimeoutError:
+            logger.error("Extraction timed out for task %s", task_id)
+            mark_failed(
+                task_id, EXTRACT_TIMEOUT,
+                get_error_message(EXTRACT_TIMEOUT),
+            )
+            return
         except ExtractionError as e:
             error_code, safe_msg = _map_extraction_error(e)
             mark_failed(task_id, error_code, safe_msg)
@@ -194,15 +219,23 @@ async def _process_task(task_id: str) -> None:
         # --- Stage 3: Scan ---
         # scan_directory is synchronous (CPU-bound). Run it in a thread
         # via asyncio.to_thread so the event loop stays responsive.
-        # No asyncio.wait_for or hard timeout — relies on P0-4 built-in
-        # limits (file size, ignore dirs, finding cap, etc.).
-        # The await guarantees the thread has completed before cleanup.
+        # P2-3: Wrap in asyncio.wait_for with scan_timeout.
         mark_running(task_id, STAGE_SCANNING, 80)
         try:
-            scan_result = await asyncio.to_thread(
-                scan_directory,
-                Path(extract_dest),
+            scan_result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    scan_directory,
+                    Path(extract_dest),
+                ),
+                timeout=settings.scan_timeout,
             )
+        except asyncio.TimeoutError:
+            logger.error("Scan timed out for task %s", task_id)
+            mark_failed(
+                task_id, SCAN_TIMEOUT,
+                get_error_message(SCAN_TIMEOUT),
+            )
+            return
         except Exception as e:
             # Log only the exception type — never str(exc), repr(exc),
             # stack traces, or repo content.
@@ -263,10 +296,20 @@ async def _process_task(task_id: str) -> None:
         # The failed task's assessment API will NOT return residual data.
         mark_running(task_id, STAGE_ASSESSING, 90)
         try:
-            await asyncio.to_thread(
-                run_assessment,
-                task_id,
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    run_assessment,
+                    task_id,
+                ),
+                timeout=settings.assess_timeout,
             )
+        except asyncio.TimeoutError:
+            logger.error("Assessment timed out for task %s", task_id)
+            mark_failed(
+                task_id, ASSESSMENT_TIMEOUT,
+                get_error_message(ASSESSMENT_TIMEOUT),
+            )
+            return
         except AssessmentResultTooLargeError as e:
             # Serialized assessment_json exceeded assessment_max_json_bytes.
             # Log only the exception type — never str(exc) or DB details.
@@ -335,10 +378,20 @@ async def _process_task(task_id: str) -> None:
         # The failed task's repair plan API will NOT return residual data.
         mark_running(task_id, STAGE_REPAIRING, 95)
         try:
-            await asyncio.to_thread(
-                generate_and_save_repair_plan,
-                task_id,
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    generate_and_save_repair_plan,
+                    task_id,
+                ),
+                timeout=settings.repair_plan_timeout,
             )
+        except asyncio.TimeoutError:
+            logger.error("Repair plan timed out for task %s", task_id)
+            mark_failed(
+                task_id, REPAIR_PLAN_TIMEOUT,
+                get_error_message(REPAIR_PLAN_TIMEOUT),
+            )
+            return
         except RepairPlanTooLargeError as e:
             # Serialized repair_json exceeded repair_max_json_bytes.
             # Log only the exception type — never str(exc) or DB details.
@@ -390,7 +443,40 @@ async def _process_task(task_id: str) -> None:
             )
             return
 
-        # --- Stage 7: Complete with summary ---
+        # --- Stage 7: LLM analysis (NON-BLOCKING) ---
+        # Generate plain-language explanations and repair instructions
+        # for non-blocking findings. This stage reads ONLY from the
+        # persisted scan_results table.
+        # This stage NEVER fails the task — generate_and_save_llm_analysis
+        # catches all internal errors and falls back to templates.
+        # LLM analysis is an enhancement, not a requirement. Assessment
+        # scoring (P0-6) is completely independent and unaffected.
+        mark_running(task_id, STAGE_ANALYZING, 97)
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    generate_and_save_llm_analysis,
+                    task_id,
+                ),
+                timeout=settings.llm_analysis_timeout,
+            )
+        except asyncio.TimeoutError:
+            # Non-blocking — LLM analysis timeout doesn't fail the task.
+            logger.warning(
+                "LLM analysis timed out for task %s (non-blocking, "
+                "continuing to completion)",
+                task_id,
+            )
+        except Exception as e:
+            # This should never happen — generate_and_save_llm_analysis
+            # is designed to never raise. But if it does, log and continue.
+            logger.warning(
+                "LLM analysis stage failed for task %s: %s "
+                "(non-blocking, continuing to completion)",
+                task_id, type(e).__name__,
+            )
+
+        # --- Stage 8: Complete with summary ---
         # Only reached after scan result, assessment, AND repair plan are
         # successfully persisted. The scan_summary is fetched from
         # scan_results by to_response(). The security_score and

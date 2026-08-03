@@ -12,12 +12,15 @@ GET /api/check/{task_id}:
   report_url (P0-5).
 - Completed tasks with a persisted assessment include security_score,
   security_verdict, and assessment_url (P0-6).
+- Completed tasks with a persisted LLM analysis include
+  llm_analysis_available and llm_analysis_url (P1-4).
 - Completed tasks WITHOUT a persisted result (legacy) have
   scan_summary=None and report_url=None.
 - Completed tasks WITHOUT a persisted assessment (legacy P0-5) have
   security_score=None, security_verdict=None, assessment_url=None.
 - Does NOT inline full findings — use the result endpoint for that.
 - Does NOT inline full assessment — use the assessment endpoint for that.
+- Does NOT inline full LLM analysis — use the llm-analysis endpoint.
 - UUID format errors return 422.
 - Non-existent tasks return 404.
 - Frontend can poll every 2 seconds.
@@ -32,6 +35,16 @@ GET /api/check/{task_id}/result (P0-5):
   without a persisted scan_results row).
 - Never re-scans from temp directory.
 - Never returns raw exceptions or absolute paths.
+
+GET /api/check/{task_id}/llm-analysis (P1-4):
+- Returns the full persisted LLM analysis for a completed task.
+- Task not found: 404.
+- pending/running: 409 LLM_ANALYSIS_NOT_READY.
+- failed: fixed safe empty response (200).
+- completed, analysis exists: 200 full analysis.
+- completed, analysis MISSING: 200 safe empty (LLM analysis is
+  non-blocking; a task can complete without it).
+- Never returns raw secrets, temp paths, or internal exceptions.
 """
 
 import asyncio
@@ -42,6 +55,7 @@ from pydantic import BaseModel
 
 from app.core.error_codes import (
     INTERNAL_ERROR,
+    LLM_ANALYSIS_NOT_READY,
     QUEUE_FULL,
     SCAN_RESULT_MISSING,
     SCAN_RESULT_NOT_READY,
@@ -49,6 +63,7 @@ from app.core.error_codes import (
 )
 from app.core.github import GitHubDownloadError, parse_repo_url
 from app.services.background_runner import trigger_queue_processing
+from app.services.llm_service import get_llm_analysis
 from app.services.scan_result_service import (
     SCHEMA_VERSION,
     get_scan_result,
@@ -95,6 +110,8 @@ class TaskStatusResponse(BaseModel):
     assessment_url: str | None = None
     repair_plan_available: bool | None = None
     repair_plan_url: str | None = None
+    llm_analysis_available: bool | None = None
+    llm_analysis_url: str | None = None
 
 
 # --- Fixed safe empty response for failed tasks without results ---
@@ -294,6 +311,91 @@ async def get_check_result(task_id: str):
 
     # --- Case 5: unknown status → internal error ---
     # Must NOT return a success empty report.
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail={
+            "error_code": INTERNAL_ERROR,
+            "error_message": get_error_message(INTERNAL_ERROR),
+        },
+    )
+
+
+# --- LLM analysis safe empty response for failed/pending tasks ---
+
+_SAFE_EMPTY_LLM_ANALYSIS: dict = {
+    "schema_version": 1,
+    "scope": "non_blocking_findings",
+    "total_analyzed": 0,
+    "total_llm": 0,
+    "total_fallback": 0,
+    "source": "none",
+    "items": [],
+}
+
+
+@router.get("/api/check/{task_id}/llm-analysis")
+async def get_llm_analysis_result(task_id: str):
+    """Get the full persisted LLM analysis for a completed task.
+
+    State-ordered branching:
+    1. task not found → 404
+    2. pending/running → 409 LLM_ANALYSIS_NOT_READY
+    3. failed → fixed safe empty response (200)
+    4. completed → asyncio.to_thread(get_llm_analysis)
+       - analysis exists → 200 full analysis
+       - analysis MISSING → 200 safe empty (LLM analysis is non-blocking)
+    5. unknown status → 500 INTERNAL_ERROR
+
+    LLM analysis is NON-BLOCKING — a task can complete without it.
+    Unlike scan_result and assessment, a missing LLM analysis does NOT
+    return an error; it returns a safe empty response.
+    """
+    # Validate UUID format
+    try:
+        uuid.UUID(task_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error_code": "INVALID_TASK_ID",
+                "error_message": "任务ID格式无效。",
+            },
+        )
+
+    # Get task from database
+    task = get_task(task_id)
+    if task is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error_code": "TASK_NOT_FOUND",
+                "error_message": "任务不存在。",
+            },
+        )
+
+    # --- Case 2: pending/running → 409 ---
+    if task.status in (STATUS_PENDING, STATUS_RUNNING):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error_code": LLM_ANALYSIS_NOT_READY,
+                "error_message": get_error_message(LLM_ANALYSIS_NOT_READY),
+            },
+        )
+
+    # --- Case 3: failed → fixed safe empty ---
+    if task.status == STATUS_FAILED:
+        return _SAFE_EMPTY_LLM_ANALYSIS
+
+    # --- Case 4: completed → read analysis ---
+    if task.status == STATUS_COMPLETED:
+        analysis = await asyncio.to_thread(get_llm_analysis, task_id)
+        if analysis is not None:
+            return analysis
+        # Analysis missing — non-blocking, return safe empty.
+        return _SAFE_EMPTY_LLM_ANALYSIS
+
+    # --- Case 5: unknown status → internal error ---
     raise HTTPException(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         detail={

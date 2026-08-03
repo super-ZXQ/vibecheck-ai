@@ -9,6 +9,7 @@ Security:
 - Only summary metadata (file_count, total_size, top_level_dir) is persisted.
 """
 
+import logging
 import uuid
 from dataclasses import dataclass
 from typing import Optional
@@ -16,6 +17,8 @@ from typing import Optional
 from app.core.config import settings
 from app.core.error_codes import get_error_message
 from app.db.database import _get_connection, now_iso, init_db
+
+logger = logging.getLogger(__name__)
 
 
 # --- Task status / stage constants ---
@@ -31,7 +34,41 @@ STAGE_EXTRACTING = "extracting"
 STAGE_SCANNING = "scanning"
 STAGE_ASSESSING = "assessing"
 STAGE_REPAIRING = "repairing"
+STAGE_ANALYZING = "analyzing"
 STAGE_FINISHED = "finished"
+
+# --- Legal state transitions (P2-3) ---
+# Only these transitions are allowed. Any other transition is rejected.
+_LEGAL_TRANSITIONS: dict[str, frozenset[str]] = {
+    STATUS_PENDING: frozenset({STATUS_RUNNING, STATUS_COMPLETED, STATUS_FAILED}),
+    STATUS_RUNNING: frozenset({STATUS_RUNNING, STATUS_COMPLETED, STATUS_FAILED}),
+    STATUS_COMPLETED: frozenset(),  # terminal — no transitions allowed
+    STATUS_FAILED: frozenset(),     # terminal — no transitions allowed
+}
+
+
+class IllegalStateTransitionError(Exception):
+    """Raised when a task state transition is not allowed.
+
+    This is an internal error — callers should catch and log it,
+    never expose it to the API.
+    """
+    pass
+
+
+def _validate_transition(
+    task_id: str, current_status: str, new_status: str,
+) -> None:
+    """Validate that transitioning from current_status to new_status is legal.
+
+    Raises IllegalStateTransitionError if the transition is not allowed.
+    """
+    allowed = _LEGAL_TRANSITIONS.get(current_status, frozenset())
+    if new_status not in allowed:
+        raise IllegalStateTransitionError(
+            f"Illegal transition for task {task_id}: "
+            f"{current_status} -> {new_status}"
+        )
 
 
 @dataclass
@@ -153,6 +190,19 @@ class TaskRecord:
                 )
             else:
                 resp["repair_plan_url"] = None
+
+            # Include lightweight LLM analysis availability (P1-4)
+            # Reads ONLY the task_id column from llm_analysis_results —
+            # does NOT parse the full analysis_json.
+            from app.services.llm_service import get_llm_analysis_available
+            llm_available = get_llm_analysis_available(self.id)
+            resp["llm_analysis_available"] = llm_available
+            if llm_available:
+                resp["llm_analysis_url"] = (
+                    f"/api/check/{self.id}/llm-analysis"
+                )
+            else:
+                resp["llm_analysis_url"] = None
         return resp
 
 
@@ -181,6 +231,10 @@ def create_task(repo_url: str, owner: str, repo_name: str) -> TaskRecord:
         conn.commit()
     finally:
         conn.close()
+
+    # P2-3: Trigger periodic cleanup if enough tasks have been created.
+    from app.services.cleanup_service import maybe_trigger_cleanup
+    maybe_trigger_cleanup()
 
     return get_task(task_id)
 
@@ -282,7 +336,23 @@ def update_task_status(
 
 
 def mark_running(task_id: str, stage: str, progress: int) -> None:
-    """Mark a task as running with the given stage and progress."""
+    """Mark a task as running with the given stage and progress.
+
+    Validates the state transition:
+    - pending → running: allowed
+    - running → running: allowed (stage/progress update)
+    - completed/failed → running: rejected (terminal states)
+    """
+    task = get_task(task_id)
+    if task is not None:
+        try:
+            _validate_transition(task_id, task.status, STATUS_RUNNING)
+        except IllegalStateTransitionError:
+            logger.warning(
+                "Rejected illegal transition for task %s: "
+                "%s -> running", task_id, task.status,
+            )
+            return
     update_task_status(task_id, STATUS_RUNNING, stage, progress)
 
 
@@ -292,7 +362,22 @@ def mark_completed(
     total_size: int,
     top_level_dir: str,
 ) -> None:
-    """Mark a task as completed with summary metadata."""
+    """Mark a task as completed with summary metadata.
+
+    Validates the state transition:
+    - running → completed: allowed
+    - pending/completed/failed → completed: rejected
+    """
+    task = get_task(task_id)
+    if task is not None:
+        try:
+            _validate_transition(task_id, task.status, STATUS_COMPLETED)
+        except IllegalStateTransitionError:
+            logger.warning(
+                "Rejected illegal transition for task %s: "
+                "%s -> completed", task_id, task.status,
+            )
+            return
     init_db()
     now = now_iso()
     conn = _get_connection()
@@ -316,7 +401,22 @@ def mark_failed(task_id: str, error_code: str, error_message: Optional[str] = No
 
     The error_message is always sanitized via get_error_message() to ensure
     no sensitive content is stored.
+
+    Validates the state transition:
+    - pending → failed: allowed
+    - running → failed: allowed
+    - completed/failed → failed: rejected (terminal states)
     """
+    task = get_task(task_id)
+    if task is not None:
+        try:
+            _validate_transition(task_id, task.status, STATUS_FAILED)
+        except IllegalStateTransitionError:
+            logger.warning(
+                "Rejected illegal transition for task %s: "
+                "%s -> failed", task_id, task.status,
+            )
+            return
     init_db()
     now = now_iso()
     safe_message = error_message or get_error_message(error_code)

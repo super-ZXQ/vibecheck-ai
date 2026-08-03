@@ -41,6 +41,7 @@ SENSITIVE_DATA_DIMENSION = "sensitive_data_security"
 INCOMPLETE_CONTENT_DIMENSION = "incomplete_content"
 DEPLOYABILITY_PRODUCTION_DIMENSION = "deployability_production"
 BASIC_SECURITY_DIMENSION = "basic_security"
+DOCUMENTATION_CONSISTENCY_DIMENSION = "documentation_consistency"
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +204,9 @@ class RepositoryProbe(ABC):
     A fresh probe is created for every scan. Implementations must retain only
     bounded derived state and must never expose raw repository content.
     """
+
+    def observe_path(self, file_path: str) -> None:
+        """Observe one validated, desensitized repository file path."""
 
     def observe_file(self, file_path: str, lines: list[str]) -> None:
         """Observe one validated, decoded repository file."""

@@ -17,7 +17,7 @@ test("shows and filters basic-security findings with fixed advice", async ({ pag
 
   await expect(page.locator(".page-title")).toContainText("检测结果", { timeout: 15_000 });
   await expect(page.getByTestId("basic-security-dimension-count")).toContainText("27");
-  await expect(page.getByText("未完成内容、可部署性和基础安全暂不计入安全评分。")).toBeVisible();
+  await expect(page.getByText("未完成内容、可部署性、基础安全和文档一致性暂不计入安全评分。")).toBeVisible();
 
   await page.getByRole("button", { name: "基础安全", exact: true }).click();
   await expect(page.locator(".findings-table tbody tr")).toHaveCount(25);
