@@ -128,6 +128,12 @@ _IGNORED_DOCUMENTED_PARTS = frozenset({
     ".git", ".next", ".venv", "venv", "node_modules", "dist", "build",
     "coverage", "vendor", "generated", "__pycache__",
 })
+_NPM_LIFECYCLE_COMMANDS = frozenset({"start", "stop", "restart", "test"})
+_COMPLEX_SELECTOR_CHARS = frozenset("*!?[]{}")
+_GO_VALUE_OPTIONS = frozenset({
+    "-o", "-ldflags", "-tags", "-mod", "-compiler",
+    "-gccgoflags", "-gcflags", "-asmflags",
+})
 
 _TECH_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     ("react", "node", re.compile(r"(?<![\w.-])React(?![\w.-])", re.IGNORECASE)),
@@ -177,6 +183,9 @@ class _CommandReference:
     target: str
     targets: tuple[str, ...] = ()
     workspace: str = ""
+    manager: str = ""
+    selector_type: str = ""
+    workspaces: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -366,6 +375,13 @@ def _safe_relative_path(base_dir: str, value: str) -> str | None:
     return mask_untrusted_text(normalized)
 
 
+def _is_complex_pnpm_selector(selector: str) -> bool:
+    """Return True for glob, negation, or dependency-graph selectors."""
+    if "..." in selector:
+        return True
+    return any(c in _COMPLEX_SELECTOR_CHARS for c in selector)
+
+
 def _parse_workspace_command(
     command: str,
     line_number: int,
@@ -381,85 +397,136 @@ def _parse_workspace_command(
     if manager not in {"npm", "yarn", "pnpm", "bun"}:
         return None
 
-    workspace: str | None = None
-    is_name_based = False
+    workspaces: list[str] = []
+    selector_type = ""
     remainder: list[str] = []
     index = 1
 
     while index < len(tokens):
         token = tokens[index]
 
-        # Name-based selectors (workspace can appear before or after the script)
+        # Issue 2: -- separator stops package-manager option parsing
+        if token == "--":
+            remainder.extend(tokens[index + 1:])
+            break
+
+        # Issue 6: --workspaces (plural) means all workspaces – skip
+        if manager == "npm" and token == "--workspaces":
+            return None
+
+        # Name-based selectors (workspace can appear before or after script)
         if manager == "npm" and token in {"--workspace", "-w"}:
             if index + 1 < len(tokens):
-                workspace = tokens[index + 1]
-                is_name_based = True
+                workspaces.append(tokens[index + 1])
+                selector_type = "npm_workspace"
                 index += 2
                 continue
         elif manager == "npm" and token.startswith("--workspace="):
-            workspace = token.split("=", 1)[1]
-            is_name_based = True
+            workspaces.append(token.split("=", 1)[1])
+            selector_type = "npm_workspace"
             index += 1
             continue
         elif manager == "yarn" and token == "workspace":
             if index + 1 < len(tokens):
-                workspace = tokens[index + 1]
-                is_name_based = True
+                workspaces.append(tokens[index + 1])
+                selector_type = "name"
                 index += 2
                 continue
         elif manager == "pnpm" and token == "--filter":
             if index + 1 < len(tokens):
-                workspace = tokens[index + 1]
-                is_name_based = True
+                filter_value = tokens[index + 1]
+                # Issue 5: complex selectors are skipped at parse stage
+                if _is_complex_pnpm_selector(filter_value):
+                    return None
+                if filter_value.startswith(("./", "../")):
+                    selector_type = "dir"
+                else:
+                    if not _SIMPLE_PACKAGE_NAME_RE.fullmatch(filter_value):
+                        return None
+                    selector_type = "name"
+                workspaces.append(filter_value)
                 index += 2
                 continue
         elif manager == "pnpm" and token.startswith("--filter="):
-            workspace = token.split("=", 1)[1]
-            is_name_based = True
+            filter_value = token.split("=", 1)[1]
+            if _is_complex_pnpm_selector(filter_value):
+                return None
+            if filter_value.startswith(("./", "../")):
+                selector_type = "dir"
+            else:
+                if not _SIMPLE_PACKAGE_NAME_RE.fullmatch(filter_value):
+                    return None
+                selector_type = "name"
+            workspaces.append(filter_value)
             index += 1
             continue
         # Directory-based selectors: pnpm -C/--dir, yarn/bun --cwd
         elif manager == "pnpm" and token in {"-C", "--dir"}:
             if index + 1 < len(tokens):
-                workspace = tokens[index + 1]
-                is_name_based = False
+                workspaces.append(tokens[index + 1])
+                selector_type = "dir"
                 index += 2
                 continue
         elif manager == "pnpm" and token.startswith("--dir="):
-            workspace = token.split("=", 1)[1]
-            is_name_based = False
+            workspaces.append(token.split("=", 1)[1])
+            selector_type = "dir"
             index += 1
             continue
         elif manager in {"yarn", "bun"} and token == "--cwd":
             if index + 1 < len(tokens):
-                workspace = tokens[index + 1]
-                is_name_based = False
+                workspaces.append(tokens[index + 1])
+                selector_type = "dir"
                 index += 2
                 continue
 
         remainder.append(token)
         index += 1
 
-    if workspace is None:
+    if not workspaces:
         return None
-    if is_name_based and manager == "pnpm":
-        if not _SIMPLE_PACKAGE_NAME_RE.fullmatch(workspace):
-            return None
+
+    # Issue 1: strip optional "run" and check for built-in commands
+    has_run = False
     if remainder and remainder[0].lower() == "run":
+        has_run = True
         remainder = remainder[1:]
     if not remainder or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:_-]*", remainder[0]):
         return None
 
-    if is_name_based:
+    command_name = remainder[0]
+    lowered_command = command_name.lower()
+
+    # Issue 1: skip package-manager built-in commands
+    if has_run:
+        # "run <script>" is always a project script — validate it
+        pass
+    elif manager == "npm":
+        # npm without "run": only lifecycle commands are valid scripts
+        if lowered_command not in _NPM_LIFECYCLE_COMMANDS:
+            return None
+    elif lowered_command in _NODE_BUILTIN_COMMANDS.get(manager, frozenset()):
+        # yarn/pnpm/bun without "run": skip built-in commands
+        return None
+
+    # Create reference based on selector type
+    if selector_type in ("name", "npm_workspace"):
         return _CommandReference(
-            line_number, "node_workspace_name", base_dir, remainder[0],
-            workspace=workspace,
+            line_number, "node_workspace_name", base_dir, command_name,
+            workspace=workspaces[0],
+            workspaces=tuple(workspaces),
+            manager=manager,
+            selector_type=selector_type,
         )
-    normalized = _safe_relative_path(base_dir, workspace)
+    # Directory-based selector: single workspace only
+    if len(workspaces) > 1:
+        return None
+    normalized = _safe_relative_path(base_dir, workspaces[0])
     if normalized is None:
         return None
     return _CommandReference(
-        line_number, "node_script", normalized, remainder[0]
+        line_number, "node_script", normalized, command_name,
+        manager=manager,
+        selector_type=selector_type,
     )
 
 
@@ -531,6 +598,59 @@ def _parse_python_server_command(
         return None
     return _CommandReference(
         line_number, "python_import_module", command_base, target
+    )
+
+
+def _parse_go_command(
+    command: str,
+    line_number: int,
+    base_dir: str,
+) -> _CommandReference | None:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    if len(tokens) < 3:
+        return None
+    if tokens[0].lower() != "go":
+        return None
+    subcommand = tokens[1].lower()
+    if subcommand not in {"run", "build"}:
+        return None
+
+    go_packages: list[str] = []
+    package_found = False
+    index = 2
+
+    while index < len(tokens):
+        token = tokens[index]
+        # For "go run", everything after the first package is program arguments
+        if subcommand == "run" and package_found:
+            break
+        if token.startswith("-") and token != "-":
+            if "=" in token:
+                index += 1
+                continue
+            if token in _GO_VALUE_OPTIONS and index + 1 < len(tokens):
+                index += 2
+                continue
+            index += 1
+            continue
+        # Positional argument: package/path
+        package_found = True
+        normalized = _safe_relative_path(base_dir, token)
+        if normalized is None:
+            return None
+        go_packages.append(normalized)
+        index += 1
+
+    if not go_packages:
+        return None
+    if len(go_packages) == 1:
+        return _CommandReference(line_number, "go", base_dir, go_packages[0])
+    return _CommandReference(
+        line_number, "go", base_dir, go_packages[0],
+        targets=tuple(go_packages),
     )
 
 
@@ -691,10 +811,9 @@ def _parse_command(
     make = re.match(r"^make\s+([A-Za-z0-9_.-]+)(?:\s|$)", command)
     if make:
         return _CommandReference(line_number, "make", base_dir, make.group(1))
-    go = re.match(r"^go\s+(?:run|build)\s+([^\s]+)", command)
-    if go:
-        target = _safe_relative_path(base_dir, go.group(1))
-        return _CommandReference(line_number, "go", base_dir, target) if target else None
+    go = _parse_go_command(command, line_number, base_dir)
+    if go is not None:
+        return go
     if re.match(r"^cargo\s+(?:run|build)\b", command):
         return _CommandReference(line_number, "cargo", base_dir, "")
     if re.match(r"^(?:\./)?mvnw?(?:\.cmd)?\s+", command):
@@ -1077,17 +1196,36 @@ class DocumentationConsistencyProbe(RepositoryProbe):
             return f"{root_prefix}/{name}" if root_prefix else name
 
         if reference.kind == "node_workspace_name":
-            directory = self.node_package_names.get(reference.workspace)
-            if directory is not None:
-                return reference.target in self.node_scripts.get(directory, set())
-            if reference.workspace.startswith("@"):
+            all_workspaces = reference.workspaces or (
+                (reference.workspace,) if reference.workspace else ()
+            )
+            if not all_workspaces:
                 return False
-            normalized = _safe_relative_path(reference.base_dir, reference.workspace)
-            if normalized is None:
+            for ws in all_workspaces:
+                directory = self.node_package_names.get(ws)
+                if directory is not None:
+                    if reference.target not in self.node_scripts.get(directory, set()):
+                        return False
+                    continue
+                # Name not found in package registry
+                if reference.selector_type == "name":
+                    # yarn workspace / pnpm --filter name: no directory fallback
+                    return False
+                if reference.selector_type == "npm_workspace":
+                    # npm --workspace: try directory fallback for non-scoped names
+                    if ws.startswith("@"):
+                        return False
+                    normalized = _safe_relative_path(reference.base_dir, ws)
+                    if normalized is None:
+                        return False
+                    rel = normalized if normalized != "." else ""
+                    dir_path = "/".join(p for p in (root_prefix, rel) if p) or "."
+                    if reference.target not in self.node_scripts.get(dir_path, set()):
+                        return False
+                    continue
+                # Unknown selector_type: conservative fail
                 return False
-            relative_base = normalized if normalized != "." else ""
-            directory = "/".join(part for part in (root_prefix, relative_base) if part) or "."
-            return reference.target in self.node_scripts.get(directory, set())
+            return True
         if reference.kind == "node_script":
             manifest_dir = base or "."
             return reference.target in self.node_scripts.get(manifest_dir, set())
@@ -1140,15 +1278,23 @@ class DocumentationConsistencyProbe(RepositoryProbe):
         if reference.kind == "make":
             return reference.target in self.make_targets.get(base or ".", set())
         if reference.kind == "go":
-            target = reference.target
-            if "..." in target:
-                base_path = target.replace("/...", "").replace("...", "")
-                if not base_path or base_path == ".":
-                    return joined("go.mod") in self.paths
-                return self._path_exists(rooted(base_path), directory=True)
-            if target in {reference.base_dir, "."}:
-                return joined("go.mod") in self.paths
-            return self._path_exists(rooted(target))
+            all_targets = (reference.target,)
+            if reference.targets:
+                all_targets = reference.targets
+            for target in all_targets:
+                if "..." in target:
+                    if joined("go.mod") not in self.paths:
+                        return False
+                    base_path = target.replace("/...", "").replace("...", "")
+                    if base_path and base_path != ".":
+                        if not self._path_exists(rooted(base_path), directory=True):
+                            return False
+                elif target in {reference.base_dir, "."}:
+                    if joined("go.mod") not in self.paths:
+                        return False
+                elif not self._path_exists(rooted(target)):
+                    return False
+            return True
         if reference.kind == "cargo":
             return joined("Cargo.toml") in self.paths
         if reference.kind == "maven":

@@ -213,6 +213,185 @@ def test_node_script_and_working_directory_are_validated(tmp_path):
     })
     assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
 
+
+# ---- Issue 1: workspace built-in commands are not project scripts ----
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "npm install --workspace web",
+        "npm exec --workspace web vite",
+        "yarn workspace web add react",
+        "pnpm --filter web install",
+    ),
+)
+def test_workspace_builtin_commands_are_not_treated_as_scripts(tmp_path, command):
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+        "packages/web/package.json": '{"name":"web","scripts":{}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+# ---- Issue 2: -- separator stops workspace option parsing ----
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "npm run dev -- --workspace web",
+        "npm run dev -- --filter api",
+    ),
+)
+def test_double_dash_separator_stops_workspace_parsing(tmp_path, command):
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+        "package.json": '{"scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+# ---- Issue 3: yarn/pnpm name selectors must not fall back to directory ----
+
+def test_yarn_workspace_name_not_found_does_not_fall_back_to_directory(tmp_path):
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nyarn workspace web dev\n```\n"
+        ),
+        "web/package.json": '{"name":"different-name","scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_pnpm_filter_name_not_found_does_not_fall_back_to_directory(tmp_path):
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\npnpm --filter web dev\n```\n"
+        ),
+        "web/package.json": '{"name":"different-name","scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_pnpm_directory_selector_validates_correctly(tmp_path):
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\npnpm --filter ./packages/web dev\n```\n"
+        ),
+        "packages/web/package.json": '{"name":"different-name","scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+    _write_repo(tmp_path, {"packages/web/package.json": '{"name":"different-name","scripts":{}}'})
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+# ---- Issue 4: Go command parses arguments and all packages ----
+
+@pytest.mark.parametrize(
+    ("command", "files", "should_report"),
+    (
+        ("go build -o bin ./...", {"go.mod": "module app\n"}, False),
+        ("go build -o bin ./...", {}, True),
+        ("go build ./cmd/a ./cmd/b", {"cmd/a/main.go": "package main\n", "cmd/b/main.go": "package main\n"}, False),
+        ("go build ./cmd/a ./cmd/b", {"cmd/a/main.go": "package main\n"}, True),
+        ("go build ./cmd/...", {"go.mod": "module app\n", "cmd/main.go": "package main\n"}, False),
+        ("go build ./cmd/...", {"go.mod": "module app\n"}, True),
+        ("go build ./cmd/...", {"cmd/main.go": "package main\n"}, True),
+    ),
+)
+def test_go_command_parses_arguments_and_all_packages(
+    tmp_path, command, files, should_report,
+):
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+        **files,
+    })
+    assert ("C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)) is should_report
+
+
+# ---- Issue 5: pnpm complex selectors must be skipped at parse stage ----
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        'pnpm --filter web... dev',
+        'pnpm --filter ...web dev',
+        'pnpm --filter web^... dev',
+        'pnpm --filter "./packages/*" dev',
+    ),
+)
+def test_pnpm_complex_selectors_are_skipped(tmp_path, command):
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+        "packages/web/package.json": '{"name":"web","scripts":{}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+# ---- Issue 6: multiple npm workspaces must all be validated ----
+
+def test_multiple_npm_workspaces_all_valid(tmp_path):
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev --workspace web --workspace api\n```\n"
+        ),
+        "packages/web/package.json": '{"name":"web","scripts":{"dev":"vite"}}',
+        "packages/api/package.json": '{"name":"api","scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_multiple_npm_workspaces_second_missing_script(tmp_path):
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev --workspace web --workspace api\n```\n"
+        ),
+        "packages/web/package.json": '{"name":"web","scripts":{"dev":"vite"}}',
+        "packages/api/package.json": '{"name":"api","scripts":{}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_multiple_npm_workspaces_first_missing_script(tmp_path):
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev --workspace web --workspace api\n```\n"
+        ),
+        "packages/web/package.json": '{"name":"web","scripts":{}}',
+        "packages/api/package.json": '{"name":"api","scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_multiple_npm_workspaces_order_independence(tmp_path):
+    base_readme = (
+        f"# App\n\n{_long_intro()}\n## Running\n"
+        "```sh\n{}\n```\n"
+    )
+    _write_repo(tmp_path, {
+        "README.md": base_readme.format("npm run dev --workspace api --workspace web"),
+        "packages/web/package.json": '{"name":"web","scripts":{"dev":"vite"}}',
+        "packages/api/package.json": '{"name":"api","scripts":{}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_npm_workspaces_flag_is_skipped(tmp_path):
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev --workspaces\n```\n"
+        ),
+        "package.json": '{"scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
     _write_repo(tmp_path, {
         "README.md": (
             f"# App\n\n{_long_intro()}\n## Quick Start\n"
@@ -310,11 +489,11 @@ def test_workspace_commands_validate_the_workspace_script(tmp_path, command):
     readme = f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n"
     _write_repo(tmp_path, {
         "README.md": readme,
-        "web/package.json": '{"scripts":{"dev":"vite"}}',
+        "web/package.json": '{"name":"web","scripts":{"dev":"vite"}}',
     })
     assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
 
-    _write_repo(tmp_path, {"web/package.json": '{"scripts":{}}'})
+    _write_repo(tmp_path, {"web/package.json": '{"name":"web","scripts":{}}'})
     assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
 
 
