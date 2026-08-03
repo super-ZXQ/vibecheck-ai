@@ -23,7 +23,7 @@ APP_VERSION = "0.1.0"
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    """Initialize persistence and close stale tasks before serving traffic."""
+    """Initialize persistence, clean stale tasks, and remove residual temp files."""
     init_db()
     count = mark_stale_tasks_as_failed()
     if count > 0:
@@ -31,6 +31,16 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
             "Service restarted: marked %d stale task(s) as failed",
             count,
         )
+    # P2-3: Clean up residual temp files from crashed processes.
+    from app.services.cleanup_service import (
+        cleanup_residual_temp_files,
+        cleanup_expired_tasks,
+    )
+    cleanup_residual_temp_files()
+    # P2-3: Delete expired reports on startup.
+    expired = cleanup_expired_tasks()
+    if expired > 0:
+        logger.info("Startup cleanup: expired %d old report(s)", expired)
     yield
 
 

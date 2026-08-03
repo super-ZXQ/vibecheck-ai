@@ -68,8 +68,17 @@ class Settings(BaseSettings):
     max_single_file_size: int = 10 * 1024 * 1024  # 10 MB per file
 
     # --- Scan limits ---
-    scan_timeout: int = 120  # seconds
+    scan_timeout: int = 120  # seconds — wraps scan_directory in asyncio.wait_for
     scan_concurrency: int = 1  # single worker, low concurrency
+
+    # --- Stage timeouts (P2-3) ---
+    # Each CPU-intensive stage is wrapped in asyncio.wait_for.
+    # A timeout marks the task as failed with a specific error code.
+    # All timeouts must be positive integers (>= 1).
+    extract_timeout: int = Field(default=60, ge=1)  # extraction (tarball parsing)
+    assess_timeout: int = Field(default=30, ge=1)  # assessment computation
+    repair_plan_timeout: int = Field(default=30, ge=1)  # repair plan generation
+    llm_analysis_timeout: int = Field(default=60, ge=1)  # LLM analysis (non-blocking stage)
     # No line limit: files under scan_max_file_size are scanned in full.
     # Removing max_line_read prevents missing secrets in later lines.
     scan_max_file_size: int = 1024 * 1024  # 1 MB — skip files larger than this
@@ -143,9 +152,23 @@ class Settings(BaseSettings):
         ".sqlite", ".db", ".db3", ".s3db",
     ]
 
-    # --- LLM ---
-    llm_timeout: int = 30  # seconds
+    # --- LLM analysis (P1-4) ---
+    # LLM is disabled by default. Must be explicitly enabled via env.
+    # When disabled, all non-blocking findings use fallback templates.
+    llm_enabled: bool = False
+    llm_timeout: int = 30  # seconds per request
     llm_api_key: str | None = None  # read from env LLM_API_KEY
+    llm_base_url: str | None = None  # read from env LLM_BASE_URL
+    llm_model: str = ""  # model name, read from env LLM_MODEL
+    llm_max_retries: int = 2  # max retry attempts on transient failure
+    # Max non-blocking findings to send to LLM per task.
+    # Prevents unbounded LLM calls on repos with hundreds of findings.
+    llm_max_findings_per_task: int = Field(default=50, ge=1)
+    # Max characters for a single LLM explanation or instruction field.
+    llm_max_explanation_chars: int = Field(default=2000, ge=1)
+    llm_max_instruction_chars: int = Field(default=3000, ge=1)
+    # Max persisted LLM analysis JSON size in bytes.
+    llm_max_result_json_bytes: int = Field(default=4 * 1024 * 1024, ge=1)
 
     # --- Temp directory ---
     tmp_dir: str = "/tmp/vibecheck"  # isolated temp root
@@ -156,6 +179,13 @@ class Settings(BaseSettings):
     # --- Task queue ---
     max_pending_tasks: int = 5  # max pending tasks in queue
     max_running_tasks: int = 1  # only 1 task runs at a time (MVP)
+
+    # --- Report expiry (P2-3) ---
+    # Completed/failed tasks older than this are eligible for cleanup.
+    # 0 means cleanup is disabled (retain forever).
+    report_ttl_hours: int = Field(default=72, ge=0)
+    # Run cleanup every N new task creations (0 = only on startup).
+    cleanup_interval_tasks: int = Field(default=10, ge=0)
 
     # --- CORS (P0-8) ---
     # Only the configured origins are allowed. The wildcard "*" is
