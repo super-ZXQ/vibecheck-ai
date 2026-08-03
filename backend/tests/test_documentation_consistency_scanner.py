@@ -106,7 +106,6 @@ def test_nested_docs_readme_is_not_mistaken_for_repository_root(tmp_path):
     _write_repo(tmp_path, {
         "docs/README.md": f"# Docs\n\n{_long_intro()}\n",
         "docs/guide.md": "Guide\n",
-        "app.py": "print('ok')\n",
     })
     finding = next(
         finding for finding in _findings(tmp_path)
@@ -219,6 +218,9 @@ def test_node_script_and_working_directory_are_validated(tmp_path):
         "python -m venv .venv",
         "python -m pip install -r requirements.txt",
         "python -m pytest",
+        "python -m flask run",
+        "python -m streamlit run app.py",
+        "python -m http.server 8000",
         "npm create vite@latest",
         "yarn workspace frontend start",
     ),
@@ -246,11 +248,56 @@ def test_python_module_server_resolves_the_application_module(tmp_path):
     assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("command", "script"),
+    (
+        ("npm start", "start"),
+        ("npm test", "test"),
+        ("yarn dev", "dev"),
+        ("yarn start", "start"),
+        ("pnpm dev", "dev"),
+        ("bun start", "start"),
+    ),
+)
+def test_package_manager_shorthand_validates_scripts(tmp_path, command, script):
+    readme = f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n"
+    _write_repo(tmp_path, {
+        "README.md": readme,
+        "package.json": '{"scripts":{}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+    _write_repo(tmp_path, {
+        "package.json": f'{{"scripts":{{"{script}":"echo ok"}}}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
 def test_multiline_compose_command_resolves_explicit_file(tmp_path):
     _write_repo(tmp_path, {
         "README.md": (
             f"# App\n\n{_long_intro()}\n## Running\n"
             "```sh\ndocker compose \\\n  -f deploy/production.yml up\n```\n"
+        ),
+        "deploy/production.yml": "services: {}\n",
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "file_option",
+    (
+        "-f deploy/production.yml",
+        "-f=deploy/production.yml",
+        "--file deploy/production.yml",
+        "--file=deploy/production.yml",
+    ),
+)
+def test_compose_file_option_forms_resolve_explicit_file(tmp_path, file_option):
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            f"```sh\ndocker compose {file_option} up\n```\n"
         ),
         "deploy/production.yml": "services: {}\n",
     })
@@ -368,6 +415,34 @@ def test_unparseable_tree_parent_does_not_reuse_previous_sibling(tmp_path):
         "alpha/x.py": "print('ok')\n",
     })
     assert "C004_PROJECT_STRUCTURE_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_standard_tree_output_infers_directory_from_child_depth(tmp_path):
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Project Structure\n"
+            "```text\n"
+            "├── backend\n"
+            "│   └── missing.py\n"
+            "```\n"
+        ),
+        "backend/other.py": "print('ok')\n",
+    })
+    findings = [
+        finding for finding in _findings(tmp_path)
+        if finding.rule_id == "C004_PROJECT_STRUCTURE_MISMATCH"
+    ]
+    assert len(findings) == 1
+    assert findings[0].line_start is not None
+
+
+def test_referenced_requirements_file_confirms_documented_technology(tmp_path):
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Tech Stack\n- FastAPI\n",
+        "requirements.txt": "-r requirements/prod.txt\n",
+        "requirements/prod.txt": "fastapi==0.116.1\n",
+    })
+    assert "C002_TECH_STACK_MISMATCH" not in _rule_ids(tmp_path)
 
 
 def test_finding_limit_does_not_limit_command_or_structure_checks(

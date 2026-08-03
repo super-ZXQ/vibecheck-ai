@@ -54,9 +54,22 @@ _DIRECT_TREE_PATH_RE = re.compile(
     r"^\s*(?:\./)?([A-Za-z0-9._@+\-]+(?:/[A-Za-z0-9._@+\-]+)+/?)\s*$"
 )
 _SAFE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._@+\-]+/?$")
+_ARCHIVE_ROOT_RE = re.compile(
+    r"^[A-Za-z0-9_.-]+-(?:main|master|[0-9a-f]{7,40}|"
+    r"v?\d+(?:\.\d+)+(?:[-+][A-Za-z0-9.-]+)?)$",
+    re.IGNORECASE,
+)
 _REQUIREMENT_NAME_RE = re.compile(r"^\s*([A-Za-z0-9_.-]+)(?:\[[^\]]+\])?")
+_REQUIREMENT_INCLUDE_RE = re.compile(
+    r"^(?:-r(?:\s+|=)?|--requirement(?:\s+|=))([^\s]+)",
+    re.IGNORECASE,
+)
 _DANGEROUS_COMMAND_RE = re.compile(r"[|;<>`]|\$\(|\$\{|%[^%]+%")
-_PYTHON_TOOL_MODULES = frozenset({"pip", "pytest", "venv"})
+_NODE_SHORTHAND_EXCLUSIONS = frozenset({
+    "add", "audit", "ci", "create", "dlx", "exec", "init", "install",
+    "remove", "run", "set", "update", "upgrade", "workspace",
+})
+_MAX_REQUIREMENT_INCLUDE_DEPTH = 8
 _IGNORED_DOCUMENTED_PARTS = frozenset({
     ".git", ".next", ".venv", "venv", "node_modules", "dist", "build",
     "coverage", "vendor", "generated", "__pycache__",
@@ -257,6 +270,24 @@ def _parse_command(line: str, line_number: int) -> _CommandReference | None:
     if node:
         return _CommandReference(line_number, "node_script", base_dir, node.group(2))
 
+    node_shorthand = re.match(
+        r"^(npm|pnpm|yarn|bun)\s+([A-Za-z0-9:_-]+)(?:\s|$)",
+        command,
+        re.IGNORECASE,
+    )
+    if node_shorthand:
+        manager = node_shorthand.group(1).lower()
+        script = node_shorthand.group(2)
+        lowered = script.lower()
+        if manager == "npm":
+            if lowered not in {"restart", "start", "stop", "test"}:
+                return None
+        elif lowered in _NODE_SHORTHAND_EXCLUSIONS or (
+            manager == "bun" and lowered in {"test", "x"}
+        ):
+            return None
+        return _CommandReference(line_number, "node_script", base_dir, script)
+
     python_module_server = re.match(
         r"^python(?:3)?\s+-m\s+(?:uvicorn|gunicorn|hypercorn)\s+"
         r"([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*):[A-Za-z_]\w*",
@@ -272,9 +303,7 @@ def _parse_command(line: str, line_number: int) -> _CommandReference | None:
         command,
     )
     if python_module:
-        if python_module.group(1).lower() in _PYTHON_TOOL_MODULES:
-            return None
-        return _CommandReference(line_number, "python_module", base_dir, python_module.group(1))
+        return None
     python_file = re.match(r"^python(?:3)?\s+([^\s]+\.py)(?:\s|$)", command)
     if python_file:
         target = _safe_relative_path(base_dir, python_file.group(1))
@@ -292,7 +321,11 @@ def _parse_command(line: str, line_number: int) -> _CommandReference | None:
 
     compose = re.match(r"^(?:docker\s+compose|docker-compose)\b(.*)$", command, re.IGNORECASE)
     if compose:
-        file_option = re.search(r"(?:^|\s)-f\s+([^\s]+)", compose.group(1))
+        file_option = re.search(
+            r"(?:^|\s)(?:-f|--file)(?:\s+|=)([^\s]+)",
+            compose.group(1),
+            re.IGNORECASE,
+        )
         target = ""
         if file_option:
             normalized = _safe_relative_path(base_dir, file_option.group(1))
@@ -407,11 +440,21 @@ def _structure_references(lines: list[str]) -> tuple[_StructureReference, ...]:
                 depth = len(match.group("prefix")) // 4
                 name = re.split(r"\s{2,}|\s+#", match.group("name"), maxsplit=1)[0].strip()
                 stack = {key: value for key, value in stack.items() if key < depth}
+                next_depth: int | None = None
+                next_index = index + 1
+                while next_index < end and not lines[next_index].strip():
+                    next_index += 1
+                if next_index < end and not _FENCE_RE.match(lines[next_index]):
+                    next_match = _TREE_RE.match(lines[next_index])
+                    if next_match:
+                        next_depth = len(next_match.group("prefix")) // 4
+                is_directory = name.endswith("/") or (
+                    next_depth is not None and next_depth > depth
+                )
                 if not _SAFE_SEGMENT_RE.fullmatch(name):
-                    if name.endswith("/"):
+                    if is_directory:
                         stack[depth] = ""
                     continue
-                is_directory = name.endswith("/")
                 segment = name.rstrip("/")
                 parent = stack.get(depth - 1, "") if depth > 0 else ""
                 if depth > 0 and not parent:
@@ -465,6 +508,9 @@ class DocumentationConsistencyProbe(RepositoryProbe):
         self.valid_python_manifest = False
         self.node_scripts: dict[str, set[str]] = {}
         self.make_targets: dict[str, set[str]] = {}
+        self.requirement_roots: set[str] = set()
+        self.requirement_packages: dict[str, set[str]] = {}
+        self.requirement_includes: dict[str, set[str]] = {}
 
     def observe_file(self, file_path: str, lines: list[str]) -> None:
         path = PurePosixPath(file_path)
@@ -484,15 +530,8 @@ class DocumentationConsistencyProbe(RepositoryProbe):
         text = "\n".join(lines)
         if name == "package.json":
             self._observe_package_json(directory, text)
-        elif name.startswith("requirements") and name.endswith(".txt"):
-            self.valid_python_manifest = True
-            for line in lines:
-                stripped = line.strip()
-                if not stripped or stripped.startswith(("#", "-")):
-                    continue
-                match = _REQUIREMENT_NAME_RE.match(stripped)
-                if match:
-                    self.python_packages.add(match.group(1).lower().replace("_", "-"))
+        elif name.endswith(".txt"):
+            self._observe_requirements(normalized, directory, name, lines)
         elif name == "pyproject.toml":
             self._observe_pyproject(text)
         elif name == "pipfile":
@@ -522,6 +561,52 @@ class DocumentationConsistencyProbe(RepositoryProbe):
                 str(name) for name, command in scripts.items()
                 if isinstance(command, str) and command.strip()
             )
+
+    def _observe_requirements(
+        self,
+        file_path: str,
+        directory: str,
+        name: str,
+        lines: list[str],
+    ) -> None:
+        packages: set[str] = set()
+        includes: set[str] = set()
+        for line in lines:
+            stripped = line.split("#", 1)[0].strip()
+            if not stripped:
+                continue
+            include = _REQUIREMENT_INCLUDE_RE.match(stripped)
+            if include:
+                target = _safe_relative_path(directory, include.group(1))
+                if target not in {None, "."}:
+                    includes.add(target)
+                continue
+            if stripped.startswith("-"):
+                continue
+            match = _REQUIREMENT_NAME_RE.match(stripped)
+            if match:
+                packages.add(match.group(1).lower().replace("_", "-"))
+        self.requirement_packages[file_path] = packages
+        self.requirement_includes[file_path] = includes
+        if name.startswith("requirements"):
+            self.valid_python_manifest = True
+            self.requirement_roots.add(file_path)
+
+    def _resolved_requirement_packages(self) -> set[str]:
+        packages: set[str] = set()
+        visited: set[str] = set()
+        pending = [(root, 0) for root in sorted(self.requirement_roots)]
+        while pending:
+            file_path, depth = pending.pop()
+            if file_path in visited or depth > _MAX_REQUIREMENT_INCLUDE_DEPTH:
+                continue
+            visited.add(file_path)
+            packages.update(self.requirement_packages.get(file_path, set()))
+            pending.extend(
+                (target, depth + 1)
+                for target in sorted(self.requirement_includes.get(file_path, set()))
+            )
+        return packages
 
     def _observe_pyproject(self, text: str) -> None:
         try:
@@ -571,12 +656,13 @@ class DocumentationConsistencyProbe(RepositoryProbe):
         candidates = root_readmes
         if not candidates and len(self.top_level_parts) == 1:
             possible_root = next(iter(self.top_level_parts))
-            candidates = [
-                facts for facts in self.readmes.values()
-                if PurePosixPath(facts.path).parent.as_posix() == possible_root
-            ]
-            if candidates:
-                root_prefix = possible_root
+            if _ARCHIVE_ROOT_RE.fullmatch(possible_root):
+                candidates = [
+                    facts for facts in self.readmes.values()
+                    if PurePosixPath(facts.path).parent.as_posix() == possible_root
+                ]
+                if candidates:
+                    root_prefix = possible_root
         if not candidates:
             return None, ""
         return min(
@@ -651,7 +737,10 @@ class DocumentationConsistencyProbe(RepositoryProbe):
 
         packages_by_ecosystem: dict[str, tuple[bool, set[str]]] = {
             "node": (self.valid_node_manifest, self.node_packages),
-            "python": (self.valid_python_manifest, self.python_packages),
+            "python": (
+                self.valid_python_manifest,
+                self.python_packages | self._resolved_requirement_packages(),
+            ),
         }
         tech_count = 0
         for reference in readme.technologies:
