@@ -80,8 +80,11 @@ def test_primary_readme_priority_is_deterministic_and_case_insensitive(tmp_path)
     assert findings[0].file_path == "ReadMe.MD"
 
 
-def test_github_archive_wrapper_is_treated_as_repository_root(tmp_path):
-    wrapper = "owner-project-7fd1a60"
+@pytest.mark.parametrize(
+    "wrapper",
+    ("owner-project-7fd1a60", "project-main", "project-v1.0.0"),
+)
+def test_archive_wrapper_is_treated_as_repository_root(tmp_path, wrapper):
     _write_repo(tmp_path, {
         f"{wrapper}/README.md": (
             f"# App\n\n{_long_intro()}\n"
@@ -103,6 +106,7 @@ def test_nested_docs_readme_is_not_mistaken_for_repository_root(tmp_path):
     _write_repo(tmp_path, {
         "docs/README.md": f"# Docs\n\n{_long_intro()}\n",
         "docs/guide.md": "Guide\n",
+        "app.py": "print('ok')\n",
     })
     finding = next(
         finding for finding in _findings(tmp_path)
@@ -210,6 +214,50 @@ def test_node_script_and_working_directory_are_validated(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "command",
+    (
+        "python -m venv .venv",
+        "python -m pip install -r requirements.txt",
+        "python -m pytest",
+        "npm create vite@latest",
+        "yarn workspace frontend start",
+    ),
+)
+def test_installation_and_tool_commands_are_not_treated_as_project_entries(
+    tmp_path, command,
+):
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Installation\n"
+            f"```sh\n{command}\n```\n"
+        ),
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_python_module_server_resolves_the_application_module(tmp_path):
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\npython -m uvicorn app.main:app\n```\n"
+        ),
+        "app/main.py": "app = object()\n",
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_multiline_compose_command_resolves_explicit_file(tmp_path):
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\ndocker compose \\\n  -f deploy/production.yml up\n```\n"
+        ),
+        "deploy/production.yml": "services: {}\n",
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+@pytest.mark.parametrize(
     ("command", "files"),
     (
         ("python app.py", {"app.py": "print('ok')\n"}),
@@ -304,6 +352,43 @@ def test_direct_paths_generated_paths_and_unstructured_examples(tmp_path):
         "src/app.py": "print('ok')\n",
     })
     assert "C004_PROJECT_STRUCTURE_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_unparseable_tree_parent_does_not_reuse_previous_sibling(tmp_path):
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Project Structure\n"
+            "```text\n"
+            "├── alpha/\n"
+            "│   └── x.py\n"
+            "├── beta dir/\n"
+            "    └── y.py\n"
+            "```\n"
+        ),
+        "alpha/x.py": "print('ok')\n",
+    })
+    assert "C004_PROJECT_STRUCTURE_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_finding_limit_does_not_limit_command_or_structure_checks(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(
+        "app.scanner.documentation_rules.settings.scan_max_findings_per_rule_per_file",
+        1,
+    )
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n"
+            "## Running\n```sh\npython app.py\npython missing.py\n```\n"
+            "## Project Structure\n```text\nsrc/app.py\nmissing/path.py\n```\n"
+        ),
+        "app.py": "print('ok')\n",
+        "src/app.py": "print('ok')\n",
+    })
+    ids = _rule_ids(tmp_path)
+    assert ids.count("C003_START_COMMAND_MISMATCH") == 1
+    assert ids.count("C004_PROJECT_STRUCTURE_MISMATCH") == 1
 
 
 def test_findings_are_bounded_deterministic_and_non_blocking(tmp_path, monkeypatch):

@@ -54,9 +54,9 @@ _DIRECT_TREE_PATH_RE = re.compile(
     r"^\s*(?:\./)?([A-Za-z0-9._@+\-]+(?:/[A-Za-z0-9._@+\-]+)+/?)\s*$"
 )
 _SAFE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._@+\-]+/?$")
-_GITHUB_ARCHIVE_ROOT_RE = re.compile(r"^[A-Za-z0-9_.-]+-[0-9a-f]{7,40}$", re.IGNORECASE)
 _REQUIREMENT_NAME_RE = re.compile(r"^\s*([A-Za-z0-9_.-]+)(?:\[[^\]]+\])?")
 _DANGEROUS_COMMAND_RE = re.compile(r"[|;<>`]|\$\(|\$\{|%[^%]+%")
+_PYTHON_TOOL_MODULES = frozenset({"pip", "pytest", "venv"})
 _IGNORED_DOCUMENTED_PARTS = frozenset({
     ".git", ".next", ".venv", "venv", "node_modules", "dist", "build",
     "coverage", "vendor", "generated", "__pycache__",
@@ -251,14 +251,29 @@ def _parse_command(line: str, line_number: int) -> _CommandReference | None:
         return None
 
     node = re.match(
-        r"^(npm|pnpm|yarn|bun)\s+(?:run\s+)?([A-Za-z0-9:_-]+)(?:\s|$)",
+        r"^(npm|pnpm|yarn|bun)\s+run\s+([A-Za-z0-9:_-]+)(?:\s|$)",
         command, re.IGNORECASE,
     )
-    if node and node.group(2).lower() not in {"install", "add", "ci", "audit"}:
+    if node:
         return _CommandReference(line_number, "node_script", base_dir, node.group(2))
 
-    python_module = re.match(r"^python(?:3)?\s+-m\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)", command)
+    python_module_server = re.match(
+        r"^python(?:3)?\s+-m\s+(?:uvicorn|gunicorn|hypercorn)\s+"
+        r"([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*):[A-Za-z_]\w*",
+        command,
+        re.IGNORECASE,
+    )
+    if python_module_server:
+        return _CommandReference(
+            line_number, "python_module", base_dir, python_module_server.group(1)
+        )
+    python_module = re.match(
+        r"^python(?:3)?\s+-m\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)",
+        command,
+    )
     if python_module:
+        if python_module.group(1).lower() in _PYTHON_TOOL_MODULES:
+            return None
         return _CommandReference(line_number, "python_module", base_dir, python_module.group(1))
     python_file = re.match(r"^python(?:3)?\s+([^\s]+\.py)(?:\s|$)", command)
     if python_file:
@@ -330,29 +345,48 @@ def _technology_references(lines: list[str]) -> tuple[_TechnologyReference, ...]
     return tuple(references)
 
 
-def _command_references(lines: list[str], limit: int) -> tuple[_CommandReference, ...]:
+def _command_references(lines: list[str]) -> tuple[_CommandReference, ...]:
     references: list[_CommandReference] = []
     for start, end in _section_ranges(lines, _COMMAND_SECTION_RE):
         in_fence = False
+        pending_parts: list[str] = []
+        pending_line = 0
         for index in range(start, end):
             line = lines[index]
             if _FENCE_RE.match(line):
                 in_fence = not in_fence
+                pending_parts.clear()
                 continue
-            candidate: str | None = line if in_fence else None
-            if not in_fence:
+            candidate: str | None = None
+            candidate_line = index + 1
+            if in_fence:
+                stripped = line.strip()
+                if pending_parts:
+                    pending_parts.append(
+                        stripped[:-1].rstrip() if stripped.endswith("\\") else stripped
+                    )
+                    if stripped.endswith("\\"):
+                        continue
+                    candidate = " ".join(part for part in pending_parts if part)
+                    candidate_line = pending_line
+                    pending_parts.clear()
+                elif stripped.endswith("\\"):
+                    pending_parts.append(stripped[:-1].rstrip())
+                    pending_line = index + 1
+                    continue
+                else:
+                    candidate = line
+            else:
                 inline = _INLINE_COMMAND_RE.match(line)
                 candidate = inline.group(1) if inline else None
             if candidate:
-                parsed = _parse_command(candidate, index + 1)
+                parsed = _parse_command(candidate, candidate_line)
                 if parsed is not None:
                     references.append(parsed)
-                    if len(references) >= limit:
-                        return tuple(references)
     return tuple(references)
 
 
-def _structure_references(lines: list[str], limit: int) -> tuple[_StructureReference, ...]:
+def _structure_references(lines: list[str]) -> tuple[_StructureReference, ...]:
     references: list[_StructureReference] = []
     seen: set[str] = set()
     for start, end in _section_ranges(lines, _STRUCTURE_SECTION_RE):
@@ -372,13 +406,19 @@ def _structure_references(lines: list[str], limit: int) -> tuple[_StructureRefer
             if match:
                 depth = len(match.group("prefix")) // 4
                 name = re.split(r"\s{2,}|\s+#", match.group("name"), maxsplit=1)[0].strip()
+                stack = {key: value for key, value in stack.items() if key < depth}
                 if not _SAFE_SEGMENT_RE.fullmatch(name):
+                    if name.endswith("/"):
+                        stack[depth] = ""
                     continue
                 is_directory = name.endswith("/")
                 segment = name.rstrip("/")
                 parent = stack.get(depth - 1, "") if depth > 0 else ""
+                if depth > 0 and not parent:
+                    if is_directory:
+                        stack[depth] = ""
+                    continue
                 path_value = f"{parent}/{segment}" if parent else segment
-                stack = {key: value for key, value in stack.items() if key < depth}
                 if is_directory:
                     stack[depth] = path_value
             else:
@@ -397,18 +437,16 @@ def _structure_references(lines: list[str], limit: int) -> tuple[_StructureRefer
             if normalized not in seen:
                 references.append(_StructureReference(index + 1, normalized, is_directory))
                 seen.add(normalized)
-                if len(references) >= limit:
-                    return tuple(references)
     return tuple(references)
 
 
-def _readme_facts(file_path: str, lines: list[str], limit: int) -> _ReadmeFacts:
+def _readme_facts(file_path: str, lines: list[str]) -> _ReadmeFacts:
     return _ReadmeFacts(
         path=file_path,
         prose_characters=_prose_character_count(lines),
         technologies=_technology_references(lines),
-        commands=_command_references(lines, limit),
-        structure=_structure_references(lines, limit),
+        commands=_command_references(lines),
+        structure=_structure_references(lines),
     )
 
 
@@ -442,7 +480,7 @@ class DocumentationConsistencyProbe(RepositoryProbe):
         name = path.name.lower()
         directory = path.parent.as_posix()
         if len(path.parts) <= 2 and name in _README_PRIORITY:
-            self.readmes[normalized] = _readme_facts(normalized, lines, self.limit)
+            self.readmes[normalized] = _readme_facts(normalized, lines)
         text = "\n".join(lines)
         if name == "package.json":
             self._observe_package_json(directory, text)
@@ -533,13 +571,12 @@ class DocumentationConsistencyProbe(RepositoryProbe):
         candidates = root_readmes
         if not candidates and len(self.top_level_parts) == 1:
             possible_root = next(iter(self.top_level_parts))
-            if _GITHUB_ARCHIVE_ROOT_RE.fullmatch(possible_root):
-                candidates = [
-                    facts for facts in self.readmes.values()
-                    if PurePosixPath(facts.path).parent.as_posix() == possible_root
-                ]
-                if candidates:
-                    root_prefix = possible_root
+            candidates = [
+                facts for facts in self.readmes.values()
+                if PurePosixPath(facts.path).parent.as_posix() == possible_root
+            ]
+            if candidates:
+                root_prefix = possible_root
         if not candidates:
             return None, ""
         return min(
