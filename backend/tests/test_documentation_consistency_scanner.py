@@ -310,7 +310,7 @@ def test_parallel_scans_do_not_share_probe_state(tmp_path):
 
 
 def test_repository_derived_text_never_enters_finding_payload(tmp_path):
-    marker = "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ"
+    marker = "private-documentation-marker-1234567890"
     _write_repo(tmp_path, {
         "README.md": (
             f"# App\n\n{_long_intro()}\n## Project Structure\n"
