@@ -953,3 +953,98 @@ def test_src_layout_import_module_is_validated(tmp_path, command, files):
     for path in files:
         (tmp_path / path).unlink()
     assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("command", "files", "should_report"),
+    (
+        ("uvicorn --factory app.main:create_app", {"app/main.py": "app = object()\n"}, False),
+        ("uvicorn --factory missing:create_app", {}, True),
+        ("python -m uvicorn --factory missing:create_app", {}, True),
+    ),
+)
+def test_uvicorn_factory_is_boolean_flag_not_value_option(
+    tmp_path, command, files, should_report,
+):
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+        **files,
+    })
+    assert ("C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)) is should_report
+
+
+@pytest.mark.parametrize(
+    ("command", "script"),
+    (
+        ("npm run dev --workspace web", "dev"),
+        ("npm run dev --workspace=web", "dev"),
+        ("npm run dev -w web", "dev"),
+        ("npm test --workspace web", "test"),
+    ),
+)
+def test_npm_workspace_after_script_validates_workspace_package(
+    tmp_path, command, script,
+):
+    readme = f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n"
+    _write_repo(tmp_path, {
+        "README.md": readme,
+        "packages/web/package.json": (
+            f'{{"name":"web","scripts":{{"{script}":"echo ok"}}}}'
+        ),
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+    _write_repo(tmp_path, {"packages/web/package.json": '{"name":"web","scripts":{}}'})
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_scoped_workspace_with_missing_script_reports_c003(tmp_path):
+    readme = (
+        f"# App\n\n{_long_intro()}\n## Running\n"
+        "```sh\nyarn workspace @acme/web dev\n```\n"
+    )
+    _write_repo(tmp_path, {
+        "README.md": readme,
+        "packages/web/package.json": '{"name":"@acme/web","scripts":{}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_scoped_workspace_not_found_reports_c003(tmp_path):
+    readme = (
+        f"# App\n\n{_long_intro()}\n## Running\n"
+        "```sh\nyarn workspace @acme/missing dev\n```\n"
+    )
+    _write_repo(tmp_path, {"README.md": readme})
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("command", "files", "should_report"),
+    (
+        ("go build ./...", {"go.mod": "module app\n"}, False),
+        ("go build ./...", {}, True),
+        ("go build ./cmd/...", {"go.mod": "module app\n", "cmd/main.go": "package main\n"}, False),
+        ("go build ./cmd/...", {"go.mod": "module app\n"}, True),
+    ),
+)
+def test_go_package_pattern_with_ellipsis(tmp_path, command, files, should_report):
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+        **files,
+    })
+    assert ("C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)) is should_report
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "streamlit run https://example.com/app.py",
+        "python -m streamlit run https://example.com/app.py",
+    ),
+)
+def test_streamlit_remote_url_is_skipped(tmp_path, command):
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)

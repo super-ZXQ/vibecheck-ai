@@ -114,7 +114,7 @@ _SERVER_VALUE_OPTIONS = frozenset({
     "--timeout-graceful-shutdown", "--uds", "--fd", "--loop",
     "--http", "--interface", "--ws", "--ws-ping-interval",
     "--ws-ping-timeout", "--ws-max-size", "--ws-max-queue",
-    "--forwarded-allow-ips", "--factory", "--keyfile", "--certfile",
+    "--forwarded-allow-ips", "--keyfile", "--certfile",
     "--ca-certs", "--ciphers", "--insecure-bind",
     "--bind", "-b", "--config", "-c", "--pid", "--error-logfile",
     "--access-logfile", "--logger-class", "--logformat",
@@ -378,43 +378,73 @@ def _parse_workspace_command(
     if len(tokens) < 3:
         return None
     manager = tokens[0].lower()
+    if manager not in {"npm", "yarn", "pnpm", "bun"}:
+        return None
+
     workspace: str | None = None
     is_name_based = False
     remainder: list[str] = []
+    index = 1
 
-    # Name-based selectors: npm --workspace, yarn workspace, pnpm --filter
-    if manager == "npm" and tokens[1] in {"--workspace", "-w"}:
-        workspace, remainder = tokens[2], tokens[3:]
-        is_name_based = True
-    elif manager == "npm" and tokens[1].startswith("--workspace="):
-        workspace, remainder = tokens[1].split("=", 1)[1], tokens[2:]
-        is_name_based = True
-    elif manager == "yarn" and tokens[1] == "workspace":
-        workspace, remainder = tokens[2], tokens[3:]
-        is_name_based = True
-    elif manager == "pnpm" and tokens[1] == "--filter":
-        workspace, remainder = tokens[2], tokens[3:]
-        is_name_based = True
-        if not _SIMPLE_PACKAGE_NAME_RE.fullmatch(workspace):
-            return None
-    elif manager == "pnpm" and tokens[1].startswith("--filter="):
-        workspace, remainder = tokens[1].split("=", 1)[1], tokens[2:]
-        is_name_based = True
-        if not _SIMPLE_PACKAGE_NAME_RE.fullmatch(workspace):
-            return None
-    # Directory-based selectors: pnpm -C/--dir, yarn/bun --cwd
-    elif manager == "pnpm" and tokens[1] in {"-C", "--dir"}:
-        workspace, remainder = tokens[2], tokens[3:]
-        is_name_based = False
-    elif manager == "pnpm" and tokens[1].startswith("--dir="):
-        workspace, remainder = tokens[1].split("=", 1)[1], tokens[2:]
-        is_name_based = False
-    elif manager in {"yarn", "bun"} and tokens[1] == "--cwd":
-        workspace, remainder = tokens[2], tokens[3:]
-        is_name_based = False
+    while index < len(tokens):
+        token = tokens[index]
+
+        # Name-based selectors (workspace can appear before or after the script)
+        if manager == "npm" and token in {"--workspace", "-w"}:
+            if index + 1 < len(tokens):
+                workspace = tokens[index + 1]
+                is_name_based = True
+                index += 2
+                continue
+        elif manager == "npm" and token.startswith("--workspace="):
+            workspace = token.split("=", 1)[1]
+            is_name_based = True
+            index += 1
+            continue
+        elif manager == "yarn" and token == "workspace":
+            if index + 1 < len(tokens):
+                workspace = tokens[index + 1]
+                is_name_based = True
+                index += 2
+                continue
+        elif manager == "pnpm" and token == "--filter":
+            if index + 1 < len(tokens):
+                workspace = tokens[index + 1]
+                is_name_based = True
+                index += 2
+                continue
+        elif manager == "pnpm" and token.startswith("--filter="):
+            workspace = token.split("=", 1)[1]
+            is_name_based = True
+            index += 1
+            continue
+        # Directory-based selectors: pnpm -C/--dir, yarn/bun --cwd
+        elif manager == "pnpm" and token in {"-C", "--dir"}:
+            if index + 1 < len(tokens):
+                workspace = tokens[index + 1]
+                is_name_based = False
+                index += 2
+                continue
+        elif manager == "pnpm" and token.startswith("--dir="):
+            workspace = token.split("=", 1)[1]
+            is_name_based = False
+            index += 1
+            continue
+        elif manager in {"yarn", "bun"} and token == "--cwd":
+            if index + 1 < len(tokens):
+                workspace = tokens[index + 1]
+                is_name_based = False
+                index += 2
+                continue
+
+        remainder.append(token)
+        index += 1
 
     if workspace is None:
         return None
+    if is_name_based and manager == "pnpm":
+        if not _SIMPLE_PACKAGE_NAME_RE.fullmatch(workspace):
+            return None
     if remainder and remainder[0].lower() == "run":
         remainder = remainder[1:]
     if not remainder or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:_-]*", remainder[0]):
@@ -528,6 +558,8 @@ def _parse_streamlit_flask_command(
     if tool == "streamlit":
         if len(arguments) >= 2 and arguments[0].lower() == "run":
             path = arguments[1]
+            if path.lower().startswith(("http://", "https://")):
+                return None
             target = _safe_relative_path(base_dir, path)
             if target is None:
                 return None
@@ -1049,10 +1081,10 @@ class DocumentationConsistencyProbe(RepositoryProbe):
             if directory is not None:
                 return reference.target in self.node_scripts.get(directory, set())
             if reference.workspace.startswith("@"):
-                return True
+                return False
             normalized = _safe_relative_path(reference.base_dir, reference.workspace)
             if normalized is None:
-                return True
+                return False
             relative_base = normalized if normalized != "." else ""
             directory = "/".join(part for part in (root_prefix, relative_base) if part) or "."
             return reference.target in self.node_scripts.get(directory, set())
@@ -1108,9 +1140,15 @@ class DocumentationConsistencyProbe(RepositoryProbe):
         if reference.kind == "make":
             return reference.target in self.make_targets.get(base or ".", set())
         if reference.kind == "go":
-            if reference.target in {reference.base_dir, "."}:
+            target = reference.target
+            if "..." in target:
+                base_path = target.replace("/...", "").replace("...", "")
+                if not base_path or base_path == ".":
+                    return joined("go.mod") in self.paths
+                return self._path_exists(rooted(base_path), directory=True)
+            if target in {reference.base_dir, "."}:
                 return joined("go.mod") in self.paths
-            return self._path_exists(rooted(reference.target))
+            return self._path_exists(rooted(target))
         if reference.kind == "cargo":
             return joined("Cargo.toml") in self.paths
         if reference.kind == "maven":
