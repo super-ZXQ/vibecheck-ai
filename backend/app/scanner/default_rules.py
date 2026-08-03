@@ -31,6 +31,7 @@ from app.scanner.incomplete_rules import (
 )
 from app.scanner.deployability_rules import DeployabilityRule
 from app.scanner.basic_security_rules import BasicSecurityRule
+from app.scanner.documentation_rules import DocumentationConsistencyRule
 
 # Ordered list of default rules.
 # Order matters only for readability; actual priority is determined by RULE_PRIORITY_MAP.
@@ -53,6 +54,7 @@ DEFAULT_RULES: list = [
     ExcessiveDebugOutputRule(),      # I005
     DeployabilityRule(),             # D001-D010 repository checks
     BasicSecurityRule(),              # B001-B005 basic security checks
+    DocumentationConsistencyRule(),  # C001-C004 documentation checks
 ]
 
 # Priority map: lower number = higher priority.
@@ -97,4 +99,8 @@ RULE_PRIORITY_MAP: dict[str, int] = {
     "B003_RATE_LIMITING": 302,
     "B004_PERMISSIVE_CORS": 303,
     "B005_SQL_INJECTION": 304,
+    "C001_README_COMPLETENESS": 400,
+    "C002_TECH_STACK_MISMATCH": 401,
+    "C003_START_COMMAND_MISMATCH": 402,
+    "C004_PROJECT_STRUCTURE_MISMATCH": 403,
 }
