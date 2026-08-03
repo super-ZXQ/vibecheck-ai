@@ -17,7 +17,7 @@ test("shows and filters deployability findings with fixed advice", async ({ page
 
   await expect(page.locator(".page-title")).toContainText("检测结果", { timeout: 15_000 });
   await expect(page.getByTestId("deployability-dimension-count")).toContainText("27");
-  await expect(page.getByText("未完成内容、可部署性和基础安全暂不计入安全评分。")).toBeVisible();
+  await expect(page.getByText("未完成内容、可部署性、基础安全和文档一致性暂不计入安全评分。")).toBeVisible();
 
   await page.getByRole("button", { name: "可部署性", exact: true }).click();
   await expect(page.locator(".findings-table tbody tr")).toHaveCount(25);

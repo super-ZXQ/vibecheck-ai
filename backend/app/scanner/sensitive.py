@@ -291,6 +291,9 @@ def scan_directory(
             # operations continue using the real full_path.
             safe_path = mask_untrusted_text(posix_path)
 
+            for probe in repository_probes:
+                probe.observe_path(safe_path)
+
             # --- Check file size ---
             try:
                 file_size = os.path.getsize(full_path)

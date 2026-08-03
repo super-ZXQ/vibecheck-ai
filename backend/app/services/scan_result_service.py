@@ -37,6 +37,7 @@ from app.scanner.base import (
     BASIC_SECURITY_DIMENSION,
     Confidence,
     DEPLOYABILITY_PRODUCTION_DIMENSION,
+    DOCUMENTATION_CONSISTENCY_DIMENSION,
     Finding,
     FindingType,
     ScanError,
@@ -370,6 +371,10 @@ def _compute_summary(
         BASIC_SECURITY_DIMENSION: sum(
             1 for f in findings if f.dimension == BASIC_SECURITY_DIMENSION
         ),
+        DOCUMENTATION_CONSISTENCY_DIMENSION: sum(
+            1 for f in findings
+            if f.dimension == DOCUMENTATION_CONSISTENCY_DIMENSION
+        ),
     }
     return {
         "total_findings": len(findings),
@@ -399,6 +404,7 @@ def _normalize_dimension_counts(
     counts.setdefault(INCOMPLETE_CONTENT_DIMENSION, 0)
     counts.setdefault(DEPLOYABILITY_PRODUCTION_DIMENSION, 0)
     counts.setdefault(BASIC_SECURITY_DIMENSION, 0)
+    counts.setdefault(DOCUMENTATION_CONSISTENCY_DIMENSION, 0)
     return counts
 
 

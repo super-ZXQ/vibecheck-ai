@@ -12,6 +12,7 @@ from app.scanner.base import (
     BASIC_SECURITY_DIMENSION,
     Confidence,
     DEPLOYABILITY_PRODUCTION_DIMENSION,
+    DOCUMENTATION_CONSISTENCY_DIMENSION,
     Finding,
     FindingType,
     INCOMPLETE_CONTENT_DIMENSION,
@@ -46,17 +47,20 @@ def test_db(tmp_path, monkeypatch):
 
 def _finding(dimension: str = SENSITIVE_DATA_DIMENSION) -> Finding:
     basic_security = dimension == BASIC_SECURITY_DIMENSION
+    documentation = dimension == DOCUMENTATION_CONSISTENCY_DIMENSION
     incomplete = dimension == INCOMPLETE_CONTENT_DIMENSION
     deployability = dimension == DEPLOYABILITY_PRODUCTION_DIMENSION
     return Finding(
         rule_id=(
-            "B001_API_AUTHENTICATION" if basic_security
+            "C001_README_COMPLETENESS" if documentation
+            else "B001_API_AUTHENTICATION" if basic_security
             else "D001_PRODUCTION_START" if deployability
             else "I001_TODO_COMMENT" if incomplete
             else "R006_PASSWORD_ASSIGNMENT"
         ),
         rule_name=(
-            "API authentication not detected" if basic_security
+            "README is missing or incomplete" if documentation
+            else "API authentication not detected" if basic_security
             else "Missing production start" if deployability
             else "Unfinished work comment" if incomplete
             else "Password Assignment"
@@ -69,7 +73,8 @@ def _finding(dimension: str = SENSITIVE_DATA_DIMENSION) -> Finding:
         column_start=2,
         column_end=6,
         snippet_masked=(
-            "<repository-basic-security-check>" if basic_security
+            "<c001_readme_completeness>" if documentation
+            else "<repository-basic-security-check>" if basic_security
             else "# TODO" if incomplete
             else "password=****"
         ),
@@ -77,15 +82,19 @@ def _finding(dimension: str = SENSITIVE_DATA_DIMENSION) -> Finding:
         finding_type=FindingType.CONTENT,
         description="Fixed description",
         category=(
-            "basic_security" if basic_security
+            "documentation" if documentation
+            else "basic_security" if basic_security
             else "deployability" if deployability
             else "unfinished_comment" if incomplete
             else "password"
         ),
-        secret_type="" if (basic_security or incomplete or deployability) else "password",
+        secret_type="" if (
+            basic_security or documentation or incomplete or deployability
+        ) else "password",
         message="Fixed advice",
         repair_template_key=(
-            "add_api_authentication" if basic_security
+            "c001_readme_completeness" if documentation
+            else "add_api_authentication" if basic_security
             else "add_production_start" if deployability
             else "complete_or_remove_todo_comment" if incomplete
             else "use_env_var_password"
@@ -119,6 +128,10 @@ def _scan_dict(findings: list[dict], *, multidimensional: bool) -> dict:
         finding.get("dimension") == BASIC_SECURITY_DIMENSION
         for finding in findings
     )
+    documentation_count = sum(
+        finding.get("dimension") == DOCUMENTATION_CONSISTENCY_DIMENSION
+        for finding in findings
+    )
     summary = {
         "total_findings": len(findings),
         "blocking_findings": sum(bool(finding["is_blocking"]) for finding in findings),
@@ -142,6 +155,7 @@ def _scan_dict(findings: list[dict], *, multidimensional: bool) -> dict:
             INCOMPLETE_CONTENT_DIMENSION: incomplete_count,
             DEPLOYABILITY_PRODUCTION_DIMENSION: deployability_count,
             BASIC_SECURITY_DIMENSION: basic_security_count,
+            DOCUMENTATION_CONSISTENCY_DIMENSION: documentation_count,
         }
     return {
         "schema_version": 2 if multidimensional else 1,
@@ -160,6 +174,7 @@ def test_v2_serialization_round_trip_fields_and_counts():
             _finding(INCOMPLETE_CONTENT_DIMENSION),
             _finding(DEPLOYABILITY_PRODUCTION_DIMENSION),
             _finding(BASIC_SECURITY_DIMENSION),
+            _finding(DOCUMENTATION_CONSISTENCY_DIMENSION),
         ),
         notices=(), skipped_files=(), scan_errors=(),
         total_files_scanned=1, total_lines_scanned=2,
@@ -170,12 +185,14 @@ def test_v2_serialization_round_trip_fields_and_counts():
         INCOMPLETE_CONTENT_DIMENSION,
         DEPLOYABILITY_PRODUCTION_DIMENSION,
         BASIC_SECURITY_DIMENSION,
+        DOCUMENTATION_CONSISTENCY_DIMENSION,
     ]
     assert serialized["summary"]["dimension_counts"] == {
         SENSITIVE_DATA_DIMENSION: 1,
         INCOMPLETE_CONTENT_DIMENSION: 1,
         DEPLOYABILITY_PRODUCTION_DIMENSION: 1,
         BASIC_SECURITY_DIMENSION: 1,
+        DOCUMENTATION_CONSISTENCY_DIMENSION: 1,
     }
     assert json.loads(json.dumps(serialized, sort_keys=True)) == serialized
 
@@ -189,6 +206,9 @@ def test_older_v2_results_default_new_dimensions_to_zero():
         DEPLOYABILITY_PRODUCTION_DIMENSION
     )
     old_v2["summary"]["dimension_counts"].pop(BASIC_SECURITY_DIMENSION)
+    old_v2["summary"]["dimension_counts"].pop(
+        DOCUMENTATION_CONSISTENCY_DIMENSION
+    )
     normalized = normalize_scan_result_dimensions(old_v2)
     normalized_summary = normalize_scan_summary_dimensions(old_v2["summary"])
     assert normalized["schema_version"] == 2
@@ -200,6 +220,12 @@ def test_older_v2_results_default_new_dimensions_to_zero():
     ] == 0
     assert normalized["summary"]["dimension_counts"][BASIC_SECURITY_DIMENSION] == 0
     assert normalized_summary["dimension_counts"][BASIC_SECURITY_DIMENSION] == 0
+    assert normalized["summary"]["dimension_counts"][
+        DOCUMENTATION_CONSISTENCY_DIMENSION
+    ] == 0
+    assert normalized_summary["dimension_counts"][
+        DOCUMENTATION_CONSISTENCY_DIMENSION
+    ] == 0
 
 
 def test_v1_database_read_defaults_to_sensitive_without_rewrite(test_db):
@@ -233,6 +259,7 @@ def test_v1_database_read_defaults_to_sensitive_without_rewrite(test_db):
         INCOMPLETE_CONTENT_DIMENSION: 0,
         DEPLOYABILITY_PRODUCTION_DIMENSION: 0,
         BASIC_SECURITY_DIMENSION: 0,
+        DOCUMENTATION_CONSISTENCY_DIMENSION: 0,
     }
     conn = _get_connection()
     try:
@@ -250,12 +277,14 @@ def test_non_security_findings_do_not_change_assessment_or_repair_plan():
     incomplete = _finding_dict(_finding(INCOMPLETE_CONTENT_DIMENSION))
     deployability = _finding_dict(_finding(DEPLOYABILITY_PRODUCTION_DIMENSION))
     basic_security = _finding_dict(_finding(BASIC_SECURITY_DIMENSION))
+    documentation = _finding_dict(_finding(DOCUMENTATION_CONSISTENCY_DIMENSION))
     legacy_sensitive = dict(sensitive)
     legacy_sensitive.pop("dimension")
 
     baseline_scan = _scan_dict([legacy_sensitive], multidimensional=False)
     mixed_scan = _scan_dict(
-        [sensitive, incomplete, deployability, basic_security], multidimensional=True
+        [sensitive, incomplete, deployability, basic_security, documentation],
+        multidimensional=True,
     )
     baseline_assessment = assess_scan_result(task_id, baseline_scan)
     mixed_assessment = assess_scan_result(task_id, mixed_scan)
@@ -279,6 +308,7 @@ def test_non_security_findings_do_not_change_assessment_or_repair_plan():
     assert "I001_TODO_COMMENT" not in mixed_plan["agent_prompt"]
     assert "D001_PRODUCTION_START" not in mixed_plan["agent_prompt"]
     assert "B001_API_AUTHENTICATION" not in mixed_plan["agent_prompt"]
+    assert "C001_README_COMPLETENESS" not in mixed_plan["agent_prompt"]
     assert mixed_assessment["verdict"] != "blocked"
 
 
