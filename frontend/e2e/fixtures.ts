@@ -140,6 +140,7 @@ export const mockScanResult = {
       incomplete_content: 0,
       deployability_production: 0,
       basic_security: 0,
+      documentation_consistency: 0,
     },
   },
 };
@@ -169,6 +170,7 @@ export const mockMultidimensionalScanResult = {
       incomplete_content: 6,
       deployability_production: 0,
       basic_security: 0,
+      documentation_consistency: 0,
     },
   },
 };
@@ -197,6 +199,7 @@ export const mockThreeDimensionalScanResult = {
       incomplete_content: 6,
       deployability_production: 27,
       basic_security: 0,
+      documentation_consistency: 0,
     },
   },
 };
@@ -225,6 +228,38 @@ export const mockFourDimensionalScanResult = {
       incomplete_content: 6,
       deployability_production: 27,
       basic_security: 27,
+      documentation_consistency: 0,
+    },
+  },
+};
+
+export const mockFiveDimensionalScanResult = {
+  ...mockFourDimensionalScanResult,
+  findings: [
+    ...mockFourDimensionalScanResult.findings,
+    ...Array.from({ length: 27 }, (_, i) => ({
+      ...mockScanResult.findings[i],
+      rule_id: `C${String(i % 4 + 1).padStart(3, "0")}_DOCUMENTATION`,
+      rule_name: `Documentation Rule ${i + 1}`,
+      file_path: i === 0 ? "<repository>" : "README.md",
+      line_start: i === 0 ? null : i + 10,
+      line_end: i === 0 ? null : i + 10,
+      is_blocking: false,
+      dimension: "documentation_consistency" as const,
+      description: "A documented repository fact does not match the project.",
+      message: "Update the documentation or restore the referenced project element.",
+    })),
+  ],
+  summary: {
+    ...mockFourDimensionalScanResult.summary,
+    total_findings: 113,
+    returned_findings: 113,
+    dimension_counts: {
+      sensitive_data_security: 26,
+      incomplete_content: 6,
+      deployability_production: 27,
+      basic_security: 27,
+      documentation_consistency: 27,
     },
   },
 };
