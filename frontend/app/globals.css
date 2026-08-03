@@ -316,6 +316,11 @@ body {
   color: #166534;
 }
 
+.dimension-documentation_consistency {
+  background: #fef3c7;
+  color: #92400e;
+}
+
 .finding-detail-button {
   white-space: nowrap;
   padding: 3px 8px;

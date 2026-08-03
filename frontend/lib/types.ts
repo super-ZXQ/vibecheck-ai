@@ -44,6 +44,7 @@ export interface ScanSummary {
     incomplete_content?: number;
     deployability_production?: number;
     basic_security?: number;
+    documentation_consistency?: number;
   };
 }
 
@@ -92,7 +93,8 @@ export interface Finding {
     | "sensitive_data_security"
     | "incomplete_content"
     | "deployability_production"
-    | "basic_security";
+    | "basic_security"
+    | "documentation_consistency";
 }
 
 export interface ScanNotice {

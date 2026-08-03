@@ -42,13 +42,15 @@ const SENSITIVE_DIMENSION = "sensitive_data_security";
 const INCOMPLETE_DIMENSION = "incomplete_content";
 const DEPLOYABILITY_DIMENSION = "deployability_production";
 const BASIC_SECURITY_DIMENSION = "basic_security";
+const DOCUMENTATION_DIMENSION = "documentation_consistency";
 
 type FindingFilter =
   | "all"
   | typeof SENSITIVE_DIMENSION
   | typeof INCOMPLETE_DIMENSION
   | typeof DEPLOYABILITY_DIMENSION
-  | typeof BASIC_SECURITY_DIMENSION;
+  | typeof BASIC_SECURITY_DIMENSION
+  | typeof DOCUMENTATION_DIMENSION;
 
 function findingDimension(dimension: string | undefined) {
   return dimension ?? SENSITIVE_DIMENSION;
@@ -58,6 +60,7 @@ function dimensionLabel(dimension: string) {
   if (dimension === INCOMPLETE_DIMENSION) return "未完成内容";
   if (dimension === DEPLOYABILITY_DIMENSION) return "可部署性";
   if (dimension === BASIC_SECURITY_DIMENSION) return "基础安全";
+  if (dimension === DOCUMENTATION_DIMENSION) return "文档一致性";
   return "敏感信息";
 }
 
@@ -77,6 +80,8 @@ export function ScanResults({ scanResult }: ScanResultsProps) {
     ?? findings.filter((finding) => findingDimension(finding.dimension) === DEPLOYABILITY_DIMENSION).length;
   const basicSecurityCount = counts?.basic_security
     ?? findings.filter((finding) => findingDimension(finding.dimension) === BASIC_SECURITY_DIMENSION).length;
+  const documentationCount = counts?.documentation_consistency
+    ?? findings.filter((finding) => findingDimension(finding.dimension) === DOCUMENTATION_DIMENSION).length;
   const filteredFindings = filter === "all"
     ? findings
     : findings.filter((finding) => findingDimension(finding.dimension) === filter);
@@ -111,9 +116,13 @@ export function ScanResults({ scanResult }: ScanResultsProps) {
           <span>基础安全</span>
           <strong>{basicSecurityCount}</strong>
         </div>
+        <div className="dimension-card" data-testid="documentation-dimension-count">
+          <span>文档一致性</span>
+          <strong>{documentationCount}</strong>
+        </div>
       </div>
       <p className="dimension-score-notice">
-        未完成内容、可部署性和基础安全暂不计入安全评分。
+        未完成内容、可部署性、基础安全和文档一致性暂不计入安全评分。
       </p>
 
       {/* --- Findings --- */}
@@ -128,6 +137,7 @@ export function ScanResults({ scanResult }: ScanResultsProps) {
           [INCOMPLETE_DIMENSION, "未完成内容"],
           [DEPLOYABILITY_DIMENSION, "可部署性"],
           [BASIC_SECURITY_DIMENSION, "基础安全"],
+          [DOCUMENTATION_DIMENSION, "文档一致性"],
         ] as const).map(([value, label]) => (
           <button
             key={value}
