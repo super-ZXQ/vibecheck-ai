@@ -65,10 +65,30 @@ _REQUIREMENT_INCLUDE_RE = re.compile(
     re.IGNORECASE,
 )
 _DANGEROUS_COMMAND_RE = re.compile(r"[|;<>`]|\$\(|\$\{|%[^%]+%")
-_NODE_SHORTHAND_EXCLUSIONS = frozenset({
-    "add", "audit", "ci", "create", "dlx", "exec", "init", "install",
-    "remove", "run", "set", "update", "upgrade", "workspace",
-})
+_NODE_BUILTIN_COMMANDS = {
+    "yarn": frozenset({
+        "add", "audit", "autoclean", "bin", "cache", "config", "create",
+        "dlx", "exec", "global", "help", "import", "info", "init",
+        "install", "licenses", "link", "list", "login", "logout", "node",
+        "npm", "outdated", "owner", "pack", "patch", "plugin", "policies",
+        "publish", "remove", "run", "set", "stage", "tag", "team",
+        "unlink", "unplug", "up", "upgrade", "version", "why", "workspace",
+        "workspaces",
+    }),
+    "pnpm": frozenset({
+        "add", "audit", "bin", "config", "create", "deploy", "dlx", "env",
+        "exec", "fetch", "help", "import", "init", "install", "link",
+        "list", "login", "logout", "ls", "outdated", "pack", "patch",
+        "patch-commit", "prune", "publish", "rebuild", "remove", "root",
+        "run", "server", "setup", "store", "uninstall", "unlink", "update",
+        "why",
+    }),
+    "bun": frozenset({
+        "add", "build", "create", "help", "init", "install", "link",
+        "outdated", "pm", "publish", "remove", "repl", "run", "test",
+        "unlink", "update", "upgrade", "x",
+    }),
+}
 _MAX_REQUIREMENT_INCLUDE_DEPTH = 8
 _IGNORED_DOCUMENTED_PARTS = frozenset({
     ".git", ".next", ".venv", "venv", "node_modules", "dist", "build",
@@ -121,6 +141,7 @@ class _CommandReference:
     kind: str
     base_dir: str
     target: str
+    targets: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -241,21 +262,28 @@ def _safe_relative_path(base_dir: str, value: str) -> str | None:
         if part in {"", "."}:
             continue
         if part == "..":
-            return None
+            if not parts:
+                return None
+            parts.pop()
+            continue
         parts.append(part)
     normalized = "/".join(parts) or "."
     return mask_untrusted_text(normalized)
 
 
-def _parse_command(line: str, line_number: int) -> _CommandReference | None:
+def _parse_command(
+    line: str,
+    line_number: int,
+    initial_base_dir: str = ".",
+) -> _CommandReference | None:
     command = line.strip()
     command = re.sub(r"^(?:\$|>)\s+", "", command)
     if not command or _DANGEROUS_COMMAND_RE.search(command):
         return None
-    base_dir = "."
+    base_dir = initial_base_dir
     cd_match = re.match(r"^cd\s+([^\s]+)\s*&&\s*(.+)$", command, re.IGNORECASE)
     if cd_match:
-        normalized = _safe_relative_path(".", cd_match.group(1))
+        normalized = _safe_relative_path(base_dir, cd_match.group(1))
         if normalized is None:
             return None
         base_dir = normalized
@@ -282,9 +310,7 @@ def _parse_command(line: str, line_number: int) -> _CommandReference | None:
         if manager == "npm":
             if lowered not in {"restart", "start", "stop", "test"}:
                 return None
-        elif lowered in _NODE_SHORTHAND_EXCLUSIONS or (
-            manager == "bun" and lowered in {"test", "x"}
-        ):
+        elif lowered in _NODE_BUILTIN_COMMANDS[manager]:
             return None
         return _CommandReference(line_number, "node_script", base_dir, script)
 
@@ -321,18 +347,20 @@ def _parse_command(line: str, line_number: int) -> _CommandReference | None:
 
     compose = re.match(r"^(?:docker\s+compose|docker-compose)\b(.*)$", command, re.IGNORECASE)
     if compose:
-        file_option = re.search(
+        file_options = re.finditer(
             r"(?:^|\s)(?:-f|--file)(?:\s+|=)([^\s]+)",
             compose.group(1),
             re.IGNORECASE,
         )
-        target = ""
-        if file_option:
+        targets: list[str] = []
+        for file_option in file_options:
             normalized = _safe_relative_path(base_dir, file_option.group(1))
             if normalized is None:
                 return None
-            target = normalized
-        return _CommandReference(line_number, "compose", base_dir, target)
+            targets.append(normalized)
+        return _CommandReference(
+            line_number, "compose", base_dir, "", tuple(targets)
+        )
 
     make = re.match(r"^make\s+([A-Za-z0-9_.-]+)(?:\s|$)", command)
     if make:
@@ -384,11 +412,13 @@ def _command_references(lines: list[str]) -> tuple[_CommandReference, ...]:
         in_fence = False
         pending_parts: list[str] = []
         pending_line = 0
+        working_directory: str | None = "."
         for index in range(start, end):
             line = lines[index]
             if _FENCE_RE.match(line):
                 in_fence = not in_fence
                 pending_parts.clear()
+                working_directory = "."
                 continue
             candidate: str | None = None
             candidate_line = index + 1
@@ -413,7 +443,25 @@ def _command_references(lines: list[str]) -> tuple[_CommandReference, ...]:
                 inline = _INLINE_COMMAND_RE.match(line)
                 candidate = inline.group(1) if inline else None
             if candidate:
-                parsed = _parse_command(candidate, candidate_line)
+                normalized_candidate = re.sub(
+                    r"^(?:\$|>)\s+", "", candidate.strip()
+                )
+                directory_change = re.fullmatch(
+                    r"cd\s+([^\s]+)", normalized_candidate, re.IGNORECASE
+                )
+                if in_fence and directory_change:
+                    if working_directory is not None:
+                        working_directory = _safe_relative_path(
+                            working_directory, directory_change.group(1)
+                        )
+                    continue
+                if in_fence and working_directory is None:
+                    continue
+                parsed = _parse_command(
+                    candidate,
+                    candidate_line,
+                    working_directory if in_fence else ".",
+                )
                 if parsed is not None:
                     references.append(parsed)
     return tuple(references)
@@ -512,7 +560,7 @@ class DocumentationConsistencyProbe(RepositoryProbe):
         self.requirement_packages: dict[str, set[str]] = {}
         self.requirement_includes: dict[str, set[str]] = {}
 
-    def observe_file(self, file_path: str, lines: list[str]) -> None:
+    def observe_path(self, file_path: str) -> None:
         path = PurePosixPath(file_path)
         normalized = path.as_posix()
         self.paths.add(normalized)
@@ -522,6 +570,10 @@ class DocumentationConsistencyProbe(RepositoryProbe):
             value = parent.as_posix()
             if value != ".":
                 self.directories.add(value)
+
+    def observe_file(self, file_path: str, lines: list[str]) -> None:
+        path = PurePosixPath(file_path)
+        normalized = path.as_posix()
 
         name = path.name.lower()
         directory = path.parent.as_posix()
@@ -698,6 +750,8 @@ class DocumentationConsistencyProbe(RepositoryProbe):
                 joined(f"{module}/__main__.py")
             )
         if reference.kind == "compose":
+            if reference.targets:
+                return all(rooted(target) in self.paths for target in reference.targets)
             if reference.target:
                 return rooted(reference.target) in self.paths
             return any(joined(name) in self.paths for name in _COMPOSE_NAMES)

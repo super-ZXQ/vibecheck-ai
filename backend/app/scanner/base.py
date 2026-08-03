@@ -205,6 +205,9 @@ class RepositoryProbe(ABC):
     bounded derived state and must never expose raw repository content.
     """
 
+    def observe_path(self, file_path: str) -> None:
+        """Observe one validated, desensitized repository file path."""
+
     def observe_file(self, file_path: str, lines: list[str]) -> None:
         """Observe one validated, decoded repository file."""
 

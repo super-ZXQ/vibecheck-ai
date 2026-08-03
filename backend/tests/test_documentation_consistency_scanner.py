@@ -212,6 +212,17 @@ def test_node_script_and_working_directory_are_validated(tmp_path):
     assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
 
 
+def test_multiline_working_directory_is_applied_to_following_commands(tmp_path):
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Quick Start\n"
+            "```sh\ncd frontend\nnpm install\nnpm run dev\n```\n"
+        ),
+        "frontend/package.json": '{"scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
 @pytest.mark.parametrize(
     "command",
     (
@@ -273,6 +284,29 @@ def test_package_manager_shorthand_validates_scripts(tmp_path, command, script):
     assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
 
 
+@pytest.mark.parametrize(
+    "command",
+    (
+        "yarn config set npmRegistryServer https://registry.npmjs.org",
+        "yarn cache clean",
+        "pnpm list",
+        "pnpm store prune",
+        "bun pm cache",
+    ),
+)
+def test_package_manager_builtin_commands_are_not_treated_as_scripts(
+    tmp_path, command,
+):
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Installation\n"
+            f"```sh\n{command}\n```\n"
+        ),
+        "package.json": '{"scripts":{}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
 def test_multiline_compose_command_resolves_explicit_file(tmp_path):
     _write_repo(tmp_path, {
         "README.md": (
@@ -302,6 +336,18 @@ def test_compose_file_option_forms_resolve_explicit_file(tmp_path, file_option):
         "deploy/production.yml": "services: {}\n",
     })
     assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_compose_validates_every_explicit_file(tmp_path):
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\ndocker compose -f deploy/base.yml "
+            "--file deploy/missing.yml up\n```\n"
+        ),
+        "deploy/base.yml": "services: {}\n",
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -436,11 +482,36 @@ def test_standard_tree_output_infers_directory_from_child_depth(tmp_path):
     assert findings[0].line_start is not None
 
 
+def test_binary_tree_paths_are_observed_without_reading_content(tmp_path):
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Project Structure\n"
+            "```text\n"
+            "└── assets/\n"
+            "    └── logo.png\n"
+            "```\n"
+        ),
+    })
+    logo = tmp_path / "assets" / "logo.png"
+    logo.parent.mkdir(parents=True, exist_ok=True)
+    logo.write_bytes(b"\x89PNG\r\n\x1a\n\x00binary")
+    assert "C004_PROJECT_STRUCTURE_MISMATCH" not in _rule_ids(tmp_path)
+
+
 def test_referenced_requirements_file_confirms_documented_technology(tmp_path):
     _write_repo(tmp_path, {
         "README.md": f"# App\n\n{_long_intro()}\n## Tech Stack\n- FastAPI\n",
         "requirements.txt": "-r requirements/prod.txt\n",
         "requirements/prod.txt": "fastapi==0.116.1\n",
+    })
+    assert "C002_TECH_STACK_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_safe_parent_requirements_reference_stays_inside_repository(tmp_path):
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Tech Stack\n- FastAPI\n",
+        "service/requirements.txt": "-r ../requirements/common.txt\n",
+        "requirements/common.txt": "fastapi==0.116.1\n",
     })
     assert "C002_TECH_STACK_MISMATCH" not in _rule_ids(tmp_path)
 
