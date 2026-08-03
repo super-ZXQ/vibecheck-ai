@@ -1997,3 +1997,292 @@ def test_go_v_boolean_value_validation(tmp_path, command, should_report):
         "go.mod": "module app\n",
     })
     assert ("C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)) == should_report
+
+
+# ---- Round 8 Issue 1: --if-present must not ignore missing/corrupt manifest ----
+
+def test_npm_if_present_no_package_json_reports(tmp_path):
+    """No package.json at all → C003 even with --if-present."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev --if-present\n```\n"
+        ),
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_npm_if_present_corrupt_package_json_reports(tmp_path):
+    """Corrupt package.json → C003 even with --if-present."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev --if-present\n```\n"
+        ),
+        "package.json": "{bad",
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_npm_if_present_valid_manifest_missing_script_ok(tmp_path):
+    """Valid package.json but no dev script → no C003."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev --if-present\n```\n"
+        ),
+        "package.json": '{"scripts":{}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_npm_if_present_true_eq_form(tmp_path):
+    """--if-present=true → suppress missing script."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev --if-present=true\n```\n"
+        ),
+        "package.json": '{"scripts":{}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_npm_if_present_false_eq_form_reports(tmp_path):
+    """--if-present=false → do NOT suppress missing script."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev --if-present=false\n```\n"
+        ),
+        "package.json": '{"scripts":{}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_npm_if_present_true_prefix_form(tmp_path):
+    """npm --if-present=true run dev → suppress missing script."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm --if-present=true run dev\n```\n"
+        ),
+        "package.json": '{"scripts":{}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_npm_if_present_false_prefix_form_reports(tmp_path):
+    """npm --if-present=false run dev → do NOT suppress."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm --if-present=false run dev\n```\n"
+        ),
+        "package.json": '{"scripts":{}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_npm_if_present_after_separator_reports(tmp_path):
+    """--if-present after -- is a script argument → C003."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev -- --if-present=true\n```\n"
+        ),
+        "package.json": '{"scripts":{}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_npm_if_present_lifecycle_corrupt_manifest_reports(tmp_path):
+    """Corrupt package.json with lifecycle command + --if-present → C003."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm start --if-present\n```\n"
+        ),
+        "package.json": "{bad",
+        "server.js": "console.log('ok')\n",
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_npm_if_present_workspace_corrupt_pkg_reports(tmp_path):
+    """Workspace with corrupt package.json + --if-present → C003."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm start -w packages/web --if-present\n```\n"
+        ),
+        "package.json": _ROOT_WORKSPACES_PKG,
+        "packages/web/package.json": "{bad",
+        "packages/web/server.js": "console.log('ok')\n",
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+# ---- Round 8 Issue 2: npm workspace name resolution refactor ----
+
+def test_npm_workspace_glob_double_star(tmp_path):
+    """workspaces=["packages/**"] matches nested dirs."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev -w web\n```\n"
+        ),
+        "package.json": '{"workspaces":["packages/**"]}',
+        "packages/group/web/package.json": '{"name":"web","scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_npm_workspace_glob_negation_excludes(tmp_path):
+    """workspaces=["packages/*","!packages/excluded"] → excluded not a workspace."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev -w excluded\n```\n"
+        ),
+        "package.json": '{"workspaces":["packages/*","!packages/excluded"]}',
+        "packages/excluded/package.json": '{"name":"excluded","scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_npm_workspace_glob_negation_includes_others(tmp_path):
+    """Negation doesn't affect non-excluded packages."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev -w web\n```\n"
+        ),
+        "package.json": '{"workspaces":["packages/*","!packages/excluded"]}',
+        "packages/web/package.json": '{"name":"web","scripts":{"dev":"vite"}}',
+        "packages/excluded/package.json": '{"name":"excluded","scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_npm_workspace_name_prefers_declared_over_vendor(tmp_path):
+    """Same-named package in vendor must not override declared workspace."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev -w web\n```\n"
+        ),
+        "package.json": '{"workspaces":["packages/*"]}',
+        "packages/web/package.json": '{"name":"web","scripts":{"dev":"vite"}}',
+        "vendor/web/package.json": '{"name":"web","scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_npm_workspace_name_not_declared_reports(tmp_path):
+    """Package exists but not in root workspaces → C003."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev -w web\n```\n"
+        ),
+        "package.json": '{"workspaces":["packages/*"]}',
+        "vendor/web/package.json": '{"name":"web","scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_npm_workspace_glob_nested_pattern(tmp_path):
+    """apps/*/packages/* pattern."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev -w shared\n```\n"
+        ),
+        "package.json": '{"workspaces":["apps/*/packages/*"]}',
+        "apps/web/packages/shared/package.json": '{"name":"shared","scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_npm_workspace_corrupt_pkg_reports(tmp_path):
+    """Workspace package.json exists but corrupt → C003."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev -w web\n```\n"
+        ),
+        "package.json": _ROOT_WORKSPACES_PKG,
+        "packages/web/package.json": "{bad",
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_npm_workspace_object_form_glob(tmp_path):
+    """Object form workspaces with glob pattern."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev -w web\n```\n"
+        ),
+        "package.json": '{"workspaces":{"packages":["packages/**"]}}',
+        "packages/group/web/package.json": '{"name":"web","scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+# ---- Round 8 Issue 3: Go parameters split by subcommand ----
+
+@pytest.mark.parametrize(
+    ("command", "should_report"),
+    (
+        ("go build -v=1 ./...", False),
+        ("go build -race=True ./...", False),
+        ("go build -race=FALSE ./...", False),
+        ("go build -buildvcs=1 ./...", False),
+        ("go build -buildvcs=auto ./...", False),
+        ("go build -race=maybe ./...", True),
+    ),
+)
+def test_go_extended_boolean_values(tmp_path, command, should_report):
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+        "go.mod": "module app\n",
+    })
+    assert ("C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)) == should_report
+
+
+@pytest.mark.parametrize(
+    ("command", "should_report"),
+    (
+        ("go build -exec wrapper ./...", True),
+        ("go run -o bin .", True),
+        ("go build -u ./...", True),
+        ("go build -d ./...", True),
+        ("go build -fix ./...", True),
+        ("go build -json ./...", True),
+    ),
+)
+def test_go_wrong_subcommand_flags_report(tmp_path, command, should_report):
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+        "go.mod": "module app\n",
+    })
+    assert ("C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)) == should_report
+
+
+@pytest.mark.parametrize(
+    ("command", "files", "should_report"),
+    (
+        ("go run -exec wrapper ./cmd/app", {"cmd/app/main.go": "package main\n"}, False),
+        ("go build -o bin ./...", {"go.mod": "module app\n"}, False),
+    ),
+)
+def test_go_correct_subcommand_flags_valid(
+    tmp_path, command, files, should_report,
+):
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+        **files,
+    })
+    assert ("C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)) == should_report

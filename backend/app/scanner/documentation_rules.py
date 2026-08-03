@@ -131,23 +131,76 @@ _IGNORED_DOCUMENTED_PARTS = frozenset({
 _NPM_LIFECYCLE_COMMANDS = frozenset({"start", "stop", "restart", "test"})
 _NPM_RUN_KEYWORDS = frozenset({"run", "run-script"})
 _COMPLEX_SELECTOR_CHARS = frozenset("*!?[]{}")
-_GO_VALUE_OPTIONS = frozenset({
+# ---- Go flag sets (split by subcommand) ----
+# Global flags that can appear before the subcommand.
+_GO_GLOBAL_VALUE_OPTIONS = frozenset({"-C"})
+
+# Build-specific boolean flags.
+_GO_BUILD_BOOLEAN_OPTIONS = frozenset({
+    "-v", "-race", "-cover", "-a", "-n", "-x", "-work",
+    "-modcacherw", "-trimpath", "-buildvcs", "-linkshared",
+    "-msan", "-asan",
+})
+# Build-specific value-taking flags.
+_GO_BUILD_VALUE_OPTIONS = frozenset({
     "-o", "-ldflags", "-tags", "-mod", "-compiler",
     "-gccgoflags", "-gcflags", "-asmflags",
-    "-p", "-exec", "-covermode", "-coverpkg", "-buildmode",
+    "-p", "-covermode", "-coverpkg", "-buildmode",
     "-installsuffix", "-modfile", "-overlay", "-pkgdir", "-toolexec",
     "-pgo",
 })
-_GO_BOOLEAN_OPTIONS = frozenset({
+# Run-specific boolean flags.
+_GO_RUN_BOOLEAN_OPTIONS = frozenset({
     "-v", "-race", "-cover", "-a", "-n", "-x", "-work",
     "-modcacherw", "-trimpath", "-buildvcs", "-linkshared",
-    "-msan", "-asan", "-json", "-e", "-fix", "-u", "-d",
+    "-msan", "-asan",
 })
-_GO_BOOLEAN_VALID_VALUES = frozenset({"true", "false"})
-_GO_BUILDVCS_VALID_VALUES = frozenset({"true", "false", "auto"})
-_GO_GLOBAL_VALUE_OPTIONS = frozenset({"-C"})
+# Run-specific value-taking flags.
+_GO_RUN_VALUE_OPTIONS = frozenset({
+    "-ldflags", "-tags", "-mod", "-compiler",
+    "-gccgoflags", "-gcflags", "-asmflags",
+    "-exec", "-p", "-covermode", "-coverpkg",
+    "-installsuffix", "-modfile", "-overlay", "-pkgdir", "-toolexec",
+    "-pgo",
+})
+# Known Go flags that are NOT valid for build/run subcommands.
+_GO_UNSUPPORTED_KNOWN_OPTIONS = frozenset({"-u", "-d", "-fix", "-json", "-e"})
+# All known Go boolean flags (for detecting "known but wrong subcommand").
+_GO_ALL_KNOWN_BOOLEAN = (
+    _GO_BUILD_BOOLEAN_OPTIONS
+    | _GO_RUN_BOOLEAN_OPTIONS
+    | _GO_UNSUPPORTED_KNOWN_OPTIONS
+)
+# All known Go value-taking flags.
+_GO_ALL_KNOWN_VALUE = (
+    _GO_BUILD_VALUE_OPTIONS
+    | _GO_RUN_VALUE_OPTIONS
+    | _GO_GLOBAL_VALUE_OPTIONS
+)
+
+# Go boolean flag valid values (Go cmd accepts these for -flag=value).
+_GO_BOOLEAN_VALID_VALUES = frozenset({
+    "1", "0", "t", "f", "T", "F",
+    "true", "false", "True", "False", "TRUE", "FALSE",
+})
+_GO_BUILDVCS_VALID_VALUES = frozenset({
+    "1", "0", "t", "f", "T", "F",
+    "true", "false", "True", "False", "TRUE", "FALSE",
+    "auto",
+})
 _SKIP_COMMAND = object()
 _NPM_IF_PRESENT = "--if-present"
+
+# ---- P0-13 Support Boundary Freeze ----
+# npm: run/run-script, start/stop/restart/test, --if-present[=true|false],
+#   single/multiple --workspace/-w, root workspaces array/object form,
+#   declared workspace package name or directory selection.
+# pnpm: single simple name filter, single ./directory filter,
+#   complex or multiple filters → SKIP_UNSUPPORTED.
+# Go: local relative paths, .go files, ... pattern,
+#   import/module path (no local check), declared build/run param sets,
+#   unknown params → SKIP_UNSUPPORTED.
+# -----------------------------------------------------------------
 
 _TECH_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     ("react", "node", re.compile(r"(?<![\w.-])React(?![\w.-])", re.IGNORECASE)),
@@ -200,7 +253,9 @@ class _CommandReference:
     manager: str = ""
     selector_type: str = ""
     workspaces: tuple[str, ...] = ()
-    if_present: bool = False
+    # None: --if-present not specified; True: allow missing script;
+    # False: --if-present=false, do NOT allow missing script.
+    if_present: bool | None = None
     invalid: bool = False
 
 
@@ -409,6 +464,62 @@ def _is_go_import_path(token: str) -> bool:
     return True
 
 
+def _npm_glob_to_regex(pattern: str) -> str:
+    """Convert an npm workspace glob pattern to a regex string.
+
+    ``*`` matches within a single path segment (``[^/]*``).
+    ``**`` matches across path separators (``.*``).
+    """
+    result: list[str] = []
+    i = 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "*":
+            if i + 1 < len(pattern) and pattern[i + 1] == "*":
+                result.append(".*")
+                i += 2
+            else:
+                result.append("[^/]*")
+                i += 1
+        elif ch in ".+(){}|^$\\":
+            result.append("\\")
+            result.append(ch)
+            i += 1
+        else:
+            result.append(ch)
+            i += 1
+    return "^" + "".join(result) + "$"
+
+
+_NPM_GLOB_CACHE: dict[str, "re.Pattern[str]"] = {}
+
+
+def _npm_glob_match(path: str, pattern: str) -> bool:
+    """Match a relative directory path against an npm workspace glob."""
+    if pattern not in _NPM_GLOB_CACHE:
+        _NPM_GLOB_CACHE[pattern] = re.compile(_npm_glob_to_regex(pattern))
+    return bool(_NPM_GLOB_CACHE[pattern].fullmatch(path))
+
+
+def _npm_workspace_glob_match(directory: str, patterns: list[str]) -> bool:
+    """Check if *directory* matches npm workspace *patterns*.
+
+    Supports positive patterns and negation (``!`` prefix).  A directory
+    must match at least one positive pattern and must not match any
+    negative pattern.
+    """
+    positive: list[str] = []
+    negative: list[str] = []
+    for pattern in patterns:
+        if pattern.startswith("!"):
+            negative.append(pattern[1:])
+        else:
+            positive.append(pattern)
+    if not any(_npm_glob_match(directory, p) for p in positive):
+        return False
+    return not any(_npm_glob_match(directory, p) for p in negative)
+
+
 def _parse_workspace_command(
     command: str,
     line_number: int,
@@ -436,7 +547,7 @@ def _parse_workspace_command(
     workspaces: list[str] = []
     selector_type = ""
     remainder: list[str] = []
-    if_present = False
+    if_present: bool | None = None
     filter_count = 0
     index = 1
 
@@ -452,9 +563,21 @@ def _parse_workspace_command(
         if manager == "npm" and token in {"--workspaces", "--no-workspaces"}:
             return _SKIP_COMMAND
 
-        # --if-present: npm flag that suppresses missing-script errors
-        if manager == "npm" and token == _NPM_IF_PRESENT:
-            if_present = True
+        # --if-present: npm flag (bare or =true/=false)
+        if manager == "npm" and (
+            token == _NPM_IF_PRESENT
+            or token.startswith(_NPM_IF_PRESENT + "=")
+        ):
+            if "=" in token:
+                value = token.split("=", 1)[1].lower()
+                if value in ("true", "1", "t"):
+                    if_present = True
+                elif value in ("false", "0", "f"):
+                    if_present = False
+                else:
+                    return _SKIP_COMMAND
+            else:
+                if_present = True
             index += 1
             continue
 
@@ -536,7 +659,7 @@ def _parse_workspace_command(
     if manager == "pnpm" and filter_count > 1:
         return _SKIP_COMMAND
 
-    if not workspaces and not if_present:
+    if not workspaces and if_present is None:
         return None
 
     # strip optional "run"/"run-script" and check for built-in commands
@@ -572,7 +695,7 @@ def _parse_workspace_command(
             "npm_lifecycle" if is_lifecycle else "node_script",
             base_dir, command_name,
             manager=manager,
-            if_present=True,
+            if_present=if_present,
         )
 
     # Create reference based on selector type
@@ -745,6 +868,16 @@ def _parse_go_command(
     go_file_mode = False
     invalid = False
 
+    # Select subcommand-specific flag sets.
+    sub_boolean = (
+        _GO_BUILD_BOOLEAN_OPTIONS if subcommand == "build"
+        else _GO_RUN_BOOLEAN_OPTIONS
+    )
+    sub_value = (
+        _GO_BUILD_VALUE_OPTIONS if subcommand == "build"
+        else _GO_RUN_VALUE_OPTIONS
+    )
+
     while index < len(tokens):
         token = tokens[index]
         # For "go run", after finding the first target:
@@ -763,10 +896,10 @@ def _parse_go_command(
             # Handle -flag=value form
             if "=" in token:
                 flag, value = token.split("=", 1)
-                if flag in _GO_VALUE_OPTIONS:
+                if flag in sub_value:
                     index += 1
                     continue
-                if flag in _GO_BOOLEAN_OPTIONS:
+                if flag in sub_boolean:
                     valid_values = (
                         _GO_BUILDVCS_VALID_VALUES
                         if flag == "-buildvcs"
@@ -776,15 +909,31 @@ def _parse_go_command(
                         invalid = True
                     index += 1
                     continue
-                # Unknown flag with =: conservative skip
+                # Known Go flag but not valid for this subcommand → INVALID
+                if (
+                    flag in _GO_ALL_KNOWN_BOOLEAN
+                    or flag in _GO_ALL_KNOWN_VALUE
+                ):
+                    invalid = True
+                    index += 1
+                    continue
+                # Completely unknown flag: conservative skip
                 return None
             # Handle -flag (boolean) form
-            if token in _GO_BOOLEAN_OPTIONS:
+            if token in sub_boolean:
                 index += 1
                 continue
             # Handle -flag value (value option) form
-            if token in _GO_VALUE_OPTIONS and index + 1 < len(tokens):
+            if token in sub_value and index + 1 < len(tokens):
                 index += 2
+                continue
+            # Known Go flag but not valid for this subcommand → INVALID
+            if (
+                token in _GO_ALL_KNOWN_BOOLEAN
+                or token in _GO_ALL_KNOWN_VALUE
+            ):
+                invalid = True
+                index += 1
                 continue
             # Unknown flag: conservative skip
             return None
@@ -1180,7 +1329,10 @@ class DocumentationConsistencyProbe(RepositoryProbe):
         self.valid_node_manifest = False
         self.valid_python_manifest = False
         self.node_scripts: dict[str, set[str]] = {}
-        self.node_package_names: dict[str, str] = {}
+        # package name → list of directories (preserves insertion order)
+        self.node_package_names: dict[str, list[str]] = {}
+        # directories where package.json parsed successfully to a dict
+        self.valid_node_manifest_dirs: set[str] = set()
         self.package_workspaces: dict[str, list[str]] = {}
         self.make_targets: dict[str, set[str]] = {}
         self.requirement_roots: set[str] = set()
@@ -1230,9 +1382,12 @@ class DocumentationConsistencyProbe(RepositoryProbe):
         if not isinstance(data, dict):
             return
         self.valid_node_manifest = True
+        self.valid_node_manifest_dirs.add(directory)
         package_name = data.get("name")
         if isinstance(package_name, str) and package_name.strip():
-            self.node_package_names[package_name] = directory
+            dirs = self.node_package_names.setdefault(package_name, [])
+            if directory not in dirs:
+                dirs.append(directory)
         for key in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
             dependencies = data.get(key)
             if isinstance(dependencies, dict):
@@ -1394,7 +1549,12 @@ class DocumentationConsistencyProbe(RepositoryProbe):
     def _npm_workspace_is_declared(
         self, directory: str, root_prefix: str,
     ) -> bool:
-        """Check that directory is a declared npm workspace with package.json."""
+        """Check that *directory* is a declared npm workspace with valid package.json.
+
+        Uses proper npm workspace glob matching (``*`` for single segment,
+        ``**`` for recursive, ``!`` for negation) instead of
+        ``PurePosixPath.match()``.
+        """
         root_pkg_dir = root_prefix or "."
         patterns = self.package_workspaces.get(root_pkg_dir)
         if not patterns:
@@ -1402,11 +1562,36 @@ class DocumentationConsistencyProbe(RepositoryProbe):
         rel_dir = directory
         if root_prefix and directory.startswith(root_prefix + "/"):
             rel_dir = directory[len(root_prefix) + 1:]
-        for pattern in patterns:
-            if PurePosixPath(rel_dir).match(pattern):
-                pkg_json = f"{directory}/package.json"
-                return pkg_json in self.paths
-        return False
+        if not _npm_workspace_glob_match(rel_dir, patterns):
+            return False
+        # Workspace must have a valid (parseable) package.json
+        pkg_json = f"{directory}/package.json"
+        if pkg_json not in self.paths:
+            return False
+        return directory in self.valid_node_manifest_dirs
+
+    def _resolve_npm_workspace_by_name(
+        self, name: str, root_prefix: str,
+    ) -> str | None:
+        """Resolve an npm workspace package name to its directory.
+
+        1. Read root package.json workspaces patterns.
+        2. From all valid package manifests, filter those matching patterns.
+        3. Match by package name among the filtered candidates.
+        """
+        root_pkg_dir = root_prefix or "."
+        patterns = self.package_workspaces.get(root_pkg_dir)
+        if not patterns:
+            return None
+        candidate_dirs = self.node_package_names.get(name, [])
+        for directory in candidate_dirs:
+            rel_dir = directory
+            if root_prefix and directory.startswith(root_prefix + "/"):
+                rel_dir = directory[len(root_prefix) + 1:]
+            if _npm_workspace_glob_match(rel_dir, patterns):
+                if directory in self.valid_node_manifest_dirs:
+                    return directory
+        return None
 
     def _command_is_valid(
         self, reference: _CommandReference, root_prefix: str
@@ -1420,6 +1605,11 @@ class DocumentationConsistencyProbe(RepositoryProbe):
         def rooted(name: str) -> str:
             return f"{root_prefix}/{name}" if root_prefix else name
 
+        # --if-present only suppresses missing-script errors.
+        # It does NOT suppress: missing package.json, corrupt package.json,
+        # missing workspace, undeclared workspace.
+        if_present_allows_missing = reference.if_present is True
+
         if reference.kind == "node_workspace_name":
             all_workspaces = reference.workspaces or (
                 (reference.workspace,) if reference.workspace else ()
@@ -1427,13 +1617,31 @@ class DocumentationConsistencyProbe(RepositoryProbe):
             if not all_workspaces:
                 return False
             for ws in all_workspaces:
-                directory = self.node_package_names.get(ws)
-                if directory is not None:
-                    if reference.manager == "npm":
-                        if not self._npm_workspace_is_declared(directory, root_prefix):
+                if reference.manager == "npm":
+                    directory = self._resolve_npm_workspace_by_name(
+                        ws, root_prefix,
+                    )
+                    if directory is None:
+                        # Try as directory path
+                        normalized = _safe_relative_path(reference.base_dir, ws)
+                        if normalized is None:
                             return False
+                        rel = normalized if normalized != "." else ""
+                        dir_path = "/".join(p for p in (root_prefix, rel) if p) or "."
+                        if not self._npm_workspace_is_declared(dir_path, root_prefix):
+                            return False
+                        directory = dir_path
                     if reference.target not in self.node_scripts.get(directory, set()):
-                        if reference.if_present:
+                        if if_present_allows_missing:
+                            continue
+                        return False
+                    continue
+                # Non-npm managers: use legacy name→dir map
+                dirs = self.node_package_names.get(ws, [])
+                if dirs:
+                    directory = dirs[0]
+                    if reference.target not in self.node_scripts.get(directory, set()):
+                        if if_present_allows_missing:
                             continue
                         return False
                     continue
@@ -1448,11 +1656,8 @@ class DocumentationConsistencyProbe(RepositoryProbe):
                         return False
                     rel = normalized if normalized != "." else ""
                     dir_path = "/".join(p for p in (root_prefix, rel) if p) or "."
-                    if reference.manager == "npm":
-                        if not self._npm_workspace_is_declared(dir_path, root_prefix):
-                            return False
                     if reference.target not in self.node_scripts.get(dir_path, set()):
-                        if reference.if_present:
+                        if if_present_allows_missing:
                             continue
                         return False
                     continue
@@ -1465,11 +1670,26 @@ class DocumentationConsistencyProbe(RepositoryProbe):
             if not all_workspaces:
                 return False
             for ws in all_workspaces:
-                directory = self.node_package_names.get(ws)
-                if directory is None:
-                    if reference.selector_type == "name":
+                if reference.manager == "npm":
+                    directory = self._resolve_npm_workspace_by_name(
+                        ws, root_prefix,
+                    )
+                    if directory is None:
+                        # Try as directory path
+                        normalized = _safe_relative_path(reference.base_dir, ws)
+                        if normalized is None:
+                            return False
+                        rel = normalized if normalized != "." else ""
+                        directory = "/".join(p for p in (root_prefix, rel) if p) or "."
+                        if not self._npm_workspace_is_declared(directory, root_prefix):
+                            return False
+                else:
+                    dirs = self.node_package_names.get(ws, [])
+                    if dirs:
+                        directory = dirs[0]
+                    elif reference.selector_type == "name":
                         return False
-                    if reference.selector_type == "npm_workspace":
+                    elif reference.selector_type == "npm_workspace":
                         if ws.startswith("@"):
                             return False
                         normalized = _safe_relative_path(reference.base_dir, ws)
@@ -1479,32 +1699,41 @@ class DocumentationConsistencyProbe(RepositoryProbe):
                         directory = "/".join(p for p in (root_prefix, rel) if p) or "."
                     else:
                         return False
-                if reference.manager == "npm":
-                    if not self._npm_workspace_is_declared(directory, root_prefix):
-                        return False
                 scripts = self.node_scripts.get(directory, set())
                 pkg_path = directory
                 if not self._npm_lifecycle_is_valid(
                     reference.target, scripts, pkg_path,
                 ):
-                    if reference.if_present:
+                    if if_present_allows_missing:
                         continue
                     return False
             return True
         if reference.kind == "node_script":
             manifest_dir = base or "."
+            # Verify package.json exists and is valid before if_present
+            if joined("package.json") not in self.paths:
+                return False
+            if manifest_dir not in self.valid_node_manifest_dirs:
+                return False
             if reference.target in self.node_scripts.get(manifest_dir, set()):
                 return True
-            return reference.if_present
+            return if_present_allows_missing
         if reference.kind == "npm_lifecycle":
-            scripts = self.node_scripts.get(base or ".", set())
+            manifest_dir = base or "."
+            # Step 1: package.json must exist
             if joined("package.json") not in self.paths:
-                return reference.if_present
+                return False
+            # Step 2: package.json must be valid
+            if manifest_dir not in self.valid_node_manifest_dirs:
+                return False
+            # Step 3: validate scripts/server.js
+            scripts = self.node_scripts.get(manifest_dir, set())
             if self._npm_lifecycle_is_valid(
-                reference.target, scripts, base or ".",
+                reference.target, scripts, manifest_dir,
             ):
                 return True
-            return reference.if_present
+            # Step 4: apply --if-present (only suppresses missing script)
+            return if_present_allows_missing
         if reference.kind == "path":
             return self._path_exists(rooted(reference.target))
         if reference.kind == "python_runnable_module":
