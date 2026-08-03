@@ -382,16 +382,34 @@ def test_multiple_npm_workspaces_order_independence(tmp_path):
     assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
 
 
-def test_npm_workspaces_flag_is_skipped(tmp_path):
+def test_npm_workspaces_flag_is_skipped_no_root_script(tmp_path):
+    """--workspaces must conservatively skip; no root scripts.dev to prove no fallback."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev --workspaces\n```\n"
+        ),
+        "package.json": '{"scripts":{}}',
+        "packages/web/package.json": '{"name":"web","scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_npm_workspaces_flag_is_skipped_even_with_root_script(tmp_path):
+    """--workspaces must skip even when root has scripts.dev (no false positive on workspace)."""
     _write_repo(tmp_path, {
         "README.md": (
             f"# App\n\n{_long_intro()}\n## Running\n"
             "```sh\nnpm run dev --workspaces\n```\n"
         ),
         "package.json": '{"scripts":{"dev":"vite"}}',
+        "packages/web/package.json": '{"name":"web","scripts":{}}',
     })
     assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
 
+
+def test_cd_and_npm_run_missing_reports_c003(tmp_path):
+    """Separate test: cd into directory and run missing script."""
     _write_repo(tmp_path, {
         "README.md": (
             f"# App\n\n{_long_intro()}\n## Quick Start\n"
@@ -399,6 +417,18 @@ def test_npm_workspaces_flag_is_skipped(tmp_path):
         ),
     })
     assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_npm_no_workspaces_flag_is_skipped(tmp_path):
+    """--no-workspaces must also conservatively skip."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev --no-workspaces\n```\n"
+        ),
+        "package.json": '{"scripts":{}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
 
 
 def test_multiline_working_directory_is_applied_to_following_commands(tmp_path):
@@ -1227,3 +1257,149 @@ def test_streamlit_remote_url_is_skipped(tmp_path, command):
         "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
     })
     assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+# ---- Issue 2: workspace npm lifecycle supports default server.js ----
+
+def test_workspace_npm_start_accepts_default_server_js(tmp_path):
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm start --workspace web\n```\n"
+        ),
+        "packages/web/package.json": '{"name":"web","version":"1.0.0"}',
+        "packages/web/server.js": "console.info('ok')\n",
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_workspace_npm_restart_accepts_default_server_js(tmp_path):
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm restart --workspace web\n```\n"
+        ),
+        "packages/web/package.json": '{"name":"web","version":"1.0.0"}',
+        "packages/web/server.js": "console.info('ok')\n",
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_workspace_npm_start_missing_script_and_server_js_reports_c003(tmp_path):
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm start --workspace web\n```\n"
+        ),
+        "packages/web/package.json": '{"name":"web","version":"1.0.0"}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_workspace_npm_restart_missing_script_and_server_js_reports_c003(tmp_path):
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm restart --workspace web\n```\n"
+        ),
+        "packages/web/package.json": '{"name":"web","version":"1.0.0"}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_workspace_npm_start_one_fails_in_multiple_workspaces(tmp_path):
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm start --workspace web --workspace api\n```\n"
+        ),
+        "packages/web/package.json": '{"name":"web","scripts":{"start":"node app.js"}}',
+        "packages/api/package.json": '{"name":"api","version":"1.0.0"}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+# ---- Issue 3: Go extended value options and -C global flag ----
+
+@pytest.mark.parametrize(
+    ("command", "files", "should_report"),
+    (
+        ("go build -p 4 ./...", {"go.mod": "module app\n"}, False),
+        ("go build -p 4 ./...", {}, True),
+        ("go run -exec wrapper ./cmd/app", {"cmd/app/main.go": "package main\n"}, False),
+        ("go run -exec wrapper ./cmd/missing", {}, True),
+        ("go build -coverpkg ./... ./cmd/app", {"go.mod": "module app\n", "cmd/app/main.go": "package main\n"}, False),
+    ),
+)
+def test_go_extended_value_options(tmp_path, command, files, should_report):
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+        **files,
+    })
+    assert ("C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)) is should_report
+
+
+@pytest.mark.parametrize(
+    ("command", "files", "should_report"),
+    (
+        ("go -C service build ./...", {"service/go.mod": "module app\n"}, False),
+        ("go -C service build ./...", {}, True),
+    ),
+)
+def test_go_global_c_flag_changes_directory(tmp_path, command, files, should_report):
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+        **files,
+    })
+    assert ("C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)) is should_report
+
+
+# ---- Issue 4: go run validates multiple .go files ----
+
+@pytest.mark.parametrize(
+    ("command", "files", "should_report"),
+    (
+        ("go run main.go helper.go", {"main.go": "package main\n", "helper.go": "package main\n"}, False),
+        ("go run main.go missing.go", {"main.go": "package main\n"}, True),
+        ("go run main.go helper.go arg1", {"main.go": "package main\n", "helper.go": "package main\n"}, False),
+        ("go run ./cmd/app arg1", {"cmd/app/main.go": "package main\n"}, False),
+    ),
+)
+def test_go_run_multiple_go_files(tmp_path, command, files, should_report):
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+        **files,
+    })
+    assert ("C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)) is should_report
+
+
+# ---- Issue 5: npm run-script formal syntax ----
+
+@pytest.mark.parametrize(
+    ("command", "script_present"),
+    (
+        ("npm run-script dev --workspace web", True),
+        ("npm run-script dev --workspace web", False),
+        ("npm --workspace web run-script dev", True),
+        ("npm --workspace web run-script dev", False),
+        ("npm run-script dev", True),
+        ("npm run-script dev", False),
+    ),
+)
+def test_npm_run_script_workspace_and_root(tmp_path, command, script_present):
+    script_json = '{"dev":"vite"}' if script_present else '{}'
+    if "--workspace" in command:
+        files = {
+            "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+            "packages/web/package.json": f'{{"name":"web","scripts":{script_json}}}',
+        }
+    else:
+        files = {
+            "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+            "package.json": f'{{"scripts":{script_json}}}',
+        }
+    _write_repo(tmp_path, files)
+    if script_present:
+        assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+    else:
+        assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)

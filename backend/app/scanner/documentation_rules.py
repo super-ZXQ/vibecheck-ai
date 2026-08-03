@@ -129,11 +129,16 @@ _IGNORED_DOCUMENTED_PARTS = frozenset({
     "coverage", "vendor", "generated", "__pycache__",
 })
 _NPM_LIFECYCLE_COMMANDS = frozenset({"start", "stop", "restart", "test"})
+_NPM_RUN_KEYWORDS = frozenset({"run", "run-script"})
 _COMPLEX_SELECTOR_CHARS = frozenset("*!?[]{}")
 _GO_VALUE_OPTIONS = frozenset({
     "-o", "-ldflags", "-tags", "-mod", "-compiler",
     "-gccgoflags", "-gcflags", "-asmflags",
+    "-p", "-exec", "-covermode", "-coverpkg", "-buildmode",
+    "-installsuffix", "-modfile", "-overlay", "-pkgdir", "-toolexec",
 })
+_GO_GLOBAL_VALUE_OPTIONS = frozenset({"-C"})
+_SKIP_COMMAND = object()
 
 _TECH_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     ("react", "node", re.compile(r"(?<![\w.-])React(?![\w.-])", re.IGNORECASE)),
@@ -386,7 +391,16 @@ def _parse_workspace_command(
     command: str,
     line_number: int,
     base_dir: str,
-) -> _CommandReference | None:
+) -> _CommandReference | object | None:
+    """Parse a workspace command.
+
+    Returns:
+        _CommandReference: a valid command reference.
+        _SKIP_COMMAND: the command was identified as a package-manager
+            workspace command but is conservatively skipped (e.g. ``--workspaces``).
+            Callers must NOT fall back to other parsers.
+        None: the command is not a workspace command.
+    """
     try:
         tokens = shlex.split(command)
     except ValueError:
@@ -410,9 +424,9 @@ def _parse_workspace_command(
             remainder.extend(tokens[index + 1:])
             break
 
-        # Issue 6: --workspaces (plural) means all workspaces – skip
-        if manager == "npm" and token == "--workspaces":
-            return None
+        # Issue 1: --workspaces / --no-workspaces → conservatively skip
+        if manager == "npm" and token in {"--workspaces", "--no-workspaces"}:
+            return _SKIP_COMMAND
 
         # Name-based selectors (workspace can appear before or after script)
         if manager == "npm" and token in {"--workspace", "-w"}:
@@ -437,12 +451,12 @@ def _parse_workspace_command(
                 filter_value = tokens[index + 1]
                 # Issue 5: complex selectors are skipped at parse stage
                 if _is_complex_pnpm_selector(filter_value):
-                    return None
+                    return _SKIP_COMMAND
                 if filter_value.startswith(("./", "../")):
                     selector_type = "dir"
                 else:
                     if not _SIMPLE_PACKAGE_NAME_RE.fullmatch(filter_value):
-                        return None
+                        return _SKIP_COMMAND
                     selector_type = "name"
                 workspaces.append(filter_value)
                 index += 2
@@ -450,12 +464,12 @@ def _parse_workspace_command(
         elif manager == "pnpm" and token.startswith("--filter="):
             filter_value = token.split("=", 1)[1]
             if _is_complex_pnpm_selector(filter_value):
-                return None
+                return _SKIP_COMMAND
             if filter_value.startswith(("./", "../")):
                 selector_type = "dir"
             else:
                 if not _SIMPLE_PACKAGE_NAME_RE.fullmatch(filter_value):
-                    return None
+                    return _SKIP_COMMAND
                 selector_type = "name"
             workspaces.append(filter_value)
             index += 1
@@ -485,20 +499,20 @@ def _parse_workspace_command(
     if not workspaces:
         return None
 
-    # Issue 1: strip optional "run" and check for built-in commands
+    # Issue 1/5: strip optional "run"/"run-script" and check for built-in commands
     has_run = False
-    if remainder and remainder[0].lower() == "run":
+    if remainder and remainder[0].lower() in _NPM_RUN_KEYWORDS:
         has_run = True
         remainder = remainder[1:]
     if not remainder or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:_-]*", remainder[0]):
-        return None
+        return _SKIP_COMMAND if has_run else None
 
     command_name = remainder[0]
     lowered_command = command_name.lower()
 
     # Issue 1: skip package-manager built-in commands
     if has_run:
-        # "run <script>" is always a project script — validate it
+        # "run"/"run-script <script>" is always a project script — validate it
         pass
     elif manager == "npm":
         # npm without "run": only lifecycle commands are valid scripts
@@ -508,10 +522,19 @@ def _parse_workspace_command(
         # yarn/pnpm/bun without "run": skip built-in commands
         return None
 
+    # Determine if this is a lifecycle command for workspace validation
+    is_lifecycle = (
+        manager == "npm"
+        and not has_run
+        and lowered_command in _NPM_LIFECYCLE_COMMANDS
+    )
+
     # Create reference based on selector type
     if selector_type in ("name", "npm_workspace"):
         return _CommandReference(
-            line_number, "node_workspace_name", base_dir, command_name,
+            line_number,
+            "node_workspace_lifecycle" if is_lifecycle else "node_workspace_name",
+            base_dir, command_name,
             workspace=workspaces[0],
             workspaces=tuple(workspaces),
             manager=manager,
@@ -524,7 +547,9 @@ def _parse_workspace_command(
     if normalized is None:
         return None
     return _CommandReference(
-        line_number, "node_script", normalized, command_name,
+        line_number,
+        "npm_lifecycle" if is_lifecycle else "node_script",
+        normalized, command_name,
         manager=manager,
         selector_type=selector_type,
     )
@@ -614,31 +639,65 @@ def _parse_go_command(
         return None
     if tokens[0].lower() != "go":
         return None
-    subcommand = tokens[1].lower()
+
+    # Issue 3: support global -C <dir> before subcommand
+    go_base_dir = base_dir
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in _GO_GLOBAL_VALUE_OPTIONS and index + 1 < len(tokens):
+            normalized = _safe_relative_path(base_dir, tokens[index + 1])
+            if normalized is None:
+                return None
+            go_base_dir = normalized
+            index += 2
+            continue
+        break
+
+    if index >= len(tokens):
+        return None
+    subcommand = tokens[index].lower()
     if subcommand not in {"run", "build"}:
         return None
+    index += 1
 
     go_packages: list[str] = []
     package_found = False
-    index = 2
+    go_file_mode = False
 
     while index < len(tokens):
         token = tokens[index]
-        # For "go run", everything after the first package is program arguments
+        # For "go run", after finding the first target:
         if subcommand == "run" and package_found:
+            # Issue 4: if first target is a .go file, collect consecutive .go files
+            if go_file_mode:
+                if token.endswith(".go"):
+                    normalized = _safe_relative_path(go_base_dir, token)
+                    if normalized is None:
+                        return None
+                    go_packages.append(normalized)
+                    index += 1
+                    continue
+                # First non-.go token ends file collection; rest are program args
+                break
+            # For directory/import-path targets, rest are program args
             break
         if token.startswith("-") and token != "-":
+            # Issue 3: support -flag=value and -flag value
             if "=" in token:
                 index += 1
                 continue
             if token in _GO_VALUE_OPTIONS and index + 1 < len(tokens):
                 index += 2
                 continue
+            # Unknown flag: conservatively treat as boolean (no value)
             index += 1
             continue
-        # Positional argument: package/path
+        # Positional argument: package/path/file
         package_found = True
-        normalized = _safe_relative_path(base_dir, token)
+        if token.endswith(".go"):
+            go_file_mode = True
+        normalized = _safe_relative_path(go_base_dir, token)
         if normalized is None:
             return None
         go_packages.append(normalized)
@@ -647,9 +706,9 @@ def _parse_go_command(
     if not go_packages:
         return None
     if len(go_packages) == 1:
-        return _CommandReference(line_number, "go", base_dir, go_packages[0])
+        return _CommandReference(line_number, "go", go_base_dir, go_packages[0])
     return _CommandReference(
-        line_number, "go", base_dir, go_packages[0],
+        line_number, "go", go_base_dir, go_packages[0],
         targets=tuple(go_packages),
     )
 
@@ -746,13 +805,15 @@ def _parse_command(
         return streamlit_flask
 
     workspace = _parse_workspace_command(command, line_number, base_dir)
+    if workspace is _SKIP_COMMAND:
+        return None
     if workspace is not None:
         return workspace
     if re.match(r"^(?:npm|pnpm|yarn|bun)\s+(?:-|workspace\b)", command, re.IGNORECASE):
         return None
 
     node = re.match(
-        r"^(npm|pnpm|yarn|bun)\s+run\s+([A-Za-z0-9][A-Za-z0-9:_-]*)(?:\s|$)",
+        r"^(npm|pnpm|yarn|bun)\s+(?:run|run-script)\s+([A-Za-z0-9][A-Za-z0-9:_-]*)(?:\s|$)",
         command, re.IGNORECASE,
     )
     if node:
@@ -1185,6 +1246,26 @@ class DocumentationConsistencyProbe(RepositoryProbe):
     def _path_exists(self, path: str, *, directory: bool = False) -> bool:
         return path in (self.directories if directory else self.paths | self.directories)
 
+    def _npm_lifecycle_is_valid(
+        self, target: str, scripts: set[str], package_path: str,
+    ) -> bool:
+        """Unified npm lifecycle validation shared by root and workspace.
+
+        Args:
+            target: the lifecycle command name (start/stop/restart/test).
+            scripts: the scripts set for the package directory.
+            package_path: the rooted path to the package directory
+                (used to check for ``server.js``).
+        """
+        server_js = "server.js" if package_path == "." else f"{package_path}/server.js"
+        if target == "start":
+            return "start" in scripts or server_js in self.paths
+        if target == "restart":
+            return "restart" in scripts or (
+                "start" in scripts or server_js in self.paths
+            )
+        return target in scripts
+
     def _command_is_valid(
         self, reference: _CommandReference, root_prefix: str
     ) -> bool:
@@ -1226,6 +1307,34 @@ class DocumentationConsistencyProbe(RepositoryProbe):
                 # Unknown selector_type: conservative fail
                 return False
             return True
+        if reference.kind == "node_workspace_lifecycle":
+            all_workspaces = reference.workspaces or (
+                (reference.workspace,) if reference.workspace else ()
+            )
+            if not all_workspaces:
+                return False
+            for ws in all_workspaces:
+                directory = self.node_package_names.get(ws)
+                if directory is None:
+                    if reference.selector_type == "name":
+                        return False
+                    if reference.selector_type == "npm_workspace":
+                        if ws.startswith("@"):
+                            return False
+                        normalized = _safe_relative_path(reference.base_dir, ws)
+                        if normalized is None:
+                            return False
+                        rel = normalized if normalized != "." else ""
+                        directory = "/".join(p for p in (root_prefix, rel) if p) or "."
+                    else:
+                        return False
+                scripts = self.node_scripts.get(directory, set())
+                pkg_path = "/".join(p for p in (root_prefix, directory) if p)
+                if not self._npm_lifecycle_is_valid(
+                    reference.target, scripts, pkg_path,
+                ):
+                    return False
+            return True
         if reference.kind == "node_script":
             manifest_dir = base or "."
             return reference.target in self.node_scripts.get(manifest_dir, set())
@@ -1233,13 +1342,9 @@ class DocumentationConsistencyProbe(RepositoryProbe):
             scripts = self.node_scripts.get(base or ".", set())
             if joined("package.json") not in self.paths:
                 return False
-            if reference.target == "start":
-                return "start" in scripts or joined("server.js") in self.paths
-            if reference.target == "restart":
-                return "restart" in scripts or (
-                    "start" in scripts or joined("server.js") in self.paths
-                )
-            return reference.target in scripts
+            return self._npm_lifecycle_is_valid(
+                reference.target, scripts, base or ".",
+            )
         if reference.kind == "path":
             return self._path_exists(rooted(reference.target))
         if reference.kind == "python_runnable_module":
