@@ -502,7 +502,12 @@ def _npm_glob_to_regex(pattern: str) -> str | None:
     Frozen scope supports:
     * Literal path characters;
     * ``*`` (matches within a single path segment: ``[^/]*``);
-    * ``**`` (matches across path separators: ``.*``).
+    * ``**`` (matches zero or more complete path segments).
+
+    ``**`` follows npm glob semantics:
+    * ``**/`` at the start matches zero or more directory prefixes;
+    * ``/**/`` in the middle matches zero or more intermediate directories;
+    * ``/**`` at the end matches any depth of suffix directories.
 
     Returns ``None`` for patterns containing unsupported glob metacharacters
     (``?``, ``[``, ``]``, ``{``, ``}``, ``(``, ``)``).  Such patterns are
@@ -510,25 +515,81 @@ def _npm_glob_to_regex(pattern: str) -> str | None:
     """
     if any(ch in _NPM_GLOB_UNSUPPORTED_CHARS for ch in pattern):
         return None
-    result: list[str] = []
-    i = 0
-    while i < len(pattern):
-        ch = pattern[i]
-        if ch == "*":
-            if i + 1 < len(pattern) and pattern[i + 1] == "*":
-                result.append(".*")
-                i += 2
+    # Split into segments and process each one.
+    segments = pattern.split("/")
+    parts: list[str] = []
+    seg_count = len(segments)
+    for idx, seg in enumerate(segments):
+        is_last = idx == seg_count - 1
+        is_first = idx == 0
+        if seg == "**":
+            # ** as a full segment means zero or more path segments.
+            if seg_count == 1:
+                # Pattern is just "**" — match everything.
+                parts.append(".*")
+            elif is_last:
+                # Trailing ** : zero or more /segment suffixes.
+                # Remove the trailing slash already appended by previous segment.
+                if parts and parts[-1] == "/":
+                    parts.pop()
+                parts.append("(?:/.*)?")
+            elif is_first:
+                # Leading **/ : zero or more directory prefixes.
+                parts.append("(?:[^/]*/)*")
+                # Skip the next separator since the prefix group handles it.
+                # We use a marker to avoid appending "/" after this.
+                # Actually, the next segment will append "/" via the normal flow,
+                # but we already consumed it. So we need to skip the separator.
+                # We'll handle this by NOT appending a separator if previous was **/.
+                parts.append("\x00SKIPSEP\x00")
             else:
-                result.append("[^/]*")
-                i += 1
-        elif ch in ".+(){}|^$\\":
-            result.append("\\")
-            result.append(ch)
-            i += 1
+                # Middle /**/ : zero or more intermediate directories.
+                # Remove the trailing slash from previous segment.
+                if parts and parts[-1] == "/":
+                    parts.pop()
+                parts.append("(?:/[^/]+)*/")
         else:
-            result.append(ch)
-            i += 1
-    return "^" + "".join(result) + "$"
+            # Normal segment: escape regex special chars, convert * to [^/]*
+            seg_regex: list[str] = []
+            j = 0
+            while j < len(seg):
+                ch = seg[j]
+                if ch == "*":
+                    if j + 1 < len(seg) and seg[j + 1] == "*":
+                        # ** within a segment (not as full segment) — treat as
+                        # matching within segment boundaries (same as * for safety).
+                        seg_regex.append("[^/]*")
+                        j += 2
+                    else:
+                        seg_regex.append("[^/]*")
+                        j += 1
+                elif ch in ".+(){}|^$\\":
+                    seg_regex.append("\\")
+                    seg_regex.append(ch)
+                    j += 1
+                else:
+                    seg_regex.append(ch)
+                    j += 1
+            parts.append("".join(seg_regex))
+            if not is_last:
+                parts.append("/")
+
+    # Post-process: handle the SKIPSEP markers left by leading **/ segments.
+    # After a leading **/ segment, the next segment should NOT have a "/" prefix
+    # because the **/ group already includes the trailing slash.
+    final_parts: list[str] = []
+    skip_next_sep = False
+    for i, part in enumerate(parts):
+        if part == "\x00SKIPSEP\x00":
+            skip_next_sep = True
+            continue
+        if skip_next_sep and part == "/":
+            skip_next_sep = False
+            continue
+        skip_next_sep = False
+        final_parts.append(part)
+
+    return "^" + "".join(final_parts) + "$"
 
 
 @functools.lru_cache(maxsize=256)

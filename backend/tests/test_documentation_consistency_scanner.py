@@ -2449,3 +2449,76 @@ def test_go_buildmode_and_subcommand_separation(
         **files,
     })
     assert ("C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)) == should_report
+
+
+# ---- Round 10: ** must match zero or more path segments ----
+
+def test_npm_workspace_double_star_matches_zero_segments(tmp_path):
+    """packages/**/web must match packages/web (zero intermediate dirs)."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev -w web\n```\n"
+        ),
+        "package.json": '{"workspaces":["packages/**/web"]}',
+        "packages/web/package.json": '{"name":"web","scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_npm_workspace_double_star_matches_multiple_segments(tmp_path):
+    """packages/**/web must match packages/group/web (one or more dirs)."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev -w web\n```\n"
+        ),
+        "package.json": '{"workspaces":["packages/**/web"]}',
+        "packages/group/web/package.json": '{"name":"web","scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_npm_workspace_leading_double_star_matches_direct_and_nested(tmp_path):
+    """**/web must match web/ (zero prefix) and packages/web/ (nested).
+
+    Uses two separate repos via subdirectories to avoid cross-contamination.
+    """
+    # Zero prefix: web directly at root
+    repo1 = tmp_path / "repo1"
+    repo1.mkdir()
+    _write_repo(repo1, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev -w web\n```\n"
+        ),
+        "package.json": '{"workspaces":["**/web"]}',
+        "web/package.json": '{"name":"web","scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(repo1)
+
+    # Nested: packages/web
+    repo2 = tmp_path / "repo2"
+    repo2.mkdir()
+    _write_repo(repo2, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev -w web\n```\n"
+        ),
+        "package.json": '{"workspaces":["**/web"]}',
+        "packages/web/package.json": '{"name":"web","scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(repo2)
+
+
+def test_npm_workspace_single_star_remains_single_segment(tmp_path):
+    """packages/* must NOT match packages/group/web — * stays single segment."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev -w web\n```\n"
+        ),
+        "package.json": '{"workspaces":["packages/*"]}',
+        "packages/group/web/package.json": '{"name":"web","scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
