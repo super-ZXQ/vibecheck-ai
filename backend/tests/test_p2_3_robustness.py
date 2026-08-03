@@ -178,12 +178,14 @@ class TestCleanupResidualTempFiles:
         assert removed == 0
 
     def test_skips_symlinks(self, test_db, tmp_path):
-        """跳过符号链接。"""
+        """跳过符号链接：不通过 symlink 删除目标文件。"""
         tmp_dir = Path(test_db.parent) / "tmp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
-        # Create a normal file and a symlink to it
-        target = tmp_dir / "real_file.txt"
+        # Create target OUTSIDE tmp_dir so cleanup_residual_temp_files
+        # does not delete it as a regular file. Only the symlink lives
+        # inside tmp_dir.
+        target = Path(test_db.parent) / "real_file.txt"
         target.write_text("real")
         link = tmp_dir / "evil_link"
         try:
@@ -192,8 +194,7 @@ class TestCleanupResidualTempFiles:
             pytest.skip("symlinks not supported on this platform")
 
         cleanup_residual_temp_files()
-        # The symlink should NOT be followed/deleted
-        # (it may be removed as a file, but the target should survive)
+        # The symlink must NOT be followed — target survives.
         assert target.exists()
 
 
