@@ -2286,3 +2286,166 @@ def test_go_correct_subcommand_flags_valid(
         **files,
     })
     assert ("C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)) == should_report
+
+
+# ---- Round 9 Issue 1: npm workspace glob safety & normalization ----
+
+def test_npm_workspace_dot_slash_prefix_pattern(tmp_path):
+    """workspaces=["./packages/*"] should match normally."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev -w web\n```\n"
+        ),
+        "package.json": '{"workspaces":["./packages/*"]}',
+        "packages/web/package.json": '{"name":"web","scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_npm_workspace_trailing_slash_pattern(tmp_path):
+    """workspaces=["packages/*/"] should match normally."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev -w web\n```\n"
+        ),
+        "package.json": '{"workspaces":["packages/*/"]}',
+        "packages/web/package.json": '{"name":"web","scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_npm_workspace_malformed_bracket_no_crash(tmp_path):
+    """workspaces=["packages/[abc"] must not crash the scan."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev -w web\n```\n"
+        ),
+        "package.json": '{"workspaces":["packages/[abc"]}',
+        "packages/web/package.json": '{"name":"web","scripts":{"dev":"vite"}}',
+    })
+    # Must not raise; may or may not report C003 but must not crash.
+    _rule_ids(tmp_path)
+
+
+def test_npm_workspace_question_mark_no_crash(tmp_path):
+    """workspaces=["packages/?"] must not crash the scan."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev -w web\n```\n"
+        ),
+        "package.json": '{"workspaces":["packages/?"]}',
+        "packages/web/package.json": '{"name":"web","scripts":{"dev":"vite"}}',
+    })
+    # Must not raise.
+    _rule_ids(tmp_path)
+
+
+def test_npm_workspace_unsupported_plus_valid_mixed(tmp_path):
+    """One unsupported pattern + one valid pattern: valid workspace still works."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev -w web\n```\n"
+        ),
+        "package.json": '{"workspaces":["packages/[abc","packages/*"]}',
+        "packages/web/package.json": '{"name":"web","scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_npm_glob_no_unlimited_global_cache(tmp_path):
+    """Verify that lru_cache is used instead of a global dict by feeding many patterns."""
+    from app.scanner.documentation_rules import _npm_glob_compile
+    # Clear any cached entries
+    _npm_glob_compile.cache_clear()
+    # Feed many unique normalized patterns
+    for i in range(300):
+        _npm_glob_compile(f"dir{i}/*")
+    # lru_cache(maxsize=256) should cap at 256; info().currsize <= 256
+    info = _npm_glob_compile.cache_info()
+    assert info.currsize <= 256, f"Cache grew unbounded: {info.currsize}"
+    _npm_glob_compile.cache_clear()
+
+
+# ---- Round 9 Issue 2: duplicate workspace name → AMBIGUOUS → C003 ----
+
+def test_npm_workspace_duplicate_name_both_have_script_reports(tmp_path):
+    """Two workspaces with same name, both have dev → C003 (AMBIGUOUS)."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev -w dup\n```\n"
+        ),
+        "package.json": '{"workspaces":["packages/*"]}',
+        "packages/a/package.json": '{"name":"dup","scripts":{"dev":"vite"}}',
+        "packages/b/package.json": '{"name":"dup","scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_npm_workspace_duplicate_name_one_missing_script_reports(tmp_path):
+    """Two workspaces with same name, one has dev one doesn't → still C003."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev -w dup\n```\n"
+        ),
+        "package.json": '{"workspaces":["packages/*"]}',
+        "packages/a/package.json": '{"name":"dup","scripts":{"dev":"vite"}}',
+        "packages/b/package.json": '{"name":"dup","scripts":{"build":"tsc"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_npm_workspace_duplicate_name_order_independent(tmp_path):
+    """Duplicate workspace name must report C003 regardless of file observation order."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev -w dup\n```\n"
+        ),
+        "package.json": '{"workspaces":["packages/*"]}',
+        "packages/zzz/package.json": '{"name":"dup","scripts":{"dev":"vite"}}',
+        "packages/aaa/package.json": '{"name":"dup","scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_npm_workspace_single_name_vs_vendor_no_report(tmp_path):
+    """One declared workspace name=web + one vendor non-workspace name=web → no C003."""
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\nnpm run dev -w web\n```\n"
+        ),
+        "package.json": '{"workspaces":["packages/*"]}',
+        "packages/web/package.json": '{"name":"web","scripts":{"dev":"vite"}}',
+        "vendor/web/package.json": '{"name":"web","scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+# ---- Round 9 Issue 3: go run -buildmode ----
+
+@pytest.mark.parametrize(
+    ("command", "files", "should_report"),
+    (
+        ("go run -buildmode=pie .", {"go.mod": "module app\n"}, False),
+        ("go run -buildmode pie .", {"go.mod": "module app\n"}, False),
+        ("go build -buildmode=pie .", {"go.mod": "module app\n"}, False),
+        ("go run -o bin .", {"go.mod": "module app\n"}, True),
+        ("go build -exec wrapper ./...", {"go.mod": "module app\n"}, True),
+    ),
+)
+def test_go_buildmode_and_subcommand_separation(
+    tmp_path, command, files, should_report,
+):
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+        **files,
+    })
+    assert ("C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)) == should_report

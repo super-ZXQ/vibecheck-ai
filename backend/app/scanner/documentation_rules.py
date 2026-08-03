@@ -6,6 +6,7 @@ import json
 import re
 import shlex
 import sys
+import functools
 import tomllib
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -135,34 +136,33 @@ _COMPLEX_SELECTOR_CHARS = frozenset("*!?[]{}")
 # Global flags that can appear before the subcommand.
 _GO_GLOBAL_VALUE_OPTIONS = frozenset({"-C"})
 
-# Build-specific boolean flags.
-_GO_BUILD_BOOLEAN_OPTIONS = frozenset({
+# Common boolean flags shared by both ``go build`` and ``go run``.
+_GO_COMMON_BUILD_BOOLEAN_OPTIONS = frozenset({
     "-v", "-race", "-cover", "-a", "-n", "-x", "-work",
     "-modcacherw", "-trimpath", "-buildvcs", "-linkshared",
     "-msan", "-asan",
 })
-# Build-specific value-taking flags.
-_GO_BUILD_VALUE_OPTIONS = frozenset({
-    "-o", "-ldflags", "-tags", "-mod", "-compiler",
+# Common value-taking flags shared by both ``go build`` and ``go run``.
+_GO_COMMON_BUILD_VALUE_OPTIONS = frozenset({
+    "-ldflags", "-tags", "-mod", "-compiler",
     "-gccgoflags", "-gcflags", "-asmflags",
     "-p", "-covermode", "-coverpkg", "-buildmode",
     "-installsuffix", "-modfile", "-overlay", "-pkgdir", "-toolexec",
     "-pgo",
 })
-# Run-specific boolean flags.
-_GO_RUN_BOOLEAN_OPTIONS = frozenset({
-    "-v", "-race", "-cover", "-a", "-n", "-x", "-work",
-    "-modcacherw", "-trimpath", "-buildvcs", "-linkshared",
-    "-msan", "-asan",
-})
-# Run-specific value-taking flags.
-_GO_RUN_VALUE_OPTIONS = frozenset({
-    "-ldflags", "-tags", "-mod", "-compiler",
-    "-gccgoflags", "-gcflags", "-asmflags",
-    "-exec", "-p", "-covermode", "-coverpkg",
-    "-installsuffix", "-modfile", "-overlay", "-pkgdir", "-toolexec",
-    "-pgo",
-})
+
+# Build-specific sets: common + build-only flags.
+_GO_BUILD_BOOLEAN_OPTIONS = _GO_COMMON_BUILD_BOOLEAN_OPTIONS
+_GO_BUILD_VALUE_OPTIONS = (
+    _GO_COMMON_BUILD_VALUE_OPTIONS
+    | frozenset({"-o"})
+)
+# Run-specific sets: common + run-only flags.
+_GO_RUN_BOOLEAN_OPTIONS = _GO_COMMON_BUILD_BOOLEAN_OPTIONS
+_GO_RUN_VALUE_OPTIONS = (
+    _GO_COMMON_BUILD_VALUE_OPTIONS
+    | frozenset({"-exec"})
+)
 # Known Go flags that are NOT valid for build/run subcommands.
 _GO_UNSUPPORTED_KNOWN_OPTIONS = frozenset({"-u", "-d", "-fix", "-json", "-e"})
 # All known Go boolean flags (for detecting "known but wrong subcommand").
@@ -189,17 +189,21 @@ _GO_BUILDVCS_VALID_VALUES = frozenset({
     "auto",
 })
 _SKIP_COMMAND = object()
+_AMBIGUOUS = object()
 _NPM_IF_PRESENT = "--if-present"
 
-# ---- P0-13 Support Boundary Freeze ----
+# ---- P0-13 Support Boundary Freeze (FINAL) ----
 # npm: run/run-script, start/stop/restart/test, --if-present[=true|false],
 #   single/multiple --workspace/-w, root workspaces array/object form,
 #   declared workspace package name or directory selection.
+#   Workspace glob: supports P0-13 frozen scope — normalized literal paths,
+#   *, **, and ! negation patterns. Patterns outside frozen scope
+#   (?, [], {}, etc.) are conservatively ignored without scan failure.
 # pnpm: single simple name filter, single ./directory filter,
 #   complex or multiple filters → SKIP_UNSUPPORTED.
 # Go: local relative paths, .go files, ... pattern,
-#   import/module path (no local check), declared build/run param sets,
-#   unknown params → SKIP_UNSUPPORTED.
+#   import/module path (no local check), declared build/run param sets
+#   (common + build-only/run-only), unknown params → SKIP_UNSUPPORTED.
 # -----------------------------------------------------------------
 
 _TECH_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
@@ -464,12 +468,48 @@ def _is_go_import_path(token: str) -> bool:
     return True
 
 
-def _npm_glob_to_regex(pattern: str) -> str:
+# Glob metacharacters outside P0-13 frozen scope (literal paths, *, **, ! prefix).
+# If any of these appear in a pattern, the pattern is unsupported and skipped.
+_NPM_GLOB_UNSUPPORTED_CHARS = frozenset("?[]{}()")
+
+
+def _normalize_npm_workspace_pattern(pattern: str) -> str | None:
+    """Normalize an npm workspace glob pattern.
+
+    * Convert backslashes to forward slashes.
+    * Strip a leading ``./``.
+    * Strip a trailing ``/``.
+    * Reject empty patterns.
+
+    Returns ``None`` if the pattern is empty after normalization or
+    contains unsupported glob metacharacters outside the frozen scope.
+    """
+    result = pattern.replace("\\", "/")
+    while result.startswith("./"):
+        result = result[2:]
+    while result.endswith("/") and len(result) > 1:
+        result = result[:-1]
+    if not result:
+        return None
+    if any(ch in _NPM_GLOB_UNSUPPORTED_CHARS for ch in result):
+        return None
+    return result
+
+
+def _npm_glob_to_regex(pattern: str) -> str | None:
     """Convert an npm workspace glob pattern to a regex string.
 
-    ``*`` matches within a single path segment (``[^/]*``).
-    ``**`` matches across path separators (``.*``).
+    Frozen scope supports:
+    * Literal path characters;
+    * ``*`` (matches within a single path segment: ``[^/]*``);
+    * ``**`` (matches across path separators: ``.*``).
+
+    Returns ``None`` for patterns containing unsupported glob metacharacters
+    (``?``, ``[``, ``]``, ``{``, ``}``, ``(``, ``)``).  Such patterns are
+    conservatively ignored and do not cause scan failures.
     """
+    if any(ch in _NPM_GLOB_UNSUPPORTED_CHARS for ch in pattern):
+        return None
     result: list[str] = []
     i = 0
     while i < len(pattern):
@@ -491,30 +531,55 @@ def _npm_glob_to_regex(pattern: str) -> str:
     return "^" + "".join(result) + "$"
 
 
-_NPM_GLOB_CACHE: dict[str, "re.Pattern[str]"] = {}
+@functools.lru_cache(maxsize=256)
+def _npm_glob_compile(pattern: str) -> "re.Pattern[str] | None":
+    """Compile a (already normalized) npm workspace glob pattern to regex.
+
+    Returns ``None`` if the pattern is unsupported or malformed.
+    Never raises — malformed patterns are safely skipped.
+    """
+    regex = _npm_glob_to_regex(pattern)
+    if regex is None:
+        return None
+    try:
+        return re.compile(regex)
+    except re.error:
+        return None
 
 
 def _npm_glob_match(path: str, pattern: str) -> bool:
-    """Match a relative directory path against an npm workspace glob."""
-    if pattern not in _NPM_GLOB_CACHE:
-        _NPM_GLOB_CACHE[pattern] = re.compile(_npm_glob_to_regex(pattern))
-    return bool(_NPM_GLOB_CACHE[pattern].fullmatch(path))
+    """Match a relative directory path against an npm workspace glob pattern.
+
+    The *pattern* must already be normalized via
+    :func:`_normalize_npm_workspace_pattern`.
+    Returns ``False`` for unsupported or malformed patterns.
+    """
+    compiled = _npm_glob_compile(pattern)
+    if compiled is None:
+        return False
+    return bool(compiled.fullmatch(path))
 
 
 def _npm_workspace_glob_match(directory: str, patterns: list[str]) -> bool:
-    """Check if *directory* matches npm workspace *patterns*.
+    """Check if *directory* matches any of the npm workspace *patterns*.
 
     Supports positive patterns and negation (``!`` prefix).  A directory
     must match at least one positive pattern and must not match any
-    negative pattern.
+    negative pattern.  Unsupported or malformed patterns are skipped
+    without causing scan failures.
     """
     positive: list[str] = []
     negative: list[str] = []
-    for pattern in patterns:
-        if pattern.startswith("!"):
-            negative.append(pattern[1:])
+    for raw in patterns:
+        is_neg = raw.startswith("!")
+        body = raw[1:] if is_neg else raw
+        normalized = _normalize_npm_workspace_pattern(body)
+        if normalized is None:
+            continue  # skip unsupported/malformed patterns
+        if is_neg:
+            negative.append(normalized)
         else:
-            positive.append(pattern)
+            positive.append(normalized)
     if not any(_npm_glob_match(directory, p) for p in positive):
         return False
     return not any(_npm_glob_match(directory, p) for p in negative)
@@ -1572,25 +1637,36 @@ class DocumentationConsistencyProbe(RepositoryProbe):
 
     def _resolve_npm_workspace_by_name(
         self, name: str, root_prefix: str,
-    ) -> str | None:
+    ) -> str | object | None:
         """Resolve an npm workspace package name to its directory.
 
         1. Read root package.json workspaces patterns.
         2. From all valid package manifests, filter those matching patterns.
         3. Match by package name among the filtered candidates.
+
+        Returns:
+            ``str``: the unique matching directory (RESOLVED).
+            ``None``: no candidate matched (NOT_FOUND).
+            ``_AMBIGUOUS``: more than one candidate matched (AMBIGUOUS).
+                Callers must NOT fall back to directory path lookup.
         """
         root_pkg_dir = root_prefix or "."
         patterns = self.package_workspaces.get(root_pkg_dir)
         if not patterns:
             return None
         candidate_dirs = self.node_package_names.get(name, [])
+        matched: list[str] = []
         for directory in candidate_dirs:
             rel_dir = directory
             if root_prefix and directory.startswith(root_prefix + "/"):
                 rel_dir = directory[len(root_prefix) + 1:]
             if _npm_workspace_glob_match(rel_dir, patterns):
                 if directory in self.valid_node_manifest_dirs:
-                    return directory
+                    matched.append(directory)
+        if len(matched) == 1:
+            return matched[0]
+        if len(matched) > 1:
+            return _AMBIGUOUS
         return None
 
     def _command_is_valid(
@@ -1621,6 +1697,9 @@ class DocumentationConsistencyProbe(RepositoryProbe):
                     directory = self._resolve_npm_workspace_by_name(
                         ws, root_prefix,
                     )
+                    if directory is _AMBIGUOUS:
+                        # Multiple workspaces with same name → INVALID
+                        return False
                     if directory is None:
                         # Try as directory path
                         normalized = _safe_relative_path(reference.base_dir, ws)
@@ -1674,6 +1753,9 @@ class DocumentationConsistencyProbe(RepositoryProbe):
                     directory = self._resolve_npm_workspace_by_name(
                         ws, root_prefix,
                     )
+                    if directory is _AMBIGUOUS:
+                        # Multiple workspaces with same name → INVALID
+                        return False
                     if directory is None:
                         # Try as directory path
                         normalized = _safe_relative_path(reference.base_dir, ws)
