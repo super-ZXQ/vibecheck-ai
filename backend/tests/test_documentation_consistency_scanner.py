@@ -240,7 +240,6 @@ def test_multiline_working_directory_is_applied_to_following_commands(tmp_path):
         "python -m pip install -r requirements.txt",
         "python -m pytest",
         "python -m flask run",
-        "python -m streamlit run app.py",
         "python -m http.server 8000",
         "npm create vite@latest",
     ),
@@ -343,16 +342,34 @@ def test_npm_start_accepts_default_server_js_entry(tmp_path):
     assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
 
 
-def test_npm_restart_accepts_stop_and_start_lifecycle_scripts(tmp_path):
+def test_npm_restart_accepts_restart_or_start_scripts(tmp_path):
+    # scripts.restart exists
     _write_repo(tmp_path, {
         "README.md": (
             f"# App\n\n{_long_intro()}\n## Running\n```sh\nnpm restart\n```\n"
         ),
-        "package.json": '{"scripts":{"stop":"echo stop","start":"node app.js"}}',
+        "package.json": '{"scripts":{"restart":"echo restart"}}',
     })
     assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
 
-    _write_repo(tmp_path, {"package.json": '{"scripts":{"stop":"echo stop"}}'})
+    # scripts.start exists but stop does not
+    _write_repo(tmp_path, {
+        "package.json": '{"scripts":{"start":"node app.js"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+    # server.js exists with empty package.json
+    _write_repo(tmp_path, {
+        "package.json": "{}",
+        "server.js": "console.info('ok')\n",
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+    # No restart, no start, no server.js
+    (tmp_path / "server.js").unlink(missing_ok=True)
+    _write_repo(tmp_path, {
+        "package.json": '{"scripts":{"stop":"echo stop"}}',
+    })
     assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
 
 
@@ -774,3 +791,165 @@ def test_repository_derived_text_never_enters_finding_payload(tmp_path):
             )
         )
         assert marker not in payload
+
+
+@pytest.mark.parametrize(
+    ("command", "package_dir", "package_json"),
+    (
+        ("pnpm --filter web dev", "packages/web", '{"name":"web","scripts":{"dev":"vite"}}'),
+        ("yarn workspace @acme/web dev", "packages/web", '{"name":"@acme/web","scripts":{"dev":"vite"}}'),
+        ("npm --workspace web run dev", "packages/web", '{"name":"web","scripts":{"dev":"vite"}}'),
+        ("npm --workspace @acme/web run dev", "packages/web", '{"name":"@acme/web","scripts":{"dev":"vite"}}'),
+        ("pnpm --filter @acme/web dev", "packages/web", '{"name":"@acme/web","scripts":{"dev":"vite"}}'),
+        ("pnpm -C packages/web dev", "packages/web", '{"name":"web","scripts":{"dev":"vite"}}'),
+    ),
+)
+def test_workspace_name_resolves_to_package_directory(
+    tmp_path, command, package_dir, package_json,
+):
+    readme = f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n"
+    _write_repo(tmp_path, {
+        "README.md": readme,
+        f"{package_dir}/package.json": package_json,
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_workspace_name_with_missing_script_reports_c003(tmp_path):
+    readme = f"# App\n\n{_long_intro()}\n## Running\n```sh\npnpm --filter web dev\n```\n"
+    _write_repo(tmp_path, {
+        "README.md": readme,
+        "packages/web/package.json": '{"name":"web","scripts":{}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_complex_pnpm_filter_selector_is_skipped(tmp_path):
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\npnpm --filter \"./packages/*\" dev\n```\n"
+        ),
+        "packages/web/package.json": '{"name":"web","scripts":{}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("command", "files"),
+    (
+        ("python -m streamlit run app.py", {"app.py": "print('ok')\n"}),
+        ("streamlit run app.py", {"app.py": "print('ok')\n"}),
+        ("flask --app app.py run", {"app.py": "print('ok')\n"}),
+        ("python -m flask --app app.py run", {"app.py": "print('ok')\n"}),
+        ("python -m flask --app myapp run", {"myapp.py": "app = object()\n"}),
+        ("python -m flask --app myapp run", {"myapp/__init__.py": "app = object()\n"}),
+    ),
+)
+def test_streamlit_and_flask_entries_are_validated(tmp_path, command, files):
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+        **files,
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+    for path in files:
+        (tmp_path / path).unlink()
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("command", "files"),
+    (
+        ("python -m streamlit run missing.py", {}),
+        ("streamlit run missing.py", {}),
+        ("python -m flask --app missing run", {}),
+        ("flask --app missing.py run", {}),
+    ),
+)
+def test_streamlit_and_flask_missing_entries_report_c003(tmp_path, command, files):
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+        **files,
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("command", "files"),
+    (
+        ("uvicorn app.main:app --header X:Y", {"app/main.py": "app = object()\n"}),
+        ("uvicorn --header X:Y app.main:app", {"app/main.py": "app = object()\n"}),
+        ("python -m uvicorn --header X:Y app.main:app", {"app/main.py": "app = object()\n"}),
+        ("uvicorn --header X:Y --port 8000 app.main:app", {"app/main.py": "app = object()\n"}),
+        ("uvicorn app.main:app --host 0.0.0.0 --port 8000", {"app/main.py": "app = object()\n"}),
+    ),
+)
+def test_uvicorn_option_values_do_not_override_entry(tmp_path, command, files):
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+        **files,
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+    for path in files:
+        (tmp_path / path).unlink()
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("command", "files"),
+    (
+        ("uvicorn app.main:app --header X:Y", {}),
+        ("uvicorn --header X:Y app.main:app", {}),
+        ("python -m uvicorn --header X:Y app.main:app", {}),
+    ),
+)
+def test_uvicorn_missing_module_with_option_values_reports_c003(
+    tmp_path, command, files,
+):
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+        **files,
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("command", "files"),
+    (
+        ("python -m myapp", {"src/myapp/__main__.py": "print('ok')\n"}),
+        ("python -m myapp", {"src/myapp.py": "print('ok')\n"}),
+        ("python -m pkg.svc", {"src/pkg/svc/__main__.py": "print('ok')\n"}),
+        ("python -m pkg.svc", {"src/pkg/svc.py": "print('ok')\n"}),
+    ),
+)
+def test_src_layout_runnable_module_is_validated(tmp_path, command, files):
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+        **files,
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+    for path in files:
+        (tmp_path / path).unlink()
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("command", "files"),
+    (
+        ("uvicorn myapp.api:app", {"src/myapp/api.py": "app = object()\n"}),
+        ("uvicorn myapp.api:app", {"src/myapp/api/__init__.py": "app = object()\n"}),
+    ),
+)
+def test_src_layout_import_module_is_validated(tmp_path, command, files):
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+        **files,
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+    for path in files:
+        (tmp_path / path).unlink()
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)

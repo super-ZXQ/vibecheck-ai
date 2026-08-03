@@ -100,6 +100,30 @@ _KNOWN_PYTHON_TOOL_MODULES = frozenset({
     "django", "flask", "gunicorn", "hypercorn", "jupyter", "pip",
     "pytest", "streamlit", "uvicorn", "venv",
 })
+_SIMPLE_PACKAGE_NAME_RE = re.compile(
+    r"^(@[A-Za-z0-9][A-Za-z0-9-]*/)?[A-Za-z0-9][A-Za-z0-9._-]*$"
+)
+_STREAMLIT_FLASK_TOOLS = frozenset({"streamlit", "flask"})
+_SERVER_VALUE_OPTIONS = frozenset({
+    "--header", "--host", "--port", "--workers", "--reload-dir",
+    "--reload-include", "--reload-exclude", "--env-file",
+    "--log-config", "--log-level", "--ssl-keyfile", "--ssl-certfile",
+    "--ssl-keyfile-password", "--ssl-version", "--ssl-cert-reqs",
+    "--ssl-ca-certs", "--limit-concurrency", "--backlog",
+    "--limit-max-requests", "--timeout-keep-alive",
+    "--timeout-graceful-shutdown", "--uds", "--fd", "--loop",
+    "--http", "--interface", "--ws", "--ws-ping-interval",
+    "--ws-ping-timeout", "--ws-max-size", "--ws-max-queue",
+    "--forwarded-allow-ips", "--factory", "--keyfile", "--certfile",
+    "--ca-certs", "--ciphers", "--insecure-bind",
+    "--bind", "-b", "--config", "-c", "--pid", "--error-logfile",
+    "--access-logfile", "--logger-class", "--logformat",
+    "--access-logformat", "--worker-class", "-k", "--worker-tmp-dir",
+    "--worker-connections", "--max-requests", "--max-requests-jitter",
+    "--graceful-timeout", "--keepalive", "--threads", "--paste",
+    "--limit-request-line", "--limit-request-fields",
+    "--limit-request-field-size", "--name", "--umask",
+})
 _IGNORED_DOCUMENTED_PARTS = frozenset({
     ".git", ".next", ".venv", "venv", "node_modules", "dist", "build",
     "coverage", "vendor", "generated", "__pycache__",
@@ -152,6 +176,7 @@ class _CommandReference:
     base_dir: str
     target: str
     targets: tuple[str, ...] = ()
+    workspace: str = ""
 
 
 @dataclass(frozen=True)
@@ -354,25 +379,52 @@ def _parse_workspace_command(
         return None
     manager = tokens[0].lower()
     workspace: str | None = None
+    is_name_based = False
     remainder: list[str] = []
+
+    # Name-based selectors: npm --workspace, yarn workspace, pnpm --filter
     if manager == "npm" and tokens[1] in {"--workspace", "-w"}:
         workspace, remainder = tokens[2], tokens[3:]
+        is_name_based = True
     elif manager == "npm" and tokens[1].startswith("--workspace="):
         workspace, remainder = tokens[1].split("=", 1)[1], tokens[2:]
-    elif manager == "pnpm" and tokens[1] in {"--filter", "-C", "--dir"}:
-        workspace, remainder = tokens[2], tokens[3:]
-    elif manager == "pnpm" and tokens[1].startswith(("--filter=", "--dir=")):
-        workspace, remainder = tokens[1].split("=", 1)[1], tokens[2:]
-    elif manager in {"yarn", "bun"} and tokens[1] == "--cwd":
-        workspace, remainder = tokens[2], tokens[3:]
+        is_name_based = True
     elif manager == "yarn" and tokens[1] == "workspace":
         workspace, remainder = tokens[2], tokens[3:]
+        is_name_based = True
+    elif manager == "pnpm" and tokens[1] == "--filter":
+        workspace, remainder = tokens[2], tokens[3:]
+        is_name_based = True
+        if not _SIMPLE_PACKAGE_NAME_RE.fullmatch(workspace):
+            return None
+    elif manager == "pnpm" and tokens[1].startswith("--filter="):
+        workspace, remainder = tokens[1].split("=", 1)[1], tokens[2:]
+        is_name_based = True
+        if not _SIMPLE_PACKAGE_NAME_RE.fullmatch(workspace):
+            return None
+    # Directory-based selectors: pnpm -C/--dir, yarn/bun --cwd
+    elif manager == "pnpm" and tokens[1] in {"-C", "--dir"}:
+        workspace, remainder = tokens[2], tokens[3:]
+        is_name_based = False
+    elif manager == "pnpm" and tokens[1].startswith("--dir="):
+        workspace, remainder = tokens[1].split("=", 1)[1], tokens[2:]
+        is_name_based = False
+    elif manager in {"yarn", "bun"} and tokens[1] == "--cwd":
+        workspace, remainder = tokens[2], tokens[3:]
+        is_name_based = False
+
     if workspace is None:
         return None
     if remainder and remainder[0].lower() == "run":
         remainder = remainder[1:]
     if not remainder or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:_-]*", remainder[0]):
         return None
+
+    if is_name_based:
+        return _CommandReference(
+            line_number, "node_workspace_name", base_dir, remainder[0],
+            workspace=workspace,
+        )
     normalized = _safe_relative_path(base_dir, workspace)
     if normalized is None:
         return None
@@ -408,6 +460,8 @@ def _parse_python_server_command(
     index = 0
     while index < len(arguments):
         token = arguments[index]
+
+        # Handle directory option (--app-dir / --chdir)
         if token == directory_option:
             if index + 1 >= len(arguments):
                 return None
@@ -422,15 +476,92 @@ def _parse_python_server_command(
             if normalized is None:
                 return None
             command_base = normalized
-        elif re.fullmatch(
+            index += 1
+            continue
+
+        # Skip options (flags and value-taking options)
+        if token.startswith("-"):
+            if "=" in token and not token.startswith("---"):
+                index += 1
+                continue
+            if token in _SERVER_VALUE_OPTIONS and index + 1 < len(arguments):
+                index += 2
+                continue
+            index += 1
+            continue
+
+        # Positional argument: only first match becomes the target
+        if target is None and re.fullmatch(
             r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*:[A-Za-z_]\w*", token
         ):
             target = token.split(":", 1)[0]
         index += 1
+
     if target is None:
         return None
     return _CommandReference(
         line_number, "python_import_module", command_base, target
+    )
+
+
+def _parse_streamlit_flask_command(
+    command: str,
+    line_number: int,
+    base_dir: str,
+) -> _CommandReference | None:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    tool = tokens[0].lower()
+    arguments = tokens[1:]
+    if tool in {"python", "python3"}:
+        if len(tokens) < 3 or tokens[1] != "-m":
+            return None
+        tool = tokens[2].lower()
+        arguments = tokens[3:]
+    if tool not in _STREAMLIT_FLASK_TOOLS:
+        return None
+
+    if tool == "streamlit":
+        if len(arguments) >= 2 and arguments[0].lower() == "run":
+            path = arguments[1]
+            target = _safe_relative_path(base_dir, path)
+            if target is None:
+                return None
+            return _CommandReference(line_number, "path", ".", target)
+        return None
+
+    app_target: str | None = None
+    index = 0
+    while index < len(arguments):
+        token = arguments[index]
+        if token == "--app":
+            if index + 1 >= len(arguments):
+                return None
+            app_target = arguments[index + 1]
+            index += 2
+            continue
+        if token.startswith("--app="):
+            app_target = token.split("=", 1)[1]
+            index += 1
+            continue
+        index += 1
+    if app_target is None:
+        return None
+
+    if ":" in app_target:
+        app_target = app_target.split(":", 1)[0]
+
+    if app_target.endswith(".py") or "/" in app_target or "\\" in app_target:
+        target = _safe_relative_path(base_dir, app_target)
+        if target is None:
+            return None
+        return _CommandReference(line_number, "path", ".", target)
+    return _CommandReference(
+        line_number, "python_import_module", base_dir, app_target
     )
 
 
@@ -457,6 +588,10 @@ def _parse_command(
     server = _parse_python_server_command(command, line_number, base_dir)
     if server is not None:
         return server
+
+    streamlit_flask = _parse_streamlit_flask_command(command, line_number, base_dir)
+    if streamlit_flask is not None:
+        return streamlit_flask
 
     workspace = _parse_workspace_command(command, line_number, base_dir)
     if workspace is not None:
@@ -721,6 +856,7 @@ class DocumentationConsistencyProbe(RepositoryProbe):
         self.valid_node_manifest = False
         self.valid_python_manifest = False
         self.node_scripts: dict[str, set[str]] = {}
+        self.node_package_names: dict[str, str] = {}
         self.make_targets: dict[str, set[str]] = {}
         self.requirement_roots: set[str] = set()
         self.requirement_packages: dict[str, set[str]] = {}
@@ -769,6 +905,9 @@ class DocumentationConsistencyProbe(RepositoryProbe):
         if not isinstance(data, dict):
             return
         self.valid_node_manifest = True
+        package_name = data.get("name")
+        if isinstance(package_name, str) and package_name.strip():
+            self.node_package_names[package_name] = directory
         for key in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
             dependencies = data.get(key)
             if isinstance(dependencies, dict):
@@ -905,6 +1044,18 @@ class DocumentationConsistencyProbe(RepositoryProbe):
         def rooted(name: str) -> str:
             return f"{root_prefix}/{name}" if root_prefix else name
 
+        if reference.kind == "node_workspace_name":
+            directory = self.node_package_names.get(reference.workspace)
+            if directory is not None:
+                return reference.target in self.node_scripts.get(directory, set())
+            if reference.workspace.startswith("@"):
+                return True
+            normalized = _safe_relative_path(reference.base_dir, reference.workspace)
+            if normalized is None:
+                return True
+            relative_base = normalized if normalized != "." else ""
+            directory = "/".join(part for part in (root_prefix, relative_base) if part) or "."
+            return reference.target in self.node_scripts.get(directory, set())
         if reference.kind == "node_script":
             manifest_dir = base or "."
             return reference.target in self.node_scripts.get(manifest_dir, set())
@@ -916,8 +1067,7 @@ class DocumentationConsistencyProbe(RepositoryProbe):
                 return "start" in scripts or joined("server.js") in self.paths
             if reference.target == "restart":
                 return "restart" in scripts or (
-                    "stop" in scripts
-                    and ("start" in scripts or joined("server.js") in self.paths)
+                    "start" in scripts or joined("server.js") in self.paths
                 )
             return reference.target in scripts
         if reference.kind == "path":
@@ -935,13 +1085,19 @@ class DocumentationConsistencyProbe(RepositoryProbe):
             ):
                 return True
             module = reference.target.replace(".", "/")
-            return self._path_exists(joined(f"{module}.py")) or self._path_exists(
-                joined(f"{module}/__main__.py")
+            return (
+                self._path_exists(joined(f"{module}.py"))
+                or self._path_exists(joined(f"{module}/__main__.py"))
+                or self._path_exists(joined(f"src/{module}.py"))
+                or self._path_exists(joined(f"src/{module}/__main__.py"))
             )
         if reference.kind == "python_import_module":
             module = reference.target.replace(".", "/")
-            return self._path_exists(joined(f"{module}.py")) or self._path_exists(
-                joined(f"{module}/__init__.py")
+            return (
+                self._path_exists(joined(f"{module}.py"))
+                or self._path_exists(joined(f"{module}/__init__.py"))
+                or self._path_exists(joined(f"src/{module}.py"))
+                or self._path_exists(joined(f"src/{module}/__init__.py"))
             )
         if reference.kind == "compose":
             if reference.targets:
