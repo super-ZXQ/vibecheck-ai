@@ -7,8 +7,6 @@ import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Callable
-
 from app.core.config import settings
 from app.core.security.desensitize import mask_untrusted_text
 from app.scanner.base import (
