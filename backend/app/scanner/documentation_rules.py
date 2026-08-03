@@ -56,6 +56,7 @@ _DIRECT_TREE_PATH_RE = re.compile(
     r"^\s*(?:\./)?([A-Za-z0-9._@+\-]+(?:/[A-Za-z0-9._@+\-]+)+/?)\s*$"
 )
 _SAFE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._@+\-]+/?$")
+_GITHUB_ARCHIVE_ROOT_RE = re.compile(r"^[A-Za-z0-9_.-]+-[0-9a-f]{7,40}$", re.IGNORECASE)
 _REQUIREMENT_NAME_RE = re.compile(r"^\s*([A-Za-z0-9_.-]+)(?:\[[^\]]+\])?")
 _DANGEROUS_COMMAND_RE = re.compile(r"[|;<>`]|\$\(|\$\{|%[^%]+%")
 _IGNORED_DOCUMENTED_PARTS = frozenset({
@@ -421,6 +422,7 @@ class DocumentationConsistencyProbe(RepositoryProbe):
         self.paths: set[str] = set()
         self.directories: set[str] = set()
         self.readmes: dict[str, _ReadmeFacts] = {}
+        self.top_level_parts: set[str] = set()
         self.node_packages: set[str] = set()
         self.python_packages: set[str] = set()
         self.valid_node_manifest = False
@@ -432,6 +434,8 @@ class DocumentationConsistencyProbe(RepositoryProbe):
         path = PurePosixPath(file_path)
         normalized = path.as_posix()
         self.paths.add(normalized)
+        if path.parts:
+            self.top_level_parts.add(path.parts[0])
         for parent in path.parents:
             value = parent.as_posix()
             if value != ".":
@@ -439,7 +443,7 @@ class DocumentationConsistencyProbe(RepositoryProbe):
 
         name = path.name.lower()
         directory = path.parent.as_posix()
-        if directory == "." and name in _README_PRIORITY:
+        if len(path.parts) <= 2 and name in _README_PRIORITY:
             self.readmes[normalized] = _readme_facts(normalized, lines, self.limit)
         text = "\n".join(lines)
         if name == "package.json":
@@ -520,30 +524,53 @@ class DocumentationConsistencyProbe(RepositoryProbe):
                     str(name).lower().replace("_", "-") for name in dependencies
                 )
 
-    def _primary_readme(self) -> _ReadmeFacts | None:
+    def _primary_readme(self) -> tuple[_ReadmeFacts | None, str]:
         if not self.readmes:
-            return None
+            return None, ""
+        root_readmes = [
+            facts for facts in self.readmes.values()
+            if PurePosixPath(facts.path).parent.as_posix() == "."
+        ]
+        root_prefix = ""
+        candidates = root_readmes
+        if not candidates and len(self.top_level_parts) == 1:
+            possible_root = next(iter(self.top_level_parts))
+            if _GITHUB_ARCHIVE_ROOT_RE.fullmatch(possible_root):
+                candidates = [
+                    facts for facts in self.readmes.values()
+                    if PurePosixPath(facts.path).parent.as_posix() == possible_root
+                ]
+                if candidates:
+                    root_prefix = possible_root
+        if not candidates:
+            return None, ""
         return min(
-            self.readmes.values(),
+            candidates,
             key=lambda facts: (
                 _README_PRIORITY[PurePosixPath(facts.path).name.lower()],
                 facts.path.casefold(),
                 facts.path,
             ),
-        )
+        ), root_prefix
 
     def _path_exists(self, path: str, *, directory: bool = False) -> bool:
         return path in (self.directories if directory else self.paths | self.directories)
 
-    def _command_is_valid(self, reference: _CommandReference) -> bool:
-        base = "" if reference.base_dir == "." else reference.base_dir
+    def _command_is_valid(
+        self, reference: _CommandReference, root_prefix: str
+    ) -> bool:
+        relative_base = "" if reference.base_dir == "." else reference.base_dir
+        base = "/".join(part for part in (root_prefix, relative_base) if part)
         def joined(name: str) -> str:
             return f"{base}/{name}" if base else name
+        def rooted(name: str) -> str:
+            return f"{root_prefix}/{name}" if root_prefix else name
 
         if reference.kind == "node_script":
-            return reference.target in self.node_scripts.get(reference.base_dir, set())
+            manifest_dir = base or "."
+            return reference.target in self.node_scripts.get(manifest_dir, set())
         if reference.kind == "path":
-            return self._path_exists(reference.target)
+            return self._path_exists(rooted(reference.target))
         if reference.kind == "python_module":
             module = reference.target.replace(".", "/")
             return self._path_exists(joined(f"{module}.py")) or self._path_exists(
@@ -551,14 +578,14 @@ class DocumentationConsistencyProbe(RepositoryProbe):
             )
         if reference.kind == "compose":
             if reference.target:
-                return reference.target in self.paths
+                return rooted(reference.target) in self.paths
             return any(joined(name) in self.paths for name in _COMPOSE_NAMES)
         if reference.kind == "make":
-            return reference.target in self.make_targets.get(reference.base_dir, set())
+            return reference.target in self.make_targets.get(base or ".", set())
         if reference.kind == "go":
             if reference.target in {reference.base_dir, "."}:
                 return joined("go.mod") in self.paths
-            return self._path_exists(reference.target)
+            return self._path_exists(rooted(reference.target))
         if reference.kind == "cargo":
             return joined("Cargo.toml") in self.paths
         if reference.kind == "maven":
@@ -567,7 +594,7 @@ class DocumentationConsistencyProbe(RepositoryProbe):
             return joined("build.gradle") in self.paths or joined("build.gradle.kts") in self.paths
         if reference.kind == "dotnet":
             if reference.target:
-                return self._path_exists(reference.target)
+                return self._path_exists(rooted(reference.target))
             prefix = f"{base}/" if base else ""
             return any(
                 path.startswith(prefix) and path.endswith((".csproj", ".fsproj", ".vbproj"))
@@ -579,7 +606,7 @@ class DocumentationConsistencyProbe(RepositoryProbe):
         return True
 
     def finalize(self) -> list[Finding]:
-        readme = self._primary_readme()
+        readme, root_prefix = self._primary_readme()
         if readme is None:
             return [_finding("C001_README_COMPLETENESS", _REPOSITORY_PATH)]
 
@@ -602,7 +629,7 @@ class DocumentationConsistencyProbe(RepositoryProbe):
 
         command_count = 0
         for reference in readme.commands:
-            if not self._command_is_valid(reference):
+            if not self._command_is_valid(reference, root_prefix):
                 findings.append(_finding("C003_START_COMMAND_MISMATCH", readme.path, reference.line))
                 command_count += 1
                 if command_count >= self.limit:
@@ -610,7 +637,12 @@ class DocumentationConsistencyProbe(RepositoryProbe):
 
         structure_count = 0
         for reference in readme.structure:
-            if not self._path_exists(reference.path, directory=reference.is_directory):
+            repository_path = (
+                f"{root_prefix}/{reference.path}" if root_prefix else reference.path
+            )
+            if not self._path_exists(
+                repository_path, directory=reference.is_directory
+            ):
                 findings.append(_finding("C004_PROJECT_STRUCTURE_MISMATCH", readme.path, reference.line))
                 structure_count += 1
                 if structure_count >= self.limit:

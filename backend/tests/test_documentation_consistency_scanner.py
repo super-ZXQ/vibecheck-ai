@@ -80,6 +80,37 @@ def test_primary_readme_priority_is_deterministic_and_case_insensitive(tmp_path)
     assert findings[0].file_path == "ReadMe.MD"
 
 
+def test_github_archive_wrapper_is_treated_as_repository_root(tmp_path):
+    wrapper = "owner-project-7fd1a60"
+    _write_repo(tmp_path, {
+        f"{wrapper}/README.md": (
+            f"# App\n\n{_long_intro()}\n"
+            "## Quick Start\n```sh\ncd frontend && npm run start\n```\n"
+            "## Project Structure\n```text\n"
+            "├── backend/\n│   └── app.py\n"
+            "└── frontend/\n    └── package.json\n```\n"
+        ),
+        f"{wrapper}/backend/app.py": "print('ok')\n",
+        f"{wrapper}/frontend/package.json": '{"scripts":{"start":"next start"}}',
+    })
+    ids = _rule_ids(tmp_path)
+    assert "C001_README_COMPLETENESS" not in ids
+    assert "C003_START_COMMAND_MISMATCH" not in ids
+    assert "C004_PROJECT_STRUCTURE_MISMATCH" not in ids
+
+
+def test_nested_docs_readme_is_not_mistaken_for_repository_root(tmp_path):
+    _write_repo(tmp_path, {
+        "docs/README.md": f"# Docs\n\n{_long_intro()}\n",
+        "docs/guide.md": "Guide\n",
+    })
+    finding = next(
+        finding for finding in _findings(tmp_path)
+        if finding.rule_id == "C001_README_COMPLETENESS"
+    )
+    assert finding.file_path == "<repository>"
+
+
 @pytest.mark.parametrize(
     ("technology", "manifest", "missing"),
     (
