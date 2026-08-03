@@ -67,6 +67,16 @@ def test_code_badges_urls_and_markup_do_not_inflate_prose(tmp_path):
     assert "C001_README_COMPLETENESS" in _rule_ids(tmp_path)
 
 
+def test_rst_code_blocks_do_not_inflate_prose(tmp_path):
+    _write_repo(tmp_path, {
+        "README.rst": (
+            "App\n===\n\nShort.\n\n.. code-block:: text\n\n"
+            "   " + ("generated code " * 40) + "\n"
+        ),
+    })
+    assert "C001_README_COMPLETENESS" in _rule_ids(tmp_path)
+
+
 def test_primary_readme_priority_is_deterministic_and_case_insensitive(tmp_path):
     _write_repo(tmp_path, {
         "README.RST": "Application\n===========\n" + (_long_intro() * 2),
@@ -233,7 +243,6 @@ def test_multiline_working_directory_is_applied_to_following_commands(tmp_path):
         "python -m streamlit run app.py",
         "python -m http.server 8000",
         "npm create vite@latest",
-        "yarn workspace frontend start",
     ),
 )
 def test_installation_and_tool_commands_are_not_treated_as_project_entries(
@@ -257,6 +266,117 @@ def test_python_module_server_resolves_the_application_module(tmp_path):
         "app/main.py": "app = object()\n",
     })
     assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_python_runnable_module_is_validated(tmp_path):
+    readme = (
+        f"# App\n\n{_long_intro()}\n## Running\n"
+        "```sh\npython -m service\n```\n"
+    )
+    _write_repo(tmp_path, {
+        "README.md": readme,
+        "service/__main__.py": "print('ok')\n",
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+    (tmp_path / "service" / "__main__.py").unlink()
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_declared_python_tool_module_is_not_treated_as_project_entry(tmp_path):
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\npython -m customtool\n```\n"
+        ),
+        "requirements.txt": "customtool==1.0.0\n",
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "npm --workspace web run dev",
+        "npm --workspace=web run dev",
+        "pnpm --filter web dev",
+        "pnpm --filter=web dev",
+        "pnpm -C web dev",
+        "yarn --cwd web dev",
+        "yarn workspace web dev",
+        "bun --cwd web run dev",
+    ),
+)
+def test_workspace_commands_validate_the_workspace_script(tmp_path, command):
+    readme = f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n"
+    _write_repo(tmp_path, {
+        "README.md": readme,
+        "web/package.json": '{"scripts":{"dev":"vite"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+    _write_repo(tmp_path, {"web/package.json": '{"scripts":{}}'})
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_unsupported_workspace_option_combination_is_skipped(tmp_path):
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n"
+            "```sh\npnpm --recursive --filter web dev\n```\n"
+        ),
+        "web/package.json": '{"scripts":{}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+
+def test_npm_start_accepts_default_server_js_entry(tmp_path):
+    readme = f"# App\n\n{_long_intro()}\n## Running\n```sh\nnpm start\n```\n"
+    _write_repo(tmp_path, {
+        "README.md": readme,
+        "package.json": "{}",
+        "server.js": "console.info('ok')\n",
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+    (tmp_path / "server.js").unlink()
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_npm_restart_accepts_stop_and_start_lifecycle_scripts(tmp_path):
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n## Running\n```sh\nnpm restart\n```\n"
+        ),
+        "package.json": '{"scripts":{"stop":"echo stop","start":"node app.js"}}',
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+    _write_repo(tmp_path, {"package.json": '{"scripts":{"stop":"echo stop"}}'})
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("command", "files"),
+    (
+        ("uvicorn --reload app.main:app", {"app/main.py": "app = object()\n"}),
+        ("python -m uvicorn --reload app.main:app", {"app/main.py": "app = object()\n"}),
+        ("uvicorn --app-dir src app.main:app", {"src/app/main.py": "app = object()\n"}),
+        ("uvicorn app.main:app --app-dir src", {"src/app/main.py": "app = object()\n"}),
+        ("gunicorn --chdir src app.main:app", {"src/app/main.py": "app = object()\n"}),
+        ("uvicorn service.api:app", {"service/api/__init__.py": "app = object()\n"}),
+    ),
+)
+def test_python_server_options_and_import_packages_resolve(tmp_path, command, files):
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Running\n```sh\n{command}\n```\n",
+        **files,
+    })
+    assert "C003_START_COMMAND_MISMATCH" not in _rule_ids(tmp_path)
+
+    for path in files:
+        (tmp_path / path).unlink()
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -387,6 +507,29 @@ def test_missing_entry_and_inline_command_are_reported_with_line(tmp_path):
     assert finding.line_start is not None
 
 
+@pytest.mark.parametrize("directive", (".. code-block:: bash", ".. code:: shell"))
+def test_rst_command_blocks_are_scanned(tmp_path, directive):
+    _write_repo(tmp_path, {
+        "README.rst": (
+            "Application\n===========\n\n" + _long_intro()
+            + "\nRunning\n-------\n\n" + directive
+            + "\n\n   python missing.py\n"
+        ),
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
+def test_rst_literal_command_block_is_scanned(tmp_path):
+    _write_repo(tmp_path, {
+        "README.rst": (
+            "Application\n===========\n\n" + _long_intro()
+            + "\nRunning\n-------\n\nCommands::\n\n"
+            "   python missing.py\n"
+        ),
+    })
+    assert "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
+
+
 def test_commands_outside_sections_or_with_shell_control_are_ignored(tmp_path):
     _write_repo(tmp_path, {
         "README.md": (
@@ -447,6 +590,36 @@ def test_direct_paths_generated_paths_and_unstructured_examples(tmp_path):
     assert "C004_PROJECT_STRUCTURE_MISMATCH" not in _rule_ids(tmp_path)
 
 
+def test_top_level_paths_in_structure_block_are_validated(tmp_path):
+    _write_repo(tmp_path, {
+        "README.md": (
+            f"# App\n\n{_long_intro()}\n"
+            "## Project Structure\n```text\nmissing.py\nsrc/\n...\n```\n"
+        ),
+    })
+    findings = [
+        finding for finding in _findings(tmp_path)
+        if finding.rule_id == "C004_PROJECT_STRUCTURE_MISMATCH"
+    ]
+    assert len(findings) == 2
+
+
+def test_rst_literal_structure_block_is_scanned(tmp_path):
+    _write_repo(tmp_path, {
+        "README.rst": (
+            "Application\n===========\n\n" + _long_intro()
+            + "\nProject Structure\n-----------------\n\n::\n\n"
+            "   src/\n   missing.py\n"
+        ),
+        "src/app.py": "print('ok')\n",
+    })
+    findings = [
+        finding for finding in _findings(tmp_path)
+        if finding.rule_id == "C004_PROJECT_STRUCTURE_MISMATCH"
+    ]
+    assert len(findings) == 1
+
+
 def test_unparseable_tree_parent_does_not_reuse_previous_sibling(tmp_path):
     _write_repo(tmp_path, {
         "README.md": (
@@ -503,6 +676,18 @@ def test_referenced_requirements_file_confirms_documented_technology(tmp_path):
         "README.md": f"# App\n\n{_long_intro()}\n## Tech Stack\n- FastAPI\n",
         "requirements.txt": "-r requirements/prod.txt\n",
         "requirements/prod.txt": "fastapi==0.116.1\n",
+    })
+    assert "C002_TECH_STACK_MISMATCH" not in _rule_ids(tmp_path)
+
+
+@pytest.mark.parametrize("included", ("requirements/base.in", "requirements/base"))
+def test_referenced_requirements_files_are_parsed_regardless_of_suffix(
+    tmp_path, included,
+):
+    _write_repo(tmp_path, {
+        "README.md": f"# App\n\n{_long_intro()}\n## Tech Stack\n- FastAPI\n",
+        "requirements.txt": f"-r {included}\n",
+        included: "fastapi==0.116.1\n",
     })
     assert "C002_TECH_STACK_MISMATCH" not in _rule_ids(tmp_path)
 

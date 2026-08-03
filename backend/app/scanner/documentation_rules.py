@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
+import sys
 import tomllib
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -46,12 +48,16 @@ _STRUCTURE_SECTION_RE = re.compile(
 _MARKDOWN_HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
 _RST_UNDERLINE_RE = re.compile(r"^\s*([=\-~^])\1{2,}\s*$")
 _FENCE_RE = re.compile(r"^\s*(```+|~~~+)")
+_RST_CODE_DIRECTIVE_RE = re.compile(
+    r"^\s*\.\.\s+(?:code-block|code)::(?:\s+\S+)?\s*$",
+    re.IGNORECASE,
+)
 _INLINE_COMMAND_RE = re.compile(
     r"^\s*(?:[-*+]\s+|\d+[.)]\s+)?`([^`]+)`\s*[.!。]?[\s]*$"
 )
 _TREE_RE = re.compile(r"^(?P<prefix>(?:│   |    )*)(?:├──|└──)\s*(?P<name>.+?)\s*$")
 _DIRECT_TREE_PATH_RE = re.compile(
-    r"^\s*(?:\./)?([A-Za-z0-9._@+\-]+(?:/[A-Za-z0-9._@+\-]+)+/?)\s*$"
+    r"^\s*(?:\./)?([A-Za-z0-9._@+\-]+(?:/[A-Za-z0-9._@+\-]+)*/?)\s*$"
 )
 _SAFE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._@+\-]+/?$")
 _ARCHIVE_ROOT_RE = re.compile(
@@ -90,6 +96,10 @@ _NODE_BUILTIN_COMMANDS = {
     }),
 }
 _MAX_REQUIREMENT_INCLUDE_DEPTH = 8
+_KNOWN_PYTHON_TOOL_MODULES = frozenset({
+    "django", "flask", "gunicorn", "hypercorn", "jupyter", "pip",
+    "pytest", "streamlit", "uvicorn", "venv",
+})
 _IGNORED_DOCUMENTED_PARTS = frozenset({
     ".git", ".next", ".venv", "venv", "node_modules", "dist", "build",
     "coverage", "vendor", "generated", "__pycache__",
@@ -222,15 +232,75 @@ def _section_ranges(
     return ranges
 
 
-def _prose_character_count(lines: list[str]) -> int:
-    visible: list[str] = []
+def _document_code_lines(lines: list[str]) -> tuple[set[int], set[int]]:
+    """Return code-content lines and all lines excluded from prose."""
+    content: set[int] = set()
+    excluded: set[int] = set()
     in_fence = False
-    in_comment = False
-    for line in lines:
+    for index, line in enumerate(lines):
         if _FENCE_RE.match(line):
             in_fence = not in_fence
+            excluded.add(index)
+        elif in_fence:
+            content.add(index)
+            excluded.add(index)
+
+    index = 0
+    while index < len(lines):
+        if index in excluded:
+            index += 1
             continue
-        if in_fence:
+        stripped = lines[index].rstrip()
+        is_directive = bool(_RST_CODE_DIRECTIVE_RE.match(stripped))
+        is_literal = stripped.endswith("::") and not is_directive
+        if not (is_directive or is_literal):
+            index += 1
+            continue
+
+        marker_indent = len(lines[index]) - len(lines[index].lstrip())
+        cursor = index + 1
+        if is_directive:
+            excluded.add(index)
+        while cursor < len(lines):
+            current = lines[cursor]
+            if not current.strip():
+                excluded.add(cursor)
+                cursor += 1
+                continue
+            current_indent = len(current) - len(current.lstrip())
+            if is_directive and current_indent > marker_indent and current.lstrip().startswith(":"):
+                excluded.add(cursor)
+                cursor += 1
+                continue
+            break
+        if cursor >= len(lines):
+            break
+        block_indent = len(lines[cursor]) - len(lines[cursor].lstrip())
+        if block_indent <= marker_indent:
+            index += 1
+            continue
+        while cursor < len(lines):
+            current = lines[cursor]
+            if not current.strip():
+                content.add(cursor)
+                excluded.add(cursor)
+                cursor += 1
+                continue
+            current_indent = len(current) - len(current.lstrip())
+            if current_indent < block_indent:
+                break
+            content.add(cursor)
+            excluded.add(cursor)
+            cursor += 1
+        index = cursor
+    return content, excluded
+
+
+def _prose_character_count(lines: list[str], excluded_lines: set[int]) -> int:
+    visible: list[str] = []
+    in_comment = False
+    for index, line in enumerate(lines):
+        if index in excluded_lines:
             continue
         current = line
         if in_comment:
@@ -271,6 +341,99 @@ def _safe_relative_path(base_dir: str, value: str) -> str | None:
     return mask_untrusted_text(normalized)
 
 
+def _parse_workspace_command(
+    command: str,
+    line_number: int,
+    base_dir: str,
+) -> _CommandReference | None:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    if len(tokens) < 3:
+        return None
+    manager = tokens[0].lower()
+    workspace: str | None = None
+    remainder: list[str] = []
+    if manager == "npm" and tokens[1] in {"--workspace", "-w"}:
+        workspace, remainder = tokens[2], tokens[3:]
+    elif manager == "npm" and tokens[1].startswith("--workspace="):
+        workspace, remainder = tokens[1].split("=", 1)[1], tokens[2:]
+    elif manager == "pnpm" and tokens[1] in {"--filter", "-C", "--dir"}:
+        workspace, remainder = tokens[2], tokens[3:]
+    elif manager == "pnpm" and tokens[1].startswith(("--filter=", "--dir=")):
+        workspace, remainder = tokens[1].split("=", 1)[1], tokens[2:]
+    elif manager in {"yarn", "bun"} and tokens[1] == "--cwd":
+        workspace, remainder = tokens[2], tokens[3:]
+    elif manager == "yarn" and tokens[1] == "workspace":
+        workspace, remainder = tokens[2], tokens[3:]
+    if workspace is None:
+        return None
+    if remainder and remainder[0].lower() == "run":
+        remainder = remainder[1:]
+    if not remainder or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:_-]*", remainder[0]):
+        return None
+    normalized = _safe_relative_path(base_dir, workspace)
+    if normalized is None:
+        return None
+    return _CommandReference(
+        line_number, "node_script", normalized, remainder[0]
+    )
+
+
+def _parse_python_server_command(
+    command: str,
+    line_number: int,
+    base_dir: str,
+) -> _CommandReference | None:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    server = tokens[0].lower()
+    arguments = tokens[1:]
+    if server in {"python", "python3"}:
+        if len(tokens) < 3 or tokens[1] != "-m":
+            return None
+        server = tokens[2].lower()
+        arguments = tokens[3:]
+    if server not in {"uvicorn", "gunicorn", "hypercorn"}:
+        return None
+
+    directory_option = "--chdir" if server == "gunicorn" else "--app-dir"
+    command_base = base_dir
+    target: str | None = None
+    index = 0
+    while index < len(arguments):
+        token = arguments[index]
+        if token == directory_option:
+            if index + 1 >= len(arguments):
+                return None
+            normalized = _safe_relative_path(base_dir, arguments[index + 1])
+            if normalized is None:
+                return None
+            command_base = normalized
+            index += 2
+            continue
+        if token.startswith(f"{directory_option}="):
+            normalized = _safe_relative_path(base_dir, token.split("=", 1)[1])
+            if normalized is None:
+                return None
+            command_base = normalized
+        elif re.fullmatch(
+            r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*:[A-Za-z_]\w*", token
+        ):
+            target = token.split(":", 1)[0]
+        index += 1
+    if target is None:
+        return None
+    return _CommandReference(
+        line_number, "python_import_module", command_base, target
+    )
+
+
 def _parse_command(
     line: str,
     line_number: int,
@@ -291,15 +454,25 @@ def _parse_command(
     if "&" in command:
         return None
 
+    server = _parse_python_server_command(command, line_number, base_dir)
+    if server is not None:
+        return server
+
+    workspace = _parse_workspace_command(command, line_number, base_dir)
+    if workspace is not None:
+        return workspace
+    if re.match(r"^(?:npm|pnpm|yarn|bun)\s+(?:-|workspace\b)", command, re.IGNORECASE):
+        return None
+
     node = re.match(
-        r"^(npm|pnpm|yarn|bun)\s+run\s+([A-Za-z0-9:_-]+)(?:\s|$)",
+        r"^(npm|pnpm|yarn|bun)\s+run\s+([A-Za-z0-9][A-Za-z0-9:_-]*)(?:\s|$)",
         command, re.IGNORECASE,
     )
     if node:
         return _CommandReference(line_number, "node_script", base_dir, node.group(2))
 
     node_shorthand = re.match(
-        r"^(npm|pnpm|yarn|bun)\s+([A-Za-z0-9:_-]+)(?:\s|$)",
+        r"^(npm|pnpm|yarn|bun)\s+([A-Za-z0-9][A-Za-z0-9:_-]*)(?:\s|$)",
         command,
         re.IGNORECASE,
     )
@@ -310,36 +483,22 @@ def _parse_command(
         if manager == "npm":
             if lowered not in {"restart", "start", "stop", "test"}:
                 return None
+            return _CommandReference(line_number, "npm_lifecycle", base_dir, lowered)
         elif lowered in _NODE_BUILTIN_COMMANDS[manager]:
             return None
         return _CommandReference(line_number, "node_script", base_dir, script)
-
-    python_module_server = re.match(
-        r"^python(?:3)?\s+-m\s+(?:uvicorn|gunicorn|hypercorn)\s+"
-        r"([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*):[A-Za-z_]\w*",
-        command,
-        re.IGNORECASE,
-    )
-    if python_module_server:
-        return _CommandReference(
-            line_number, "python_module", base_dir, python_module_server.group(1)
-        )
     python_module = re.match(
         r"^python(?:3)?\s+-m\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)",
         command,
     )
     if python_module:
-        return None
+        return _CommandReference(
+            line_number, "python_runnable_module", base_dir, python_module.group(1)
+        )
     python_file = re.match(r"^python(?:3)?\s+([^\s]+\.py)(?:\s|$)", command)
     if python_file:
         target = _safe_relative_path(base_dir, python_file.group(1))
         return _CommandReference(line_number, "path", ".", target) if target else None
-    python_server = re.match(
-        r"^(?:uvicorn|gunicorn|hypercorn)\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*):[A-Za-z_]\w*",
-        command,
-    )
-    if python_server:
-        return _CommandReference(line_number, "python_module", base_dir, python_server.group(1))
     node_file = re.match(r"^(?:node|tsx|ts-node)\s+([^\s]+\.(?:js|mjs|cjs|ts|tsx))(?:\s|$)", command)
     if node_file:
         target = _safe_relative_path(base_dir, node_file.group(1))
@@ -406,23 +565,25 @@ def _technology_references(lines: list[str]) -> tuple[_TechnologyReference, ...]
     return tuple(references)
 
 
-def _command_references(lines: list[str]) -> tuple[_CommandReference, ...]:
+def _command_references(
+    lines: list[str], code_lines: set[int]
+) -> tuple[_CommandReference, ...]:
     references: list[_CommandReference] = []
     for start, end in _section_ranges(lines, _COMMAND_SECTION_RE):
-        in_fence = False
+        in_code_block = False
         pending_parts: list[str] = []
         pending_line = 0
         working_directory: str | None = "."
         for index in range(start, end):
             line = lines[index]
-            if _FENCE_RE.match(line):
-                in_fence = not in_fence
+            is_code = index in code_lines
+            if is_code != in_code_block:
+                in_code_block = is_code
                 pending_parts.clear()
                 working_directory = "."
-                continue
             candidate: str | None = None
             candidate_line = index + 1
-            if in_fence:
+            if is_code:
                 stripped = line.strip()
                 if pending_parts:
                     pending_parts.append(
@@ -449,37 +610,39 @@ def _command_references(lines: list[str]) -> tuple[_CommandReference, ...]:
                 directory_change = re.fullmatch(
                     r"cd\s+([^\s]+)", normalized_candidate, re.IGNORECASE
                 )
-                if in_fence and directory_change:
+                if is_code and directory_change:
                     if working_directory is not None:
                         working_directory = _safe_relative_path(
                             working_directory, directory_change.group(1)
                         )
                     continue
-                if in_fence and working_directory is None:
+                if is_code and working_directory is None:
                     continue
                 parsed = _parse_command(
                     candidate,
                     candidate_line,
-                    working_directory if in_fence else ".",
+                    working_directory if is_code else ".",
                 )
                 if parsed is not None:
                     references.append(parsed)
     return tuple(references)
 
 
-def _structure_references(lines: list[str]) -> tuple[_StructureReference, ...]:
+def _structure_references(
+    lines: list[str], code_lines: set[int]
+) -> tuple[_StructureReference, ...]:
     references: list[_StructureReference] = []
     seen: set[str] = set()
     for start, end in _section_ranges(lines, _STRUCTURE_SECTION_RE):
-        in_fence = False
+        in_code_block = False
         stack: dict[int, str] = {}
         for index in range(start, end):
             line = lines[index]
-            if _FENCE_RE.match(line):
-                in_fence = not in_fence
+            is_code = index in code_lines
+            if is_code != in_code_block:
+                in_code_block = is_code
                 stack.clear()
-                continue
-            if not in_fence:
+            if not is_code:
                 continue
             match = _TREE_RE.match(line)
             path_value: str | None = None
@@ -492,7 +655,7 @@ def _structure_references(lines: list[str]) -> tuple[_StructureReference, ...]:
                 next_index = index + 1
                 while next_index < end and not lines[next_index].strip():
                     next_index += 1
-                if next_index < end and not _FENCE_RE.match(lines[next_index]):
+                if next_index < end and next_index in code_lines:
                     next_match = _TREE_RE.match(lines[next_index])
                     if next_match:
                         next_depth = len(next_match.group("prefix")) // 4
@@ -515,6 +678,8 @@ def _structure_references(lines: list[str]) -> tuple[_StructureReference, ...]:
             else:
                 direct = _DIRECT_TREE_PATH_RE.match(line)
                 if direct:
+                    if direct.group(1) == "...":
+                        continue
                     is_directory = direct.group(1).endswith("/")
                     path_value = direct.group(1).rstrip("/")
             if not path_value:
@@ -532,12 +697,13 @@ def _structure_references(lines: list[str]) -> tuple[_StructureReference, ...]:
 
 
 def _readme_facts(file_path: str, lines: list[str]) -> _ReadmeFacts:
+    code_lines, excluded_lines = _document_code_lines(lines)
     return _ReadmeFacts(
         path=file_path,
-        prose_characters=_prose_character_count(lines),
+        prose_characters=_prose_character_count(lines, excluded_lines),
         technologies=_technology_references(lines),
-        commands=_command_references(lines),
-        structure=_structure_references(lines),
+        commands=_command_references(lines, code_lines),
+        structure=_structure_references(lines, code_lines),
     )
 
 
@@ -582,18 +748,18 @@ class DocumentationConsistencyProbe(RepositoryProbe):
         text = "\n".join(lines)
         if name == "package.json":
             self._observe_package_json(directory, text)
-        elif name.endswith(".txt"):
-            self._observe_requirements(normalized, directory, name, lines)
-        elif name == "pyproject.toml":
-            self._observe_pyproject(text)
-        elif name == "pipfile":
-            self._observe_pipfile(text)
         elif name in {"makefile", "gnumakefile"}:
             targets = self.make_targets.setdefault(directory, set())
             for line in lines:
                 target = re.match(r"^([A-Za-z0-9_.-]+)\s*:(?!=)", line)
                 if target:
                     targets.add(target.group(1))
+        elif name.endswith((".txt", ".in")) or not path.suffix:
+            self._observe_requirements(normalized, directory, name, lines)
+        elif name == "pyproject.toml":
+            self._observe_pyproject(text)
+        elif name == "pipfile":
+            self._observe_pipfile(text)
 
     def _observe_package_json(self, directory: str, text: str) -> None:
         try:
@@ -742,12 +908,40 @@ class DocumentationConsistencyProbe(RepositoryProbe):
         if reference.kind == "node_script":
             manifest_dir = base or "."
             return reference.target in self.node_scripts.get(manifest_dir, set())
+        if reference.kind == "npm_lifecycle":
+            scripts = self.node_scripts.get(base or ".", set())
+            if joined("package.json") not in self.paths:
+                return False
+            if reference.target == "start":
+                return "start" in scripts or joined("server.js") in self.paths
+            if reference.target == "restart":
+                return "restart" in scripts or (
+                    "stop" in scripts
+                    and ("start" in scripts or joined("server.js") in self.paths)
+                )
+            return reference.target in scripts
         if reference.kind == "path":
             return self._path_exists(rooted(reference.target))
-        if reference.kind == "python_module":
+        if reference.kind == "python_runnable_module":
+            top_level = reference.target.split(".", 1)[0].lower()
+            dependency = top_level.replace("_", "-")
+            declared_packages = (
+                self.python_packages | self._resolved_requirement_packages()
+            )
+            if (
+                top_level in sys.stdlib_module_names
+                or top_level in _KNOWN_PYTHON_TOOL_MODULES
+                or dependency in declared_packages
+            ):
+                return True
             module = reference.target.replace(".", "/")
             return self._path_exists(joined(f"{module}.py")) or self._path_exists(
                 joined(f"{module}/__main__.py")
+            )
+        if reference.kind == "python_import_module":
+            module = reference.target.replace(".", "/")
+            return self._path_exists(joined(f"{module}.py")) or self._path_exists(
+                joined(f"{module}/__init__.py")
             )
         if reference.kind == "compose":
             if reference.targets:
