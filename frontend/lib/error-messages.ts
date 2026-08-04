@@ -7,6 +7,8 @@
  * are ever displayed.
  */
 
+import { lookup } from "./lookup";
+
 const ERROR_MESSAGES: Record<string, string> = {
   // Task lookup
   TASK_NOT_FOUND: "任务不存在。",
@@ -76,5 +78,5 @@ export const CONFIG_ERROR_MESSAGE =
  */
 export function getErrorMessage(errorCode: string | null | undefined): string {
   if (!errorCode) return UNKNOWN_ERROR_MESSAGE;
-  return ERROR_MESSAGES[errorCode] ?? UNKNOWN_ERROR_MESSAGE;
+  return lookup(ERROR_MESSAGES, errorCode, UNKNOWN_ERROR_MESSAGE);
 }

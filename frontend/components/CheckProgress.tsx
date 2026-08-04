@@ -10,6 +10,7 @@
 "use client";
 
 import { useCountUp } from "@/hooks/use-count-up";
+import { lookup } from "@/lib/lookup";
 import type { TaskStatusResponse } from "@/lib/types";
 
 interface CheckProgressProps {
@@ -44,7 +45,7 @@ function stageIndex(stage: string): number {
 }
 
 export function CheckProgress({ taskStatus }: CheckProgressProps) {
-  const stageLabel = STAGE_LABELS[taskStatus.stage] ?? taskStatus.stage;
+  const stageLabel = lookup(STAGE_LABELS, taskStatus.stage, taskStatus.stage);
   const progress = Math.max(0, Math.min(100, taskStatus.progress));
   const currentIdx = stageIndex(taskStatus.stage);
   const displayProgress = useCountUp(progress);

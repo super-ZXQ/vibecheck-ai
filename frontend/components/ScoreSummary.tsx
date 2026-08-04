@@ -10,6 +10,7 @@
 "use client";
 
 import { useCountUp } from "@/hooks/use-count-up";
+import { lookup } from "@/lib/lookup";
 import type { TaskStatusResponse } from "@/lib/types";
 
 interface ScoreSummaryProps {
@@ -47,18 +48,20 @@ export function ScoreSummary({ taskStatus }: ScoreSummaryProps) {
   const score = taskStatus.security_score;
   const verdict = taskStatus.security_verdict;
 
+  // Hooks must run unconditionally, before any early return.
+  const clamped = score === null ? 0 : Math.max(0, Math.min(100, score));
+  const displayedScore = useCountUp(clamped, 900);
+
   // If no score/verdict, don't render
   if (score === null || verdict === null) {
     return null;
   }
 
-  const verdictLabel = VERDICT_LABELS[verdict] ?? verdict;
-  const verdictClass = VERDICT_CLASSES[verdict] ?? "verdict-warning";
-  const ringColor = RING_COLORS[verdict] ?? RING_COLORS.warning;
-  const ringLight = RING_LIGHT_COLORS[verdict] ?? RING_LIGHT_COLORS.warning;
-  const clamped = Math.max(0, Math.min(100, score));
+  const verdictLabel = lookup(VERDICT_LABELS, verdict, verdict);
+  const verdictClass = lookup(VERDICT_CLASSES, verdict, "verdict-warning");
+  const ringColor = lookup(RING_COLORS, verdict, RING_COLORS.warning);
+  const ringLight = lookup(RING_LIGHT_COLORS, verdict, RING_LIGHT_COLORS.warning);
   const dashOffset = RING_CIRCUMFERENCE * (1 - clamped / 100);
-  const displayedScore = useCountUp(score, 900);
   const gradientId = `ring-grad-${verdict}`;
 
   return (

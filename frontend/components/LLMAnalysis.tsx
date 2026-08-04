@@ -4,6 +4,7 @@
  * local fallback templates (source field).
  */
 
+import { lookup } from "@/lib/lookup";
 import type { LLMAnalysisItem, LLMAnalysisResult } from "@/lib/types";
 
 interface LLMAnalysisProps {
@@ -17,7 +18,7 @@ const SOURCE_LABELS: Record<string, string> = {
 };
 
 function sourceLabel(source: string): string {
-  return SOURCE_LABELS[source] ?? source;
+  return lookup(SOURCE_LABELS, source, source);
 }
 
 function LLMItemCard({ item }: { item: LLMAnalysisItem }) {

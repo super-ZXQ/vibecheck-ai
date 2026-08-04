@@ -11,26 +11,12 @@
  */
 
 import type { AssessmentResult } from "@/lib/types";
+import { lookup } from "@/lib/lookup";
+import { SEVERITY_CLASSES, SEVERITY_LABELS } from "@/lib/severity";
 
 interface AssessmentDetailsProps {
   assessment: AssessmentResult;
 }
-
-const SEVERITY_CLASSES: Record<string, string> = {
-  critical: "severity-critical",
-  high: "severity-high",
-  medium: "severity-medium",
-  low: "severity-low",
-  info: "severity-info",
-};
-
-const SEVERITY_LABELS: Record<string, string> = {
-  critical: "严重",
-  high: "高",
-  medium: "中",
-  low: "低",
-  info: "信息",
-};
 
 export function AssessmentDetails({ assessment }: AssessmentDetailsProps) {
   return (
@@ -76,10 +62,10 @@ export function AssessmentDetails({ assessment }: AssessmentDetailsProps) {
                 <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                   <span
                     className={`severity-badge ${
-                      SEVERITY_CLASSES[r.severity] ?? "severity-info"
+                      lookup(SEVERITY_CLASSES, r.severity, "severity-info")
                     }`}
                   >
-                    {SEVERITY_LABELS[r.severity] ?? r.severity}
+                    {lookup(SEVERITY_LABELS, r.severity, r.severity)}
                   </span>
                   <strong>{r.rule_name}</strong>
                 </div>
@@ -118,10 +104,10 @@ export function AssessmentDetails({ assessment }: AssessmentDetailsProps) {
                     <td>
                       <span
                         className={`severity-badge ${
-                          SEVERITY_CLASSES[e.severity] ?? "severity-info"
+                          lookup(SEVERITY_CLASSES, e.severity, "severity-info")
                         }`}
                       >
-                        {SEVERITY_LABELS[e.severity] ?? e.severity}
+                        {lookup(SEVERITY_LABELS, e.severity, e.severity)}
                       </span>
                     </td>
                     <td>{e.finding_count}</td>
