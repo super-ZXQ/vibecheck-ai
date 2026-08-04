@@ -25,6 +25,7 @@ const STAGE_LABELS: Record<string, string> = {
   scanning: "扫描敏感信息",
   assessing: "安全评估",
   repairing: "生成修复计划",
+  analyzing: "AI 分析",
   finished: "完成",
 };
 
@@ -35,7 +36,8 @@ const PIPELINE_STEPS: { key: string; label: string }[] = [
   { key: "scanning", label: "扫描" },
   { key: "assessing", label: "评估" },
   { key: "repairing", label: "修复" },
-  { key: "finished", label: "分析" },
+  { key: "analyzing", label: "分析" },
+  { key: "finished", label: "完成" },
 ];
 
 function stageIndex(stage: string): number {
