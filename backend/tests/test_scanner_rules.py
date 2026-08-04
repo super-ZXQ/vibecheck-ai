@@ -296,6 +296,59 @@ class TestPasswordAssignmentRule:
         assert len(findings) == 1
         assert "$uperSecret123" not in findings[0].snippet_masked
 
+    def test_password_method_call_value_skipped(self):
+        """Method-call RHS (dict.get) is resolved at runtime, not a literal."""
+        rule = PasswordAssignmentRule()
+        lines = ["    stored_password = _configured_users().get(username)"]
+        findings = rule.scan_content("backend/utils/auth.py", lines)
+        assert len(findings) == 0
+
+    def test_password_attribute_chain_skipped(self):
+        """Attribute-chain RHS (parsed.password) is a runtime lookup."""
+        rule = PasswordAssignmentRule()
+        lines = ["            password=parsed.password or \"\","]
+        findings = rule.scan_content("scripts/health_check.py", lines)
+        assert len(findings) == 0
+
+    def test_password_env_nested_getenv_skipped(self):
+        """Nested os.getenv call (truncated at whitespace) is not a literal."""
+        rule = PasswordAssignmentRule()
+        lines = ['    password = os.getenv("DB_SYNC_PASSWORD", os.getenv("DB_PASSWORD", ""))']
+        findings = rule.scan_content("backend/scripts/sync_orders.py", lines)
+        assert len(findings) == 0
+
+    def test_password_identifier_reference_skipped(self):
+        """Plain identifier RHS (password=stored_pw) is a variable reference."""
+        rule = PasswordAssignmentRule()
+        lines = ["                password=stored_pw,"]
+        findings = rule.scan_content("backend/scripts/sync_orders.py", lines)
+        assert len(findings) == 0
+
+    def test_password_shell_env_concat_skipped(self):
+        """Shell env-var concatenation is not a hardcoded literal."""
+        rule = PasswordAssignmentRule()
+        lines = ['APP_PASSWORD_ESCAPED="$(escape_sql_string "${DB_APP_PASSWORD}")"']
+        findings = rule.scan_content("deploy/mysql/bootstrap-users.sh", lines)
+        assert len(findings) == 0
+
+    def test_password_documentation_text_skipped(self):
+        """Chinese documentation prompt text is not a credential."""
+        rule = PasswordAssignmentRule()
+        lines = ['DB_PASSWORD=你的MySQL密码']
+        findings = rule.scan_content("README.md", lines)
+        assert len(findings) == 0
+
+    def test_password_test_file_downgraded_to_low(self):
+        """Password fixtures in test files are downgraded to low/low."""
+        rule = PasswordAssignmentRule()
+        lines = ["        client.post('/api/auth/login', password='test-pw-123')"]
+        findings = rule.scan_content("backend/tests/test_api.py", lines)
+        assert len(findings) == 1
+        f = findings[0]
+        assert f.severity == Severity.LOW
+        assert f.confidence == Confidence.LOW
+        assert f.is_blocking is False
+
 
 class TestGenericTokenAssignmentRule:
     """Tests for R007 GenericTokenAssignmentRule."""
@@ -412,6 +465,50 @@ class TestGenericTokenAssignmentRule:
         assert len(findings) == 1
         assert findings[0].severity == Severity.HIGH
 
+    def test_attribute_chain_value_skipped(self):
+        """Attribute-chain RHS (settings.jwt_expire_minutes) is a runtime ref."""
+        rule = GenericTokenAssignmentRule()
+        lines = ["ACCESS_TOKEN_EXPIRE_MINUTES = settings.jwt_expire_minutes"]
+        findings = rule.scan_content("src/utils/auth.py", lines)
+        assert len(findings) == 0
+
+    def test_identifier_reference_value_skipped(self):
+        """Plain identifier RHS (api_key=CUSTOM_KEY) is a constant/variable ref."""
+        rule = GenericTokenAssignmentRule()
+        lines = ["        api_key=CUSTOM_KEY,"]
+        findings = rule.scan_content("src/app.py", lines)
+        assert len(findings) == 0
+
+    def test_await_expression_value_skipped(self):
+        """await expression RHS (const token = await ensureAuth()) is dynamic."""
+        rule = GenericTokenAssignmentRule()
+        lines = ["const token = await ensureAuth();"]
+        findings = rule.scan_content("src/demo.html", lines)
+        assert len(findings) == 0
+
+    def test_documentation_text_skipped(self):
+        """Chinese documentation prompt text is not a credential."""
+        rule = GenericTokenAssignmentRule()
+        lines = ["LLM_API_KEY=sk-你的DeepSeekKey"]
+        findings = rule.scan_content("README.md", lines)
+        assert len(findings) == 0
+
+    def test_quoted_placeholder_downgraded(self):
+        """Quoted placeholder values are kept but downgraded to low/low."""
+        rule = GenericTokenAssignmentRule()
+        lines = ['JWT_SECRET="your-secret-key-change-in-production"']
+        findings = rule.scan_content("README.md", lines)
+        assert len(findings) == 1
+        assert findings[0].severity == Severity.LOW
+
+    def test_numeric_ci_value_still_detected(self):
+        """Unquoted numeric CI test values are still detected high/medium."""
+        rule = GenericTokenAssignmentRule()
+        lines = ["          JWT_SECRET=ci-test-secret-not-for-production"]
+        findings = rule.scan_content(".github/workflows/ci.yml", lines)
+        assert len(findings) == 1
+        assert findings[0].severity == Severity.HIGH
+
 
 # ============================================================================
 # --- Connection string (1 test) ---
@@ -433,6 +530,22 @@ class TestConnectionStringRule:
         assert f.is_blocking is False
         # Password must not appear in snippet
         assert "s3cr3tpw" not in f.snippet_masked
+
+    def test_connection_string_doc_placeholder_downgraded(self):
+        """Documentation placeholder password (pass/***) is downgraded to low."""
+        rule = ConnectionStringRule()
+        lines = ['  --db "mysql+pymysql://user:pass@host:3306/db" \\']
+        findings = rule.scan_content("README.md", lines)
+        assert len(findings) == 1
+        assert findings[0].severity == Severity.LOW
+
+    def test_connection_string_real_password_stays_high(self):
+        """Real-looking password keeps high severity."""
+        rule = ConnectionStringRule()
+        lines = ['  --db "mysql+pymysql://root:123456@localhost/ai_commerce" \\']
+        findings = rule.scan_content("scripts/health_check.py", lines)
+        assert len(findings) == 1
+        assert findings[0].severity == Severity.HIGH
 
 
 # ============================================================================
