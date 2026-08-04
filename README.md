@@ -15,6 +15,7 @@
 - **LLM 分析**：基于非阻断式分析生成修复建议，结果不可用时自动回退到模板。
 - **检测历史**：浏览器本地持久化的检测记录卡片化展示，失败任务标注「检测失败」。
 - **结果导出**：将检测结果导出为 JSON 报告文件（含扫描、评估、修复计划与 AI 分析）。
+- **本地上传通道**：支持上传 `.zip` / `.tar.gz` 压缩包或本地文件夹替代 GitHub 下载（压缩包 ≤ 50 MB，解压总量 ≤ 200 MB，单文件 ≤ 25 MB，文件数 ≤ 2000）。
 - **浅色玻璃拟态界面**：无外部 CSS/JS/字体依赖，纯 CSS 渐变、玻璃拟态与内联 SVG。
 
 ## 技术栈
@@ -87,6 +88,10 @@ curl http://localhost:3000/health
 上调，但硬上限为 50 MB。超过独立 1 MB 扫描上限的文件只会安全解压并记录为
 跳过，不会读入规则扫描；压缩包 50 MB 与解压总量 200 MB 的限制保持不变。
 
+本地上传的压缩包与文件夹同样写入 `/tmp` 临时目录，`BACKEND_TMPFS_SIZE`
+的计算已包含上传上限（压缩包 50 MB + 解压总量 200 MB）；上传任务在完成或
+失败后立即清理临时目录。
+
 生产响应会发送 HSTS 头，但浏览器只会在服务经过 HTTPS 反向代理访问时执行
 HSTS；本机 HTTP 验收仅用于确认响应头存在，不能替代真实 TLS 部署验证。
 
@@ -103,6 +108,20 @@ HSTS；本机 HTTP 验收仅用于确认响应头存在，不能替代真实 TLS
 响应：`{ "task_id": "...", "status": "queued", "check_url": "/check/{task_id}" }`
 
 非法 URL 返回 `400 INVALID_REPO_URL`；队列已满返回 `429 QUEUE_FULL`。
+
+### 本地上传
+
+`POST /api/check/upload`（multipart/form-data）
+
+- `mode=archive`：单个 `file` 字段，支持 `.zip` / `.tar.gz` / `.tgz`，内容按魔数识别。
+- `mode=folder`：多个 `file` 字段，文件名携带相对路径（`webkitRelativePath`），后端按该路径重建目录结构。
+
+限制：压缩包 ≤ 50 MB、解压总量 ≤ 200 MB、单文件 ≤ 25 MB（可经
+`MAX_SINGLE_FILE_SIZE` 下调/上调，硬上限 50 MB）、文件数 ≤ 2000。
+
+响应：`{ "task_id": "...", "status": "pending", "check_url": "/check/{task_id}" }`
+
+超限返回 `413 UPLOAD_TOO_LARGE`；格式非法或包含不安全内容（路径穿越、符号链接）返回 `400 INVALID_UPLOAD`；队列已满返回 `429 QUEUE_FULL`。上传任务与 GitHub 检测共用同一处理队列，任务目录随任务结束一并清理。
 
 ### 轮询任务状态
 
