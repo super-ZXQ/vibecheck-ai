@@ -34,6 +34,7 @@ import {
   ApiRequestTimeoutError,
   throwAbortOutcome,
 } from "./api-abort.mjs";
+import { buildLLMHeaders } from "./llm-config";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -136,7 +137,12 @@ async function apiFetch<T>(path: string, options: FetchOptions): Promise<T> {
       cache: "no-store" as RequestCache,
       headers:
         options.method === "POST"
-          ? { "Content-Type": "application/json", Accept: "application/json" }
+          ? {
+              "Content-Type": "application/json",
+              Accept: "application/json",
+              // Per-user LLM config (only fields the user filled in).
+              ...buildLLMHeaders(),
+            }
           : { Accept: "application/json" },
       signal: internalSignal,
     };
@@ -279,6 +285,8 @@ export async function submitUpload(
         method: "POST",
         body: formData,
         cache: "no-store" as RequestCache,
+        // Per-user LLM config (only fields the user filled in).
+        headers: buildLLMHeaders(),
         signal: internalSignal,
       });
     } catch {

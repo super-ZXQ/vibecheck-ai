@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import { LLMSettings } from "@/components/LLMSettings";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -59,6 +60,7 @@ function TopBar() {
             <span className="dot" />
             公开仓库 · 零安装
           </span>
+          <LLMSettings />
         </div>
       </div>
     </header>
