@@ -4,7 +4,31 @@
 
 用户提交公开 GitHub 仓库地址，系统读取代码与文档，从五个维度检查项目是否适合正式上线，输出评分、风险清单与可复制的修复指令。
 
-## 快速启动
+## 功能特性
+
+- **五个扫描维度**：敏感信息安全、未完成内容、可部署性与生产配置、基础安全、文档一致性。
+- **安全评分**：0–100 分制，含评分明细、评分上限与加权扣分说明；未完成内容、可部署性、基础安全、文档一致性暂不计入安全评分。
+- **检测流程可视化**：下载 → 解压 → 扫描 → 评估 → 修复 → 分析，六步进度指示 + 实时百分比与文件/大小统计。
+- **发现问题清单**：按严重程度分级，支持按维度筛选、按严重性筛选、关键词搜索与分页。
+- **安全评估**：默认折叠的评分明细与评分上限，逐条可展开查看依据。
+- **修复计划**：按维度分组的可复制修复指令，支持一键复制整段 Agent Prompt，并提供「不会自动执行」免责声明。
+- **LLM 分析**：基于非阻断式分析生成修复建议，结果不可用时自动回退到模板。
+- **检测历史**：本次会话内的检测记录卡片化展示，失败任务标注「检测失败」。
+- **结果导出**：将检测结果导出为 Markdown 报告。
+- **浅色玻璃拟态界面**：无外部 CSS/JS/字体依赖，纯 CSS 渐变、玻璃拟态与内联 SVG。
+
+## 技术栈
+
+| 层 | 技术 |
+| --- | --- |
+| 前端 | Next.js (App Router) + React + TypeScript |
+| 前端测试 | Playwright (e2e) + Node 内置测试运行器 (单元) |
+| 后端 | FastAPI + SQLAlchemy + Pydantic |
+| 后端测试 | pytest |
+| 存储 | SQLite |
+| 运行 | Docker Compose（开发 / 生产双模式） |
+
+## 快速开始
 
 ```bash
 # 1. 复制环境变量配置
@@ -18,41 +42,17 @@ docker compose up --build
 # 后端 API: http://localhost:8000/api/health
 ```
 
-## 项目结构
+## Docker 部署
 
-```
-vibecheck/
-├── frontend/          # Next.js 前端
-├── backend/           # FastAPI 后端
-│   ├── app/
-│   │   ├── main.py          # FastAPI 入口
-│   │   ├── core/
-│   │   │   ├── config.py    # 配置与安全限制
-│   │   │   ├── github.py    # GitHub URL 校验与安全下载
-│   │   │   └── safe_extract.py  # 安全解压（防穿越/拒链接/限大小）
-│   │   └── ...
-│   └── tests/               # 安全测试
-├── docker-compose.yml
-└── .env.example
-```
-
-## 安全设计
-
-- 敏感信息仅在 VibeCheck 服务端隔离临时目录内处理，不发送第三方 LLM，不保存完整原文，任务结束后删除临时文件。
-- 所有密钥检测测试使用无权限合成测试字符串，不使用任何真实有效密钥。
-- 安全下载仅接受 github.com 标准地址，跳转白名单仅 github.com 与 codeload.github.com。
-- 解压时拒绝路径穿越、符号链接、硬链接、设备文件、FIFO、Socket 及异常路径。
-
-## 开发
+### 开发模式
 
 ```bash
-# 运行后端测试
-cd backend
-pip install -r requirements.txt
-pytest -v
+docker compose up --build
 ```
 
-## 生产模式
+开发模式挂载源代码并启用热重载，适合本地开发调试。
+
+### 生产模式
 
 生产模式使用独立的只读、非 root 多阶段镜像，不挂载源代码，也不会启动
 Next.js 开发服务器。
@@ -85,3 +85,117 @@ curl http://localhost:3000/health
 
 生产响应会发送 HSTS 头，但浏览器只会在服务经过 HTTPS 反向代理访问时执行
 HSTS；本机 HTTP 验收仅用于确认响应头存在，不能替代真实 TLS 部署验证。
+
+## API 文档
+
+### 提交检测
+
+`POST /api/check`
+
+```json
+{ "repo_url": "https://github.com/owner/repo" }
+```
+
+响应：`{ "task_id": "...", "status": "queued", "check_url": "/check/{task_id}" }`
+
+非法 URL 返回 `400 INVALID_REPO_URL`；队列已满返回 `429 QUEUE_FULL`。
+
+### 轮询任务状态
+
+`GET /api/check/{task_id}`
+
+返回 `status`（`queued` / `running` / `completed` / `failed`）、`stage`、
+`progress`、`file_count`、`total_size`、`score`、`scan_summary` 等。
+`status = failed` 时返回 `error_code` 与脱敏后的 `error_message`。
+
+### 拉取各阶段结果
+
+| 端点 | 内容 |
+| --- | --- |
+| `GET /api/check/{task_id}/result` | 扫描结果（findings 与五维度计数） |
+| `GET /api/check/{task_id}/assessment` | 安全评估（评分、评分明细、评分上限） |
+| `GET /api/check/{task_id}/repair-plan` | 修复计划（分组修复指令 + Agent Prompt） |
+| `GET /api/check/{task_id}/llm-analysis` | LLM 分析（非阻断，409 表示不可用并回退模板） |
+
+### 健康检查
+
+| 端点 | 用途 |
+| --- | --- |
+| `GET /api/health` | 存活探针 |
+| `GET /api/ready` | 就绪探针（生产 compose 健康检查使用） |
+
+所有错误均返回脱敏后的 `error_code`（如 `GITHUB_RATE_LIMITED`、
+`DOWNLOAD_TOO_LARGE`、`SCAN_TIMEOUT`、`REPAIR_PLAN_NOT_READY`）与对应的
+用户可读中文消息，不含 token、绝对路径、堆栈或原始异常内容。
+
+## 项目结构
+
+```
+vibecheck/
+├── frontend/               # Next.js 前端
+│   ├── app/
+│   │   ├── page.tsx             # 首页（提交表单 / 示例仓库 / 历史记录）
+│   │   ├── check/[task_id]/     # 检测结果页（轮询 + 结果展示）
+│   │   ├── globals.css          # 视觉体系（玻璃拟态设计令牌）
+│   │   └── layout.tsx           # 背景装饰层 / 顶部导航 / 页脚
+│   ├── components/              # CheckProgress / ScoreSummary / ResultTabs /
+│   │                             # ScanResults / AssessmentDetails /
+│   │                             # RepairPlan / LLMAnalysis 等
+│   ├── hooks/                   # use-count-up 等
+│   ├── lib/                     # API 客户端 / 类型 / 导出 / 历史记录
+│   ├── e2e/                     # Playwright 端到端测试
+│   └── Dockerfile(.production)
+├── backend/                 # FastAPI 后端
+│   ├── app/
+│   │   ├── main.py              # FastAPI 入口
+│   │   ├── api/                 # 路由（check / status / 各阶段结果 / 健康）
+│   │   ├── core/
+│   │   │   ├── config.py        # 配置与安全限制
+│   │   │   ├── error_codes.py   # 脱敏错误码与文案
+│   │   │   ├── github.py        # GitHub URL 校验与安全下载
+│   │   │   └── safe_extract.py  # 安全解压（防穿越/拒链接/限大小）
+│   │   ├── models/ services/    # 数据模型与任务流水线
+│   │   └── ...
+│   ├── tests/                   # pytest 安全与回归测试
+│   └── Dockerfile(.production)
+├── docker-compose.yml           # 开发模式
+├── docker-compose.production.yml # 生产加固模式
+├── .env.example / production.env.example
+└── README.md
+```
+
+## 开发指南
+
+```bash
+# 前端：安装依赖
+cd frontend
+npm install
+
+# 前端：单元测试（Node 内置测试运行器）
+npm run test:unit
+
+# 前端：端到端测试（先构建，再用生产服务器启动）
+npm run build
+npx playwright test
+
+# 后端：运行测试
+cd backend
+pip install -r requirements.txt
+pytest -v
+```
+
+提交前请确保：`npm run build` 通过、单元测试全绿、Playwright 端到端全绿、
+后端 `pytest` 全绿。改动不得破坏 e2e 依赖的类名与 `data-testid`，也不得
+修改后端核心逻辑、API、schema 或 CI。
+
+## 安全设计
+
+- 敏感信息仅在 VibeCheck 服务端隔离临时目录内处理，不发送第三方 LLM，不保存完整原文，任务结束后删除临时文件。
+- 所有密钥检测测试使用无权限合成测试字符串，不使用任何真实有效密钥。
+- 安全下载仅接受 github.com 标准地址，跳转白名单仅 github.com 与 codeload.github.com。
+- 解压时拒绝路径穿越、符号链接、硬链接、设备文件、FIFO、Socket 及异常路径。
+- 前端通过 CSP 限制脚本、样式、字体与图片来源；API 响应绝不写入 localStorage / sessionStorage / IndexedDB，错误消息一律脱敏。
+
+## License
+
+MIT
