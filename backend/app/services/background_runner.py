@@ -105,6 +105,7 @@ from app.services.repair_service import (
 )
 from app.services.scan_result_service import save_scan_result, ScanResultTooLargeError
 from app.services.llm_service import generate_and_save_llm_analysis
+from app.services.llm_user_config import get_user_config, pop_user_config
 from app.services.task_manager import (
     STAGE_ANALYZING,
     STAGE_ASSESSING,
@@ -573,11 +574,17 @@ async def _process_task(task_id: str) -> None:
         # LLM analysis is an enhancement, not a requirement. Assessment
         # scoring (P0-6) is completely independent and unaffected.
         mark_running(task_id, STAGE_ANALYZING, 97)
+        # A caller-supplied per-task LLM config (X-LLM-* headers) enables
+        # the analysis stage with the caller's own credentials even when
+        # the server has no LLM configured. Pop after the stage; the
+        # finally block also pops it as a release safety net.
+        user_llm_config = get_user_config(task_id)
         try:
             await asyncio.wait_for(
                 asyncio.to_thread(
                     generate_and_save_llm_analysis,
                     task_id,
+                    user_llm_config,
                 ),
                 timeout=settings.llm_analysis_timeout,
             )
@@ -596,6 +603,9 @@ async def _process_task(task_id: str) -> None:
                 "(non-blocking, continuing to completion)",
                 task_id, type(e).__name__,
             )
+        finally:
+            # Release the caller-supplied LLM credentials for this task.
+            pop_user_config(task_id)
 
         # --- Stage 8: Complete with summary ---
         # Only reached after scan result, assessment, AND repair plan are
@@ -623,6 +633,10 @@ async def _process_task(task_id: str) -> None:
         # Release any unconsumed extraction reservation (e.g. when the
         # extraction thread was interrupted before consuming it).
         consume_extract()
+
+        # Release any caller-supplied LLM credentials that were never
+        # consumed (e.g. the task failed before the LLM stage).
+        pop_user_config(task_id)
 
         # Cleanup runs in ALL paths: success, scan failure, persistence
         # failure, and assessment failure.

@@ -50,8 +50,9 @@ GET /api/check/{task_id}/llm-analysis (P1-4):
 import asyncio
 import logging
 import uuid
+from typing import Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, File, Form, Header, HTTPException, UploadFile, status
 from pydantic import BaseModel
 
 from app.core.config import settings
@@ -71,6 +72,7 @@ from app.core.github import GitHubDownloadError, parse_repo_url
 from app.core.safe_extract import cleanup_temp_dir, prepare_extract_dest
 from app.services.background_runner import trigger_queue_processing
 from app.services.llm_service import get_llm_analysis
+from app.services.llm_user_config import store_user_config
 from app.services.scan_result_service import (
     SCHEMA_VERSION,
     get_scan_result,
@@ -163,13 +165,22 @@ _SAFE_EMPTY_RESULT: dict = {
 # --- Routes ---
 
 @router.post("/api/check", response_model=CheckResponse, status_code=status.HTTP_202_ACCEPTED)
-async def create_check(request: CheckRequest):
+async def create_check(
+    request: CheckRequest,
+    x_llm_api_key: Optional[str] = Header(default=None, alias="X-LLM-API-KEY"),
+    x_llm_base_url: Optional[str] = Header(default=None, alias="X-LLM-BASE-URL"),
+    x_llm_model: Optional[str] = Header(default=None, alias="X-LLM-MODEL"),
+):
     """Create a new project check task.
 
     - Validates the repo URL.
     - Checks if the queue is full (max 5 pending).
     - Creates a pending task.
     - Triggers background processing.
+    - Optional X-LLM-* headers bind a caller-supplied LLM config (API key,
+      base URL, model) to this task for the LLM analysis stage. Credentials
+      live in process memory only — validated, never persisted, never logged,
+      never returned, and removed when the task finishes.
     """
     # Validate repo URL
     try:
@@ -201,6 +212,7 @@ async def create_check(request: CheckRequest):
     )
 
     # Trigger background processing (non-blocking)
+    store_user_config(task.id, x_llm_api_key, x_llm_base_url, x_llm_model)
     asyncio.create_task(trigger_queue_processing())
 
     return CheckResponse(
@@ -226,6 +238,9 @@ def _upload_error_http_status(code: str) -> int:
 async def create_upload_check(
     mode: str = Form(default="archive"),
     file: list[UploadFile] = File(...),
+    x_llm_api_key: Optional[str] = Header(default=None, alias="X-LLM-API-KEY"),
+    x_llm_base_url: Optional[str] = Header(default=None, alias="X-LLM-BASE-URL"),
+    x_llm_model: Optional[str] = Header(default=None, alias="X-LLM-MODEL"),
 ):
     """Create a new project check task from a local upload.
 
@@ -238,6 +253,8 @@ async def create_upload_check(
     Same queue capacity (5 pending) and limit set as URL submissions.
     Content is validated and staged BEFORE the task is created; a rejected
     upload never creates a task.
+
+    Optional X-LLM-* headers work exactly as on POST /api/check.
     """
     # Check queue capacity (shared with URL submissions).
     if is_queue_full():
@@ -312,6 +329,7 @@ async def create_upload_check(
         )
 
     asyncio.create_task(trigger_queue_processing())
+    store_user_config(task.id, x_llm_api_key, x_llm_base_url, x_llm_model)
 
     return CheckResponse(
         task_id=task.id,

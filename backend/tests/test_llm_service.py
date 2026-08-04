@@ -403,7 +403,7 @@ class TestAnalysisItem:
         monkeypatch.setattr("app.core.config.settings.llm_enabled", True)
         monkeypatch.setattr(
             "app.services.llm_service._call_llm_api",
-            lambda prompt: '{"explanation": "LLM解释", "instruction": "LLM修复"}',
+            lambda prompt, user_config=None: '{"explanation": "LLM解释", "instruction": "LLM修复"}',
         )
         finding = {
             "rule_id": "I001_TODO_COMMENT",
@@ -422,7 +422,7 @@ class TestAnalysisItem:
         monkeypatch.setattr("app.core.config.settings.llm_enabled", True)
         monkeypatch.setattr(
             "app.services.llm_service._call_llm_api",
-            lambda prompt: None,
+            lambda prompt, user_config=None: None,
         )
         finding = {
             "rule_id": "I001_TODO_COMMENT",
@@ -440,7 +440,7 @@ class TestAnalysisItem:
         monkeypatch.setattr("app.core.config.settings.llm_enabled", True)
         monkeypatch.setattr(
             "app.services.llm_service._call_llm_api",
-            lambda prompt: "not json",
+            lambda prompt, user_config=None: "not json",
         )
         finding = {
             "rule_id": "I001_TODO_COMMENT",

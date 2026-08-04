@@ -192,33 +192,64 @@ def _build_llm_prompt(finding: dict) -> str:
 # --- LLM API call ---
 # ---------------------------------------------------------------------------
 
-def _call_llm_api(prompt: str) -> Optional[str]:
+def _resolve_llm_config(user_config: Optional[dict]) -> tuple[bool, str, str, str]:
+    """Resolve which LLM configuration to use.
+
+    A COMPLETE user config (api_key + base_url + model all non-empty)
+    takes precedence over the server-side settings, so a caller can use
+    their own credentials even when the server LLM is disabled. A partial
+    user config is ignored and the server-side settings apply.
+
+    Returns (enabled, api_key, base_url, model). Values are never logged.
+    """
+    if user_config:
+        api_key = (user_config.get("api_key") or "").strip()
+        base_url = (user_config.get("base_url") or "").strip()
+        model = (user_config.get("model") or "").strip()
+        if api_key and base_url and model:
+            return True, api_key, base_url, model
+
+    return (
+        settings.llm_enabled,
+        settings.llm_api_key or "",
+        settings.llm_base_url or "",
+        settings.llm_model or "",
+    )
+
+
+def _call_llm_api(
+    prompt: str,
+    user_config: Optional[dict] = None,
+) -> Optional[str]:
     """Call the LLM API and return the response text.
 
     Returns None on any failure (network error, timeout, auth error).
     Never raises — failures are logged and return None.
 
     Uses urllib (standard library) to avoid adding dependencies.
+    A complete user_config (api_key/base_url/model) overrides the
+    server-side settings for this call only.
     """
-    if not settings.llm_enabled:
+    enabled, api_key, base_url, model = _resolve_llm_config(user_config)
+    if not enabled:
         return None
-    if not settings.llm_base_url:
+    if not base_url:
         logger.warning("LLM enabled but llm_base_url not configured")
         return None
-    if not settings.llm_api_key:
+    if not api_key:
         logger.warning("LLM enabled but llm_api_key not configured")
         return None
-    if not settings.llm_model:
+    if not model:
         logger.warning("LLM enabled but llm_model not configured")
         return None
 
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {settings.llm_api_key}",
+        "Authorization": f"Bearer {api_key}",
     }
 
     body = json.dumps({
-        "model": settings.llm_model,
+        "model": model,
         "messages": [
             {"role": "user", "content": prompt},
         ],
@@ -230,7 +261,7 @@ def _call_llm_api(prompt: str) -> Optional[str]:
     for attempt in range(settings.llm_max_retries + 1):
         try:
             req = urllib.request.Request(
-                settings.llm_base_url,
+                base_url,
                 data=body,
                 headers=headers,
                 method="POST",
@@ -345,6 +376,7 @@ def _parse_llm_response(content: str) -> Optional[dict]:
 def _generate_analysis_item(
     finding: dict,
     use_llm: bool,
+    user_config: Optional[dict] = None,
 ) -> dict:
     """Generate a single analysis item for a finding.
 
@@ -355,7 +387,7 @@ def _generate_analysis_item(
 
     if use_llm:
         prompt = _build_llm_prompt(finding)
-        raw_response = _call_llm_api(prompt)
+        raw_response = _call_llm_api(prompt, user_config=user_config)
         if raw_response is not None:
             parsed = _parse_llm_response(raw_response)
             if parsed is not None:
@@ -469,7 +501,10 @@ def _save_llm_analysis(
 # --- Public: main entry point ---
 # ---------------------------------------------------------------------------
 
-def generate_and_save_llm_analysis(task_id: str) -> dict:
+def generate_and_save_llm_analysis(
+    task_id: str,
+    user_config: Optional[dict] = None,
+) -> dict:
     """Generate LLM analysis for a task and persist it.
 
     This is the entry point called by the background runner via
@@ -480,6 +515,12 @@ def generate_and_save_llm_analysis(task_id: str) -> dict:
     2. Extract non-blocking findings (R006+, I0xx, D0xx, B0xx, C0xx).
     3. For each finding, call LLM (if enabled) or use fallback template.
     4. Persist the result to llm_analysis_results.
+
+    ``user_config`` (optional) is the caller-supplied per-task LLM config
+    (api_key / base_url / model). A complete config overrides the
+    server-side settings, enabling the LLM stage even when the server has
+    no LLM configured. It is used in memory only — never persisted or
+    logged.
 
     NON-BLOCKING CONTRACT:
     - This function NEVER raises to the caller.
@@ -522,13 +563,15 @@ def generate_and_save_llm_analysis(task_id: str) -> dict:
             )
 
         # Step 3: Generate analysis items.
-        use_llm = settings.llm_enabled
+        use_llm, _, _, _ = _resolve_llm_config(user_config)
         analysis_items: list[dict] = []
         total_llm = 0
         total_fallback = 0
 
         for finding in findings:
-            item = _generate_analysis_item(finding, use_llm)
+            item = _generate_analysis_item(
+                finding, use_llm, user_config=user_config
+            )
             analysis_items.append(item)
             if item["source"] == "llm":
                 total_llm += 1

@@ -62,7 +62,14 @@ def create_app(app_settings: Settings = settings) -> FastAPI:
         allow_origins=app_settings.cors_allowed_origins,
         allow_credentials=False,
         allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["Content-Type", "Accept"],
+        allow_headers=[
+            "Content-Type",
+            "Accept",
+            # Caller-supplied per-task LLM config (feature: per-user LLM).
+            "X-LLM-API-KEY",
+            "X-LLM-BASE-URL",
+            "X-LLM-MODEL",
+        ],
     )
     api.add_middleware(
         TrustedHostMiddleware,
