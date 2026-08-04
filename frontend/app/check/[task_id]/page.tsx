@@ -132,7 +132,11 @@ export default function CheckPage() {
           </div>
         </div>
         {taskStatus && <ScoreSummary taskStatus={taskStatus} />}
+        {/* key={taskId} remounts the results view when navigating between
+            tasks, so per-task UI state (active tab, filters, page, expanded
+            rows) does not leak across scans. */}
         <ResultTabs
+          key={taskId}
           scanResult={hook.scanResult}
           scanResultStatus={hook.scanResultStatus}
           assessment={hook.assessment}

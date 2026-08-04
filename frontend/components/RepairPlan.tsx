@@ -12,29 +12,15 @@
 
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
+import { lookup } from "@/lib/lookup";
+import { SEVERITY_CLASSES, SEVERITY_LABELS } from "@/lib/severity";
 import type { RepairPlan as RepairPlanType } from "@/lib/types";
 
 interface RepairPlanProps {
   plan: RepairPlanType;
 }
-
-const SEVERITY_CLASSES: Record<string, string> = {
-  critical: "severity-critical",
-  high: "severity-high",
-  medium: "severity-medium",
-  low: "severity-low",
-  info: "severity-info",
-};
-
-const SEVERITY_LABELS: Record<string, string> = {
-  critical: "严重",
-  high: "高",
-  medium: "中",
-  low: "低",
-  info: "信息",
-};
 
 export function RepairPlan({ plan }: RepairPlanProps) {
   const { summary, repair_groups, verification_steps, agent_prompt, plan_status } = plan;
@@ -104,11 +90,11 @@ export function RepairPlan({ plan }: RepairPlanProps) {
                   )}
                   <span
                     className={`severity-badge ${
-                      SEVERITY_CLASSES[group.highest_severity] ?? "severity-info"
+                      lookup(SEVERITY_CLASSES, group.highest_severity, "severity-info")
                     }`}
                     style={{ marginRight: "8px" }}
                   >
-                    {SEVERITY_LABELS[group.highest_severity] ?? group.highest_severity}
+                    {lookup(SEVERITY_LABELS, group.highest_severity, group.highest_severity)}
                   </span>
                   {group.title}
                 </div>
@@ -218,6 +204,14 @@ export function RepairPlan({ plan }: RepairPlanProps) {
 
 function CopyButton({ text, label }: { text: string; label: string }) {
   const [copied, setCopied] = useState(false);
+  const timerRef = useRef<number | null>(null);
+
+  useEffect(
+    () => () => {
+      if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+    },
+    [],
+  );
 
   const handleCopy = async () => {
     try {
@@ -226,8 +220,10 @@ function CopyButton({ text, label }: { text: string; label: string }) {
     } catch {
       setCopied(false);
     }
-    setTimeout(() => {
+    if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+    timerRef.current = window.setTimeout(() => {
       setCopied(false);
+      timerRef.current = null;
     }, 2000);
   };
 
@@ -244,6 +240,14 @@ function CopyButton({ text, label }: { text: string; label: string }) {
 
 function AgentPromptSection({ prompt }: { prompt: string }) {
   const [copyState, setCopyState] = useState<"idle" | "success" | "error">("idle");
+  const timerRef = useRef<number | null>(null);
+
+  useEffect(
+    () => () => {
+      if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+    },
+    [],
+  );
 
   const handleCopy = async () => {
     try {
@@ -254,8 +258,10 @@ function AgentPromptSection({ prompt }: { prompt: string }) {
     }
 
     // Reset after 3 seconds
-    setTimeout(() => {
+    if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+    timerRef.current = window.setTimeout(() => {
       setCopyState("idle");
+      timerRef.current = null;
     }, 3000);
   };
 

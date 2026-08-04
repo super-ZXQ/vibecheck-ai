@@ -22,6 +22,16 @@ if (!production) connectSources.push("http:", "https:", "ws:", "wss:");
 const scriptSources = ["'self'", "'unsafe-inline'"];
 if (!production) scriptSources.push("'unsafe-eval'");
 
+// NOTE: "'unsafe-inline'" in script-src is required in production. Next.js
+// App Router emits inline bootstrap scripts (self.__next_f.push(...)) into
+// the rendered HTML for hydration; removing it would break every page under
+// CSP. Impact is bounded: all application code ships as external hashed
+// bundles from 'self', inline scripts are framework-generated constant
+// strings, and object-src 'none' / base-uri 'self' / frame-ancestors 'none'
+// limit exploit surface. Switching to nonce/hash-based CSP would require
+// nonce injection via middleware (not supported natively for the RSC
+// bootstrap) and is out of scope.
+
 const contentSecurityPolicy = [
   "default-src 'self'",
   "base-uri 'self'",

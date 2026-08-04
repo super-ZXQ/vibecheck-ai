@@ -17,26 +17,12 @@
 import { Fragment, useState } from "react";
 
 import type { ScanResult } from "@/lib/types";
+import { lookup } from "@/lib/lookup";
+import { SEVERITY_CLASSES, SEVERITY_LABELS } from "@/lib/severity";
 
 interface ScanResultsProps {
   scanResult: ScanResult;
 }
-
-const SEVERITY_CLASSES: Record<string, string> = {
-  critical: "severity-critical",
-  high: "severity-high",
-  medium: "severity-medium",
-  low: "severity-low",
-  info: "severity-info",
-};
-
-const SEVERITY_LABELS: Record<string, string> = {
-  critical: "严重",
-  high: "高",
-  medium: "中",
-  low: "低",
-  info: "信息",
-};
 
 const SENSITIVE_DIMENSION = "sensitive_data_security";
 const INCOMPLETE_DIMENSION = "incomplete_content";
@@ -233,8 +219,11 @@ export function ScanResults({ scanResult }: ScanResultsProps) {
               </tr>
             </thead>
             <tbody>
-              {pageFindings.map((f, i) => {
-                const findingKey = `${f.rule_id}-${f.file_path}-${f.line_start}-${startIndex + i}`;
+              {pageFindings.map((f) => {
+                // Stable identity within the full (unfiltered) findings list,
+                // so rows keep stable React keys across paging/filtering and
+                // expansion state is not silently lost on page turns.
+                const findingKey = `${findings.indexOf(f)}`;
                 const isExpanded = expandedFinding === findingKey;
                 const dimension = findingDimension(f.dimension);
                 return (
@@ -243,10 +232,10 @@ export function ScanResults({ scanResult }: ScanResultsProps) {
                   <td>
                     <span
                       className={`severity-badge ${
-                        SEVERITY_CLASSES[f.severity] ?? "severity-info"
+                        lookup(SEVERITY_CLASSES, f.severity, "severity-info")
                       }`}
                     >
-                      {SEVERITY_LABELS[f.severity] ?? f.severity}
+                      {lookup(SEVERITY_LABELS, f.severity, f.severity)}
                     </span>
                   </td>
                   <td>
