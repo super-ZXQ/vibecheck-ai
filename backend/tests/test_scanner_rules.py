@@ -349,6 +349,13 @@ class TestPasswordAssignmentRule:
         assert f.confidence == Confidence.LOW
         assert f.is_blocking is False
 
+    def test_password_attribute_chain_with_paren_skipped(self):
+        """`password=s.db_password)` is an attribute chain reference."""
+        rule = PasswordAssignmentRule()
+        lines = ["                           user=s.db_user, password=s.db_password)"]
+        findings = rule.scan_content("backend/scripts/init_ci_schema.py", lines)
+        assert len(findings) == 0
+
 
 class TestGenericTokenAssignmentRule:
     """Tests for R007 GenericTokenAssignmentRule."""
@@ -508,6 +515,35 @@ class TestGenericTokenAssignmentRule:
         findings = rule.scan_content(".github/workflows/ci.yml", lines)
         assert len(findings) == 1
         assert findings[0].severity == Severity.HIGH
+
+    def test_null_with_semicolon_skipped(self):
+        """`authToken = null;` is a null placeholder, not a credential."""
+        rule = GenericTokenAssignmentRule()
+        lines = ["let authToken = null;"]
+        findings = rule.scan_content("backend/demo.html", lines)
+        assert len(findings) == 0
+
+    def test_attribute_chain_with_semicolon_skipped(self):
+        """`authToken = d.access_token;` is an attribute chain reference."""
+        rule = GenericTokenAssignmentRule()
+        lines = ["            authToken = d.access_token;"]
+        findings = rule.scan_content("backend/demo.html", lines)
+        assert len(findings) == 0
+
+    def test_attribute_chain_with_trailing_comma_skipped(self):
+        """`api_key=settings.llm_api_key,` is an attribute chain reference."""
+        rule = GenericTokenAssignmentRule()
+        lines = ["        api_key=settings.llm_api_key,"]
+        findings = rule.scan_content("backend/services/ai_service.py", lines)
+        assert len(findings) == 0
+
+    def test_doc_truncated_example_downgraded(self):
+        """Truncated example tokens (`eyJ0eXAi...`) in docs downgrade to low."""
+        rule = GenericTokenAssignmentRule()
+        lines = ['  "access_token": "eyJ0eXAi...",']
+        findings = rule.scan_content("ai-ecommerce-assistant/knowledge_base/api_docs.md", lines)
+        assert len(findings) == 1
+        assert findings[0].severity == Severity.LOW
 
 
 # ============================================================================
