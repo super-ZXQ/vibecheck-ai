@@ -244,30 +244,14 @@ export function ScanResults({ scanResult }: ScanResultsProps) {
                     </span>
                   </td>
                   <td>{f.rule_name}</td>
-                  <td
-                    style={{
-                      maxWidth: "200px",
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                    }}
-                    title={f.file_path}
-                  >
+                  <td className="finding-file-cell" title={f.file_path}>
                     {f.file_path}
                   </td>
                   <td>
                     {f.line_start ?? "-"}
                     {f.line_start !== null && f.line_end !== f.line_start ? `-${f.line_end}` : ""}
                   </td>
-                  <td
-                    style={{
-                      maxWidth: "300px",
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      fontFamily: "monospace",
-                      fontSize: "0.8rem",
-                    }}
-                    title={f.snippet_masked}
-                  >
+                  <td className="finding-snippet-cell" title={f.snippet_masked}>
                     {f.snippet_masked}
                   </td>
                   <td>

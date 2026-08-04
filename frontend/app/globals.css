@@ -1141,6 +1141,21 @@ body::before {
   border-bottom: none;
 }
 
+/* 文件路径 / 代码片段单元格：桌面限宽省略，移动端放开换行 */
+.finding-file-cell {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.finding-snippet-cell {
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: monospace;
+  font-size: 0.8rem;
+}
+
 /* 严重级别徽章 */
 .severity-badge {
   display: inline-block;
@@ -1868,5 +1883,21 @@ summary:focus-visible {
 
   .example-chips-label {
     width: 100%;
+  }
+
+  /* 触摸友好：移动端所有可点控件高度 ≥ 44px */
+  .btn-sm,
+  .filter-select,
+  .filter-search,
+  .finding-detail-button {
+    min-height: 44px;
+  }
+
+  /* 卡片化表格中不再限制单元格宽度，内容完整换行展示 */
+  .finding-file-cell,
+  .finding-snippet-cell {
+    max-width: none;
+    overflow: visible;
+    text-overflow: clip;
   }
 }
