@@ -27,7 +27,17 @@ from app.core.config import settings
 
 
 class GitHubDownloadError(Exception):
-    """Raised when URL validation or download fails."""
+    """Raised when URL validation or download fails.
+
+    ``code`` (optional) carries a machine-readable category so callers can
+    classify the failure without parsing the message text. The message is
+    never derived from repository content (avoids leaking repo names and
+    keeps substring-based classification reliable).
+    """
+
+    def __init__(self, message: str, code: str | None = None):
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -285,19 +295,23 @@ async def download_tarball(repo_url: str) -> DownloadResult:
                 # Check HTTP status codes
                 if response.status_code == 404:
                     raise GitHubDownloadError(
-                        "Repository not found, does not exist, or is private"
+                        "Repository not found, does not exist, or is private",
+                        code="REPOSITORY_NOT_FOUND",
                     )
                 if response.status_code == 403:
                     raise GitHubDownloadError(
-                        "GitHub API rate limit exceeded or access forbidden"
+                        "GitHub API rate limit exceeded or access forbidden",
+                        code="GITHUB_RATE_LIMITED",
                     )
                 if response.status_code == 429:
                     raise GitHubDownloadError(
-                        "GitHub API rate limit exceeded, please try again later"
+                        "GitHub API rate limit exceeded, please try again later",
+                        code="GITHUB_RATE_LIMITED",
                     )
                 if response.status_code != 200:
                     raise GitHubDownloadError(
-                        f"Download failed: HTTP {response.status_code}"
+                        f"Download failed: HTTP {response.status_code}",
+                        code="DOWNLOAD_FAILED",
                     )
 
                 # Early rejection via Content-Length (advisory only)
@@ -308,7 +322,8 @@ async def download_tarball(repo_url: str) -> DownloadResult:
                         if cl > settings.max_archive_size:
                             raise GitHubDownloadError(
                                 f"Archive too large (Content-Length): {cl} bytes "
-                                f"(limit: {settings.max_archive_size} bytes)"
+                                f"(limit: {settings.max_archive_size} bytes)",
+                                code="DOWNLOAD_TOO_LARGE",
                             )
                     except ValueError:
                         pass  # Malformed Content-Length, rely on streaming check
@@ -321,7 +336,8 @@ async def download_tarball(repo_url: str) -> DownloadResult:
                             raise GitHubDownloadError(
                                 f"Archive too large during streaming: "
                                 f"{total_written} bytes "
-                                f"(limit: {settings.max_archive_size} bytes)"
+                                f"(limit: {settings.max_archive_size} bytes)",
+                                code="DOWNLOAD_TOO_LARGE",
                             )
                         f.write(chunk)
 
@@ -332,12 +348,19 @@ async def download_tarball(repo_url: str) -> DownloadResult:
         raise
     except httpx.TimeoutException:
         raise GitHubDownloadError(
-            f"Download timed out after {settings.download_timeout}s"
+            f"Download timed out after {settings.download_timeout}s",
+            code="DOWNLOAD_FAILED",
         )
-    except httpx.ConnectError as e:
-        raise GitHubDownloadError(f"Connection failed: {e}")
-    except Exception as e:
-        raise GitHubDownloadError(f"Download failed: {e}")
+    except httpx.ConnectError:
+        raise GitHubDownloadError(
+            "Connection to GitHub failed",
+            code="DOWNLOAD_FAILED",
+        )
+    except Exception:
+        raise GitHubDownloadError(
+            "Download failed",
+            code="DOWNLOAD_FAILED",
+        )
     finally:
         if not download_succeeded:
             _safe_remove_file(temp_file)

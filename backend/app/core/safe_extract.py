@@ -16,6 +16,7 @@ import os
 import shutil
 import stat
 import tarfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -34,6 +35,42 @@ class ExtractionResult:
     total_size: int = 0
     top_level_dir: str | None = None
     rejected_entries: list[str] = field(default_factory=list)
+
+
+@dataclass
+class _PendingExtract:
+    """Handoff for a reserved extraction destination + cancellation event.
+
+    Only one task is processed at a time (background runner global lock),
+    so a single shared slot is sufficient.
+    """
+    dest_dir: Path
+    cancel_event: threading.Event
+
+
+# Reserved by the background runner before starting the extraction thread,
+# consumed by safe_extract_to_temp. Lets the runner locate the partially
+# written directory and signal cancellation even on a stage timeout.
+_pending_extract: _PendingExtract | None = None
+
+
+def reserve_extract(tmp_root: str | Path | None = None) -> _PendingExtract:
+    """Reserve an extraction destination + cancel event for the next call."""
+    global _pending_extract
+    slot = _PendingExtract(
+        dest_dir=prepare_extract_dest(tmp_root),
+        cancel_event=threading.Event(),
+    )
+    _pending_extract = slot
+    return slot
+
+
+def consume_extract() -> _PendingExtract | None:
+    """Consume (and clear) the reserved extraction slot, if any."""
+    global _pending_extract
+    slot = _pending_extract
+    _pending_extract = None
+    return slot
 
 
 # --- Member validation ---
@@ -117,11 +154,13 @@ def _validate_member_type(member: tarfile.TarInfo) -> str:
 
 
 def _is_within_directory(directory: Path, target: Path) -> bool:
-    """Check if a target path is within the directory."""
+    """Check if a target path is within the directory.
+
+    Uses path-component-aware comparison (not a raw string prefix), so a
+    sibling like ``/x/tmpfoo`` is correctly rejected.
+    """
     try:
-        directory_resolved = directory.resolve()
-        target_resolved = target.resolve()
-        return str(target_resolved).startswith(str(directory_resolved))
+        return target.resolve().is_relative_to(directory.resolve())
     except (OSError, ValueError):
         return False
 
@@ -173,11 +212,20 @@ def safe_extract(
     max_total_size: int | None = None,
     max_file_count: int | None = None,
     max_single_file_size: int | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> ExtractionResult:
     """Safely extract a tarball to a destination directory.
 
     All security checks are enforced during extraction. On any failure,
     the destination directory is cleaned up (try/finally).
+
+    Members are consumed incrementally via ``tar.next()`` instead of
+    ``getmembers()``, so limits are enforced during iteration and the
+    whole archive header list is never materialized in memory.
+
+    ``cancel_event`` (optional) lets a caller abort a long-running
+    extraction between members / file chunks. When set, extraction stops
+    promptly with an ExtractionError and the partial tree is cleaned up.
 
     Args:
         tarball_bytes: Raw tarball data (gzip compressed).
@@ -186,6 +234,7 @@ def safe_extract(
         max_total_size: Override for max total extracted size.
         max_file_count: Override for max file count.
         max_single_file_size: Override for max single file size.
+        cancel_event: Optional event; when set, extraction is cancelled.
 
     Returns:
         ExtractionResult with extraction details.
@@ -205,6 +254,9 @@ def safe_extract(
     result = ExtractionResult(dest_dir=str(dest_path))
     extracted = False
 
+    def _cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
     try:
         # Check archive size before opening
         if len(tarball_bytes) > _max_archive:
@@ -217,18 +269,26 @@ def safe_extract(
         tar = tarfile.open(fileobj=io.BytesIO(tarball_bytes), mode="r:gz")
 
         try:
-            members = tar.getmembers()
-
-            # Check file count
-            if len(members) > _max_count:
-                raise ExtractionError(
-                    f"Too many files in archive: {len(members)} "
-                    f"(limit: {_max_count})"
-                )
-
+            member_count = 0
             cumulative_size = 0
 
-            for member in members:
+            while True:
+                if _cancelled():
+                    raise ExtractionError("Extraction cancelled")
+
+                member = tar.next()
+                if member is None:
+                    break
+
+                member_count += 1
+
+                # Check file count
+                if member_count > _max_count:
+                    raise ExtractionError(
+                        f"Too many files in archive: {member_count} "
+                        f"(limit: {_max_count})"
+                    )
+
                 # Validate name (path traversal, null bytes, etc.)
                 _validate_member_name(member.name)
 
@@ -270,6 +330,10 @@ def safe_extract(
                         with open(target_path, "wb") as dst:
                             # Read in chunks to handle large files safely
                             while True:
+                                if _cancelled():
+                                    raise ExtractionError(
+                                        "Extraction cancelled"
+                                    )
                                 chunk = src.read(65536)
                                 if not chunk:
                                     break
@@ -295,26 +359,43 @@ def safe_extract(
     return result
 
 
-def safe_extract_to_temp(
-    tarball_bytes: bytes,
-    tmp_root: str | Path | None = None,
-) -> ExtractionResult:
-    """Extract tarball to an isolated temporary directory.
+def prepare_extract_dest(tmp_root: str | Path | None = None) -> Path:
+    """Return a unique destination path under tmp_root without creating it.
 
-    Creates a unique subdirectory under tmp_root for this extraction.
-    The caller is responsible for cleaning up the directory when done.
+    The caller passes this path into extraction so it is known even when
+    the extraction thread is interrupted (e.g. by a stage timeout) and
+    the partially-written directory can still be cleaned up.
     """
-    import tempfile
     import uuid
 
     root = Path(tmp_root or settings.tmp_dir)
-    root.mkdir(parents=True, exist_ok=True)
+    return root / f"task-{uuid.uuid4().hex[:12]}"
 
-    # Create unique subdirectory
-    task_id = uuid.uuid4().hex[:12]
-    dest = root / f"task-{task_id}"
 
-    return safe_extract(tarball_bytes, dest)
+def safe_extract_to_temp(
+    tarball_bytes: bytes,
+    tmp_root: str | Path | None = None,
+    *,
+    dest_dir: str | Path | None = None,
+    cancel_event: threading.Event | None = None,
+) -> ExtractionResult:
+    """Extract tarball to an isolated temporary directory.
+
+    When ``dest_dir``/``cancel_event`` are omitted, any slot reserved via
+    :func:`reserve_extract` is consumed (used by the background runner so a
+    stage timeout can locate and clean up the partial directory). Falls back
+    to a freshly generated unique subdirectory under tmp_root.
+    The caller is responsible for cleaning up the directory when done.
+    """
+    if dest_dir is None or cancel_event is None:
+        pending = consume_extract()
+        if pending is not None:
+            dest_dir = dest_dir or pending.dest_dir
+            cancel_event = cancel_event or pending.cancel_event
+    if dest_dir is None:
+        dest_dir = prepare_extract_dest(tmp_root)
+
+    return safe_extract(tarball_bytes, dest_dir, cancel_event=cancel_event)
 
 
 def cleanup_temp_dir(dest_dir: str | Path) -> None:

@@ -46,6 +46,7 @@ Repair plan boundary (P0-7):
 
 import asyncio
 import logging
+import tarfile
 from pathlib import Path
 
 from app.core.config import settings
@@ -81,6 +82,8 @@ from app.core.github import (
 )
 from app.core.safe_extract import (
     ExtractionError,
+    consume_extract,
+    reserve_extract,
     safe_extract_to_temp,
     cleanup_temp_dir,
 )
@@ -121,7 +124,22 @@ _is_processing = False
 
 
 def _map_download_error(error: GitHubDownloadError) -> tuple[str, str]:
-    """Map a GitHubDownloadError to an (error_code, safe_message) pair."""
+    """Map a GitHubDownloadError to an (error_code, safe_message) pair.
+
+    Prefers the structured ``code`` attached at the raise site; falls back
+    to substring matching of the message for errors constructed elsewhere
+    (e.g. by tests or legacy callers).
+    """
+    code = getattr(error, "code", None)
+    if code in {
+        REPOSITORY_NOT_FOUND,
+        PRIVATE_REPOSITORY,
+        GITHUB_RATE_LIMITED,
+        DOWNLOAD_TOO_LARGE,
+        DOWNLOAD_FAILED,
+    }:
+        return code, get_error_message(code)
+
     msg = str(error).lower()
     if "not found" in msg or "does not exist" in msg:
         return REPOSITORY_NOT_FOUND, get_error_message(REPOSITORY_NOT_FOUND)
@@ -189,7 +207,22 @@ async def _process_task(task_id: str) -> None:
         try:
             # Read the downloaded file into bytes for extraction
             # (max_archive_size is 50MB, acceptable for MVP)
-            tarball_bytes = download_result.temp_file.read_bytes()
+            try:
+                tarball_bytes = download_result.temp_file.read_bytes()
+            except Exception as e:
+                logger.error(
+                    "Failed to read downloaded archive for task %s: %s",
+                    task_id, type(e).__name__,
+                )
+                mark_failed(task_id, DOWNLOAD_FAILED, get_error_message(DOWNLOAD_FAILED))
+                return
+
+            # Reserve the destination path + cancel event BEFORE starting
+            # the thread so a stage timeout still knows where partial files
+            # were written and can signal the thread to abort.
+            pending_extract = reserve_extract(settings.tmp_dir)
+            extract_dest = pending_extract.dest_dir
+
             # P2-3: Wrap extraction in asyncio.wait_for with timeout.
             extract_result = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -202,6 +235,11 @@ async def _process_task(task_id: str) -> None:
             extract_dest = extract_result.dest_dir
         except asyncio.TimeoutError:
             logger.error("Extraction timed out for task %s", task_id)
+            # Signal the orphaned extraction thread to abort promptly, then
+            # give it a short window to release file handles before the
+            # finally-block cleanup removes the partial directory.
+            pending_extract.cancel_event.set()
+            await asyncio.sleep(0.5)
             mark_failed(
                 task_id, EXTRACT_TIMEOUT,
                 get_error_message(EXTRACT_TIMEOUT),
@@ -211,9 +249,20 @@ async def _process_task(task_id: str) -> None:
             error_code, safe_msg = _map_extraction_error(e)
             mark_failed(task_id, error_code, safe_msg)
             return
-        except Exception as e:
-            logger.error("Extraction failed for task %s: %s", task_id, type(e).__name__)
+        except tarfile.TarError as e:
+            logger.error(
+                "Archive is malformed for task %s: %s",
+                task_id, type(e).__name__,
+            )
             mark_failed(task_id, UNSAFE_ARCHIVE, get_error_message(UNSAFE_ARCHIVE))
+            return
+        except Exception as e:
+            # Genuine I/O or unexpected failures during extraction are NOT
+            # proof of a malicious archive — report them as internal errors.
+            logger.error(
+                "Extraction failed for task %s: %s", task_id, type(e).__name__
+            )
+            mark_failed(task_id, INTERNAL_ERROR, get_error_message(INTERNAL_ERROR))
             return
 
         # --- Stage 3: Scan ---
@@ -496,6 +545,10 @@ async def _process_task(task_id: str) -> None:
 
     finally:
         # --- Always clean up temp files ---
+        # Release any unconsumed extraction reservation (e.g. when the
+        # extraction thread was interrupted before consuming it).
+        consume_extract()
+
         # Cleanup runs in ALL paths: success, scan failure, persistence
         # failure, and assessment failure.
         # Clean up download file
@@ -550,7 +603,9 @@ async def trigger_queue_processing() -> None:
             _is_processing = False
         # Re-trigger in case a task was added during the gap
         if get_oldest_pending() is not None:
-            asyncio.create_task(trigger_queue_processing())
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(trigger_queue_processing())
 
 
 def reset_runner_state() -> None:
