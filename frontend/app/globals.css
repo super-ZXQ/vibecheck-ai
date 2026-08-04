@@ -24,6 +24,7 @@
   --bg-main: #f3f5fb;
   --bg-card: #ffffff;
   --bg-subtle: #f1f5f9;
+  --surface: #ffffff;
   --text-primary: #1e293b;
   --text-secondary: #64748b;
   --text-muted: #94a3b8;
@@ -323,8 +324,9 @@ body::before {
   align-items: center;
   justify-content: center;
   padding: 20px;
-  background: rgba(15, 23, 42, 0.45);
-  backdrop-filter: blur(4px);
+  background: rgba(15, 23, 42, 0.52);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
 }
 
 .modal {
@@ -332,11 +334,14 @@ body::before {
   max-width: 440px;
   max-height: calc(100vh - 48px);
   overflow-y: auto;
-  background: var(--surface);
-  border: 1px solid rgba(148, 163, 184, 0.3);
-  border-radius: 16px;
-  box-shadow: 0 24px 60px rgba(15, 23, 42, 0.28);
-  padding: 22px 24px 20px;
+  /* 不透明实底：修复 var(--surface) 未定义导致的透明问题 */
+  background: linear-gradient(180deg, #ffffff 0%, #fafbff 100%);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow:
+    0 0 0 6px rgba(99, 102, 241, 0.08),
+    0 32px 80px -20px rgba(15, 23, 42, 0.42);
+  padding: 24px 26px 22px;
 }
 
 .modal-title {
@@ -349,8 +354,12 @@ body::before {
 .modal-hint {
   font-size: 0.78rem;
   line-height: 1.65;
-  color: var(--text-muted);
-  margin: 0 0 14px;
+  color: var(--text-secondary);
+  background: var(--primary-soft);
+  border: 1px solid rgba(99, 102, 241, 0.14);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  margin: 0 0 16px;
 }
 
 .modal-field {
