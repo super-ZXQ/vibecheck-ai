@@ -250,7 +250,13 @@ async def download_tarball(repo_url: str) -> DownloadResult:
     total_written = 0
 
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        # Download directly, ignoring ambient HTTP_PROXY/HTTPS_PROXY env vars
+        # (which often point at a local proxy that is unreachable from this
+        # process). An explicit DOWNLOAD_PROXY opt-in is honored instead.
+        client_kwargs: dict = {"timeout": timeout, "trust_env": False}
+        if settings.download_proxy:
+            client_kwargs["proxy"] = settings.download_proxy
+        async with httpx.AsyncClient(**client_kwargs) as client:
             current_url = tarball_url
             current_headers = headers
             redirect_count = 0

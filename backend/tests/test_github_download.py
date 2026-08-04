@@ -476,3 +476,74 @@ class TestTempFileCleanup:
 
         downloads = list(Path(tmp_path).glob("download-*.tar.gz"))
         assert len(downloads) == 0
+
+
+# --- Client construction: direct connect vs explicit proxy ---
+
+
+class TestClientTrustEnv:
+    """download_tarball must ignore ambient proxies unless DOWNLOAD_PROXY is set.
+
+    httpx defaults to trust_env=True, which picks up HTTP_PROXY/HTTPS_PROXY
+    environment variables that often point at a local proxy that is not
+    reachable from the worker process, breaking every download. We force
+    trust_env=False (direct connect) unless an explicit DOWNLOAD_PROXY is
+    configured.
+    """
+
+    def _capture_async_client_kwargs(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("app.core.config.settings.tmp_dir", str(tmp_path))
+        monkeypatch.setattr("app.core.config.settings.max_archive_size", 10 * 1024 * 1024)
+
+        captured: dict = {}
+
+        class RecordingAsyncClient:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self._inner = make_mock_client([
+                    MockResponse(
+                        status_code=200,
+                        headers={"content-length": str(len(SMALL_CONTENT))},
+                        content=SMALL_CONTENT,
+                    )
+                ])
+
+            async def __aenter__(self):
+                return self._inner
+
+            async def __aexit__(self, *args):
+                pass
+
+        monkeypatch.setattr(
+            "app.core.github.httpx.AsyncClient", RecordingAsyncClient
+        )
+        return captured
+
+    @pytest.mark.asyncio
+    async def test_direct_connect_by_default(self, tmp_path, monkeypatch):
+        """No DOWNLOAD_PROXY → client is created with trust_env=False and no proxy."""
+        captured = self._capture_async_client_kwargs(monkeypatch, tmp_path)
+        monkeypatch.setattr("app.core.config.settings.download_proxy", None)
+
+        result = await download_tarball(REPO_URL)
+        assert result.temp_file.exists()
+        cleanup_download(result.temp_file)
+
+        assert captured.get("trust_env") is False
+        assert "proxy" not in captured
+
+    @pytest.mark.asyncio
+    async def test_explicit_proxy_is_used(self, tmp_path, monkeypatch):
+        """DOWNLOAD_PROXY set → client passes proxy AND keeps trust_env=False."""
+        captured = self._capture_async_client_kwargs(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            "app.core.config.settings.download_proxy",
+            "http://127.0.0.1:8080",
+        )
+
+        result = await download_tarball(REPO_URL)
+        assert result.temp_file.exists()
+        cleanup_download(result.temp_file)
+
+        assert captured.get("trust_env") is False
+        assert captured.get("proxy") == "http://127.0.0.1:8080"

@@ -56,6 +56,11 @@ class Settings(BaseSettings):
     # --- GitHub download ---
     github_token: str | None = None  # Optional, read from env GITHUB_TOKEN
     download_timeout: int = 60  # seconds
+    # Explicit outbound proxy for GitHub downloads (e.g. a corporate proxy).
+    # When unset the client connects DIRECTLY and IGNORES ambient proxy
+    # environment variables (HTTP_PROXY/HTTPS_PROXY), which often point at a
+    # local proxy that is not reachable from the worker process.
+    download_proxy: str | None = None  # read from env DOWNLOAD_PROXY
     allowed_redirect_hosts: list[str] = [
         "github.com",
         "codeload.github.com",
