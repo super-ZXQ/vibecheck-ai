@@ -31,6 +31,10 @@ REPAIR_PLAN_TIMEOUT = "REPAIR_PLAN_TIMEOUT"
 # --- Cleanup errors ---
 CLEANUP_FAILED = "CLEANUP_FAILED"
 
+# --- Upload errors ---
+UPLOAD_TOO_LARGE = "UPLOAD_TOO_LARGE"
+INVALID_UPLOAD = "INVALID_UPLOAD"
+
 # --- Queue errors ---
 QUEUE_FULL = "QUEUE_FULL"
 
@@ -87,6 +91,8 @@ _ERROR_MESSAGES = {
     ASSESSMENT_TIMEOUT: "安全评估阶段超时，已中止。",
     REPAIR_PLAN_TIMEOUT: "修复计划生成阶段超时，已中止。",
     CLEANUP_FAILED: "临时文件清理失败，但不影响检测结果。",
+    UPLOAD_TOO_LARGE: "上传内容超过大小限制（压缩包 50MB / 解压总量 200MB / 单文件 25MB / 文件数 2000），已拒绝。",
+    INVALID_UPLOAD: "上传文件格式无效或包含不安全内容，请选择有效的压缩包或文件夹。",
     QUEUE_FULL: "检测队列已满，请稍后重试。",
     SCAN_INTERNAL_ERROR: "扫描过程中发生内部错误，请稍后重试。",
     SCAN_RESULT_PERSIST_FAILED: "扫描结果保存失败，请稍后重试。",

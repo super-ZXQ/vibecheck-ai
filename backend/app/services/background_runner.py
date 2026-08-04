@@ -1,4 +1,4 @@
-"""Background task runner — processes download + extract + scan + assess + repair sequentially.
+"""Background task runner 鈥?processes download + extract + scan + assess + repair sequentially.
 
 Concurrency model (MVP):
 - Only 1 task runs at a time (global asyncio.Lock).
@@ -6,12 +6,12 @@ Concurrency model (MVP):
 - After each task completes, the next pending task is automatically picked up.
 
 Pipeline stages (P0-7):
-  download → extract → scan → persist scan result → assess → persist
-  assessment → generate repair plan → persist repair plan → completed → cleanup
+  download 鈫?extract 鈫?scan 鈫?persist scan result 鈫?assess 鈫?persist
+  assessment 鈫?generate repair plan 鈫?persist repair plan 鈫?completed 鈫?cleanup
 
 Error handling:
 - All errors are mapped to machine-readable error codes.
-- error_message is always desensitized — no tokens, paths, or stacks.
+- error_message is always desensitized 鈥?no tokens, paths, or stacks.
 - Temp files are always cleaned up via try/finally.
 - No code from the repository is ever executed.
 - Scanner exceptions are caught and mapped to SCAN_INTERNAL_ERROR.
@@ -39,13 +39,14 @@ Repair plan boundary (P0-7):
 - Repair plan reads ONLY from persisted scan_results and
   assessment_results (never from temp directory or memory).
 - Repair plan must succeed BEFORE mark_completed.
-- If repair plan generation fails, the task is marked failed — even if
+- If repair plan generation fails, the task is marked failed 鈥?even if
   scan_results and assessment_results were already persisted.
   The failed task's repair plan API will NOT return residual data.
 """
 
 import asyncio
 import logging
+import os
 import tarfile
 from pathlib import Path
 
@@ -82,11 +83,13 @@ from app.core.github import (
 )
 from app.core.safe_extract import (
     ExtractionError,
+    ExtractionResult,
     consume_extract,
     reserve_extract,
     safe_extract_to_temp,
     cleanup_temp_dir,
 )
+from app.services.upload_service import LOCAL_UPLOAD_PREFIX, upload_source_dir
 from app.scanner.sensitive import scan_directory
 from app.services.assessment_service import (
     AssessmentInternalError,
@@ -118,7 +121,7 @@ from app.services.task_manager import (
 
 logger = logging.getLogger(__name__)
 
-# Global lock — ensures only 1 task runs at a time
+# Global lock 鈥?ensures only 1 task runs at a time
 _lock = asyncio.Lock()
 _is_processing = False
 
@@ -160,8 +163,125 @@ def _map_extraction_error(error: ExtractionError) -> tuple[str, str]:
     return UNSAFE_ARCHIVE, get_error_message(UNSAFE_ARCHIVE)
 
 
+def _stat_directory(path: Path) -> ExtractionResult:
+    """Compute file count / total size / top-level dir of a staged upload.
+
+    Runs in a worker thread via asyncio.to_thread (walks at most
+    settings.max_file_count files).
+    """
+    count = 0
+    total = 0
+    top_level: str | None = None
+    try:
+        for root, _dirs, files in os.walk(path):
+            rel = Path(root).relative_to(path)
+            parts = rel.parts
+            if parts and top_level is None:
+                top_level = parts[0]
+            for name in files:
+                count += 1
+                try:
+                    total += (Path(root) / name).stat().st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return ExtractionResult(
+        dest_dir=str(path),
+        file_count=count,
+        total_size=total,
+        top_level_dir=top_level,
+    )
+
+
+async def _download_and_extract(
+    task_id: str, repo_url: str,
+) -> tuple[object | None, str | None, ExtractionResult | None]:
+    """Stage 1 + 2 for URL-sourced tasks: download tarball and extract it.
+
+    On success returns ``(download_result, extract_dest, extract_result)``.
+    On failure marks the task as failed with a desensitized error and
+    returns ``(None, None, None)``.
+    """
+    download_result = None
+    extract_dest = None
+
+    # --- Stage 1: Download ---
+    mark_running(task_id, STAGE_DOWNLOADING, 10)
+    try:
+        download_result = await download_tarball(repo_url)
+    except GitHubDownloadError as e:
+        error_code, safe_msg = _map_download_error(e)
+        mark_failed(task_id, error_code, safe_msg)
+        return download_result, None, None
+
+    # --- Stage 2: Extract ---
+    mark_running(task_id, STAGE_EXTRACTING, 50)
+    try:
+        # Read the downloaded file into bytes for extraction
+        # (max_archive_size is 50MB, acceptable for MVP)
+        try:
+            tarball_bytes = download_result.temp_file.read_bytes()
+        except Exception as e:
+            logger.error(
+                "Failed to read downloaded archive for task %s: %s",
+                task_id, type(e).__name__,
+            )
+            mark_failed(task_id, DOWNLOAD_FAILED, get_error_message(DOWNLOAD_FAILED))
+            return download_result, None, None
+
+        # Reserve the destination path + cancel event BEFORE starting
+        # the thread so a stage timeout still knows where partial files
+        # were written and can signal the thread to abort.
+        pending_extract = reserve_extract(settings.tmp_dir)
+        extract_dest = pending_extract.dest_dir
+
+        # P2-3: Wrap extraction in asyncio.wait_for with timeout.
+        extract_result = await asyncio.wait_for(
+            asyncio.to_thread(
+                safe_extract_to_temp,
+                tarball_bytes,
+                tmp_root=settings.tmp_dir,
+            ),
+            timeout=settings.extract_timeout,
+        )
+        extract_dest = extract_result.dest_dir
+        return download_result, extract_dest, extract_result
+    except asyncio.TimeoutError:
+        logger.error("Extraction timed out for task %s", task_id)
+        # Signal the orphaned extraction thread to abort promptly, then
+        # give it a short window to release file handles before the
+        # finally-block cleanup removes the partial directory.
+        pending_extract.cancel_event.set()
+        await asyncio.sleep(0.5)
+        mark_failed(
+            task_id, EXTRACT_TIMEOUT,
+            get_error_message(EXTRACT_TIMEOUT),
+        )
+        return download_result, None, None
+    except ExtractionError as e:
+        error_code, safe_msg = _map_extraction_error(e)
+        mark_failed(task_id, error_code, safe_msg)
+        return download_result, None, None
+    except tarfile.TarError as e:
+        logger.error(
+            "Archive is malformed for task %s: %s",
+            task_id, type(e).__name__,
+        )
+        mark_failed(task_id, UNSAFE_ARCHIVE, get_error_message(UNSAFE_ARCHIVE))
+        return download_result, None, None
+    except Exception as e:
+        # Genuine I/O or unexpected failures during extraction are NOT
+        # proof of a malicious archive 鈥?report them as internal errors.
+        logger.error(
+            "Extraction failed for task %s: %s", task_id, type(e).__name__
+        )
+        mark_failed(task_id, INTERNAL_ERROR, get_error_message(INTERNAL_ERROR))
+        return download_result, None, None
+
+
 async def _process_task(task_id: str) -> None:
-    """Process a single task: download → extract → scan → assess → repair → analyze → complete.
+    """Process a single task: download 鈫?extract 鈫?scan 鈫?assess 鈫?repair 鈫?analyze 鈫?complete.
 
     Pipeline:
     1. Download tarball from GitHub.
@@ -173,12 +293,12 @@ async def _process_task(task_id: str) -> None:
        deterministic repair plan, persist to repair_results.
     7. Generate LLM analysis: read persisted scan result, generate
        plain-language explanations for non-blocking findings, persist
-       to llm_analysis_results. This stage is NON-BLOCKING — failures
+       to llm_analysis_results. This stage is NON-BLOCKING 鈥?failures
        fall back to templates and never prevent task completion.
     8. Mark task as completed (only after successful repair plan persistence).
 
     On any failure, marks the task as failed with a desensitized error.
-    Temp files are always cleaned up via try/finally — in success, scan
+    Temp files are always cleaned up via try/finally 鈥?in success, scan
     failure, persistence failure, assessment failure, and repair plan
     failure paths.
     """
@@ -186,6 +306,7 @@ async def _process_task(task_id: str) -> None:
     extract_dest = None
     extract_result = None
     cleanup_failed = False
+    is_upload = False
 
     try:
         task = get_task(task_id)
@@ -193,77 +314,28 @@ async def _process_task(task_id: str) -> None:
             logger.error("Task %s not found", task_id)
             return
 
-        # --- Stage 1: Download ---
-        mark_running(task_id, STAGE_DOWNLOADING, 10)
-        try:
-            download_result = await download_tarball(task.repo_url)
-        except GitHubDownloadError as e:
-            error_code, safe_msg = _map_download_error(e)
-            mark_failed(task_id, error_code, safe_msg)
-            return
+        # Upload-sourced tasks skip GitHub download; their content was
+        # already validated and staged under upload-{task_id} by the
+        # upload endpoint. All subsequent stages are identical.
+        is_upload = task.repo_url.startswith(LOCAL_UPLOAD_PREFIX)
 
-        # --- Stage 2: Extract ---
-        mark_running(task_id, STAGE_EXTRACTING, 50)
-        try:
-            # Read the downloaded file into bytes for extraction
-            # (max_archive_size is 50MB, acceptable for MVP)
-            try:
-                tarball_bytes = download_result.temp_file.read_bytes()
-            except Exception as e:
+        if is_upload:
+            mark_running(task_id, STAGE_EXTRACTING, 50)
+            data_dir = upload_source_dir(task_id)
+            if not data_dir.is_dir():
                 logger.error(
-                    "Failed to read downloaded archive for task %s: %s",
-                    task_id, type(e).__name__,
+                    "Upload source directory missing for task %s", task_id
                 )
-                mark_failed(task_id, DOWNLOAD_FAILED, get_error_message(DOWNLOAD_FAILED))
+                mark_failed(task_id, INTERNAL_ERROR, get_error_message(INTERNAL_ERROR))
                 return
-
-            # Reserve the destination path + cancel event BEFORE starting
-            # the thread so a stage timeout still knows where partial files
-            # were written and can signal the thread to abort.
-            pending_extract = reserve_extract(settings.tmp_dir)
-            extract_dest = pending_extract.dest_dir
-
-            # P2-3: Wrap extraction in asyncio.wait_for with timeout.
-            extract_result = await asyncio.wait_for(
-                asyncio.to_thread(
-                    safe_extract_to_temp,
-                    tarball_bytes,
-                    tmp_root=settings.tmp_dir,
-                ),
-                timeout=settings.extract_timeout,
+            extract_dest = str(data_dir)
+            extract_result = await asyncio.to_thread(_stat_directory, data_dir)
+        else:
+            download_result, extract_dest, extract_result = (
+                await _download_and_extract(task_id, task.repo_url)
             )
-            extract_dest = extract_result.dest_dir
-        except asyncio.TimeoutError:
-            logger.error("Extraction timed out for task %s", task_id)
-            # Signal the orphaned extraction thread to abort promptly, then
-            # give it a short window to release file handles before the
-            # finally-block cleanup removes the partial directory.
-            pending_extract.cancel_event.set()
-            await asyncio.sleep(0.5)
-            mark_failed(
-                task_id, EXTRACT_TIMEOUT,
-                get_error_message(EXTRACT_TIMEOUT),
-            )
-            return
-        except ExtractionError as e:
-            error_code, safe_msg = _map_extraction_error(e)
-            mark_failed(task_id, error_code, safe_msg)
-            return
-        except tarfile.TarError as e:
-            logger.error(
-                "Archive is malformed for task %s: %s",
-                task_id, type(e).__name__,
-            )
-            mark_failed(task_id, UNSAFE_ARCHIVE, get_error_message(UNSAFE_ARCHIVE))
-            return
-        except Exception as e:
-            # Genuine I/O or unexpected failures during extraction are NOT
-            # proof of a malicious archive — report them as internal errors.
-            logger.error(
-                "Extraction failed for task %s: %s", task_id, type(e).__name__
-            )
-            mark_failed(task_id, INTERNAL_ERROR, get_error_message(INTERNAL_ERROR))
-            return
+            if extract_result is None:
+                return
 
         # --- Stage 3: Scan ---
         # scan_directory is synchronous (CPU-bound). Run it in a thread
@@ -286,7 +358,7 @@ async def _process_task(task_id: str) -> None:
             )
             return
         except Exception as e:
-            # Log only the exception type — never str(exc), repr(exc),
+            # Log only the exception type 鈥?never str(exc), repr(exc),
             # stack traces, or repo content.
             logger.error(
                 "Scan failed for task %s: %s", task_id, type(e).__name__
@@ -298,7 +370,7 @@ async def _process_task(task_id: str) -> None:
             return
 
         # --- Stage 4: Persist scan result ---
-        # Persist BEFORE marking completed — if persistence fails,
+        # Persist BEFORE marking completed 鈥?if persistence fails,
         # the task must NOT be marked as completed.
         # save_scan_result is synchronous (CPU/IO-bound). Run it in a
         # thread via asyncio.to_thread so the event loop stays responsive.
@@ -311,7 +383,7 @@ async def _process_task(task_id: str) -> None:
             )
         except ScanResultTooLargeError as e:
             # Serialized result_json exceeded scan_max_result_json_bytes.
-            # Log only the exception type — never str(exc) or DB details.
+            # Log only the exception type 鈥?never str(exc) or DB details.
             logger.error(
                 "Scan result too large for task %s: %s",
                 task_id, type(e).__name__,
@@ -322,7 +394,7 @@ async def _process_task(task_id: str) -> None:
             )
             return
         except Exception as e:
-            # Log only the exception type — never str(exc) or DB errors.
+            # Log only the exception type 鈥?never str(exc) or DB errors.
             logger.error(
                 "Scan result persistence failed for task %s: %s",
                 task_id, type(e).__name__,
@@ -340,7 +412,7 @@ async def _process_task(task_id: str) -> None:
         # run_assessment is synchronous (CPU/IO-bound). Run it in a thread
         # via asyncio.to_thread so the event loop stays responsive.
         # The await guarantees the thread has completed before cleanup.
-        # Assessment MUST succeed before mark_completed — if it fails,
+        # Assessment MUST succeed before mark_completed 鈥?if it fails,
         # the task is marked failed even though scan_results was persisted.
         # The failed task's assessment API will NOT return residual data.
         mark_running(task_id, STAGE_ASSESSING, 90)
@@ -361,7 +433,7 @@ async def _process_task(task_id: str) -> None:
             return
         except AssessmentResultTooLargeError as e:
             # Serialized assessment_json exceeded assessment_max_json_bytes.
-            # Log only the exception type — never str(exc) or DB details.
+            # Log only the exception type 鈥?never str(exc) or DB details.
             logger.error(
                 "Assessment result too large for task %s: %s",
                 task_id, type(e).__name__,
@@ -374,7 +446,7 @@ async def _process_task(task_id: str) -> None:
         except AssessmentInternalError as e:
             # Reading or parsing the persisted scan result failed, or
             # assessment computation failed.
-            # Log only the exception type — never str(exc) or stack traces.
+            # Log only the exception type 鈥?never str(exc) or stack traces.
             logger.error(
                 "Assessment internal error for task %s: %s",
                 task_id, type(e).__name__,
@@ -386,7 +458,7 @@ async def _process_task(task_id: str) -> None:
             return
         except AssessmentPersistError as e:
             # SQLite assessment_results write failed.
-            # Log only the exception type — never str(exc) or DB errors.
+            # Log only the exception type 鈥?never str(exc) or DB errors.
             logger.error(
                 "Assessment persistence failed for task %s: %s",
                 task_id, type(e).__name__,
@@ -402,7 +474,7 @@ async def _process_task(task_id: str) -> None:
             # SQLite save failures are already caught by
             # AssessmentPersistError above. Other unknown exceptions
             # belong to internal computation or orchestration.
-            # Log only the exception type — never str(exc) or DB errors.
+            # Log only the exception type 鈥?never str(exc) or DB errors.
             logger.error(
                 "Assessment failed for task %s: %s",
                 task_id, type(e).__name__,
@@ -421,7 +493,7 @@ async def _process_task(task_id: str) -> None:
         # generate_and_save_repair_plan is synchronous (CPU/IO-bound).
         # Run it in a thread via asyncio.to_thread so the event loop
         # stays responsive.
-        # Repair plan MUST succeed before mark_completed — if it fails,
+        # Repair plan MUST succeed before mark_completed 鈥?if it fails,
         # the task is marked failed even though scan_results and
         # assessment_results were already persisted.
         # The failed task's repair plan API will NOT return residual data.
@@ -443,7 +515,7 @@ async def _process_task(task_id: str) -> None:
             return
         except RepairPlanTooLargeError as e:
             # Serialized repair_json exceeded repair_max_json_bytes.
-            # Log only the exception type — never str(exc) or DB details.
+            # Log only the exception type 鈥?never str(exc) or DB details.
             logger.error(
                 "Repair plan too large for task %s: %s",
                 task_id, type(e).__name__,
@@ -457,7 +529,7 @@ async def _process_task(task_id: str) -> None:
             # Reading or parsing the persisted scan/assessment failed,
             # consistency validation failed, or repair plan computation
             # failed.
-            # Log only the exception type — never str(exc) or stack traces.
+            # Log only the exception type 鈥?never str(exc) or stack traces.
             logger.error(
                 "Repair plan internal error for task %s: %s",
                 task_id, type(e).__name__,
@@ -469,7 +541,7 @@ async def _process_task(task_id: str) -> None:
             return
         except RepairPlanPersistError as e:
             # SQLite repair_results write failed.
-            # Log only the exception type — never str(exc) or DB errors.
+            # Log only the exception type 鈥?never str(exc) or DB errors.
             logger.error(
                 "Repair plan persistence failed for task %s: %s",
                 task_id, type(e).__name__,
@@ -481,7 +553,7 @@ async def _process_task(task_id: str) -> None:
             return
         except Exception as e:
             # Catch-all for any unexpected error not covered above.
-            # Log only the exception type — never str(exc) or DB errors.
+            # Log only the exception type 鈥?never str(exc) or DB errors.
             logger.error(
                 "Repair plan failed for task %s: %s",
                 task_id, type(e).__name__,
@@ -496,7 +568,7 @@ async def _process_task(task_id: str) -> None:
         # Generate plain-language explanations and repair instructions
         # for non-blocking findings. This stage reads ONLY from the
         # persisted scan_results table.
-        # This stage NEVER fails the task — generate_and_save_llm_analysis
+        # This stage NEVER fails the task 鈥?generate_and_save_llm_analysis
         # catches all internal errors and falls back to templates.
         # LLM analysis is an enhancement, not a requirement. Assessment
         # scoring (P0-6) is completely independent and unaffected.
@@ -510,14 +582,14 @@ async def _process_task(task_id: str) -> None:
                 timeout=settings.llm_analysis_timeout,
             )
         except asyncio.TimeoutError:
-            # Non-blocking — LLM analysis timeout doesn't fail the task.
+            # Non-blocking 鈥?LLM analysis timeout doesn't fail the task.
             logger.warning(
                 "LLM analysis timed out for task %s (non-blocking, "
                 "continuing to completion)",
                 task_id,
             )
         except Exception as e:
-            # This should never happen — generate_and_save_llm_analysis
+            # This should never happen 鈥?generate_and_save_llm_analysis
             # is designed to never raise. But if it does, log and continue.
             logger.warning(
                 "LLM analysis stage failed for task %s: %s "
@@ -536,7 +608,10 @@ async def _process_task(task_id: str) -> None:
             task_id,
             file_count=extract_result.file_count,
             total_size=extract_result.total_size,
-            top_level_dir=extract_result.top_level_dir or "unknown",
+            top_level_dir=(
+                extract_result.top_level_dir
+                or ("鏈湴椤圭洰" if is_upload else "unknown")
+            ),
         )
 
     except Exception as e:
@@ -570,7 +645,7 @@ async def _process_task(task_id: str) -> None:
         # If cleanup failed but task was completed, log it (task result is still valid)
         if cleanup_failed:
             logger.warning(
-                "Cleanup failed for task %s — temp files may remain", task_id
+                "Cleanup failed for task %s 鈥?temp files may remain", task_id
             )
 
 
@@ -581,7 +656,7 @@ async def trigger_queue_processing() -> None:
     If processing is already running, this is a no-op (the running processor
     will pick up new pending tasks).
 
-    Safe to call multiple times — only one processor runs at a time.
+    Safe to call multiple times 鈥?only one processor runs at a time.
     """
     global _is_processing
 
@@ -609,6 +684,6 @@ async def trigger_queue_processing() -> None:
 
 
 def reset_runner_state() -> None:
-    """Reset the runner state — for testing only."""
+    """Reset the runner state 鈥?for testing only."""
     global _is_processing
     _is_processing = False

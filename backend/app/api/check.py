@@ -48,20 +48,27 @@ GET /api/check/{task_id}/llm-analysis (P1-4):
 """
 
 import asyncio
+import logging
 import uuid
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
 from pydantic import BaseModel
 
+from app.core.config import settings
 from app.core.error_codes import (
+    EXTRACTION_LIMIT_EXCEEDED,
     INTERNAL_ERROR,
+    INVALID_UPLOAD,
     LLM_ANALYSIS_NOT_READY,
     QUEUE_FULL,
     SCAN_RESULT_MISSING,
     SCAN_RESULT_NOT_READY,
+    UNSAFE_ARCHIVE,
+    UPLOAD_TOO_LARGE,
     get_error_message,
 )
 from app.core.github import GitHubDownloadError, parse_repo_url
+from app.core.safe_extract import cleanup_temp_dir, prepare_extract_dest
 from app.services.background_runner import trigger_queue_processing
 from app.services.llm_service import get_llm_analysis
 from app.services.scan_result_service import (
@@ -76,9 +83,18 @@ from app.services.task_manager import (
     create_task,
     get_task,
     is_queue_full,
+    mark_failed,
+)
+from app.services.upload_service import (
+    LOCAL_UPLOAD_PREFIX,
+    UploadError,
+    store_archive_upload,
+    store_folder_upload,
+    upload_source_dir,
 )
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 # --- Request / Response models ---
@@ -185,6 +201,116 @@ async def create_check(request: CheckRequest):
     )
 
     # Trigger background processing (non-blocking)
+    asyncio.create_task(trigger_queue_processing())
+
+    return CheckResponse(
+        task_id=task.id,
+        status=task.status,
+        check_url=f"/api/check/{task.id}",
+    )
+
+
+# --- Upload route ---
+# Local uploads (archive / folder) go through the same queue, pipeline and
+# result endpoints as GitHub submissions. Content is staged under
+# settings.tmp_dir (tmpfs), never persisted, and removed after scanning.
+
+def _upload_error_http_status(code: str) -> int:
+    """Map an upload rejection code to an HTTP status."""
+    if code in (UPLOAD_TOO_LARGE, EXTRACTION_LIMIT_EXCEEDED):
+        return 413  # Request Entity Too Large (content too large)
+    return status.HTTP_400_BAD_REQUEST
+
+
+@router.post("/api/check/upload", response_model=CheckResponse, status_code=status.HTTP_202_ACCEPTED)
+async def create_upload_check(
+    mode: str = Form(default="archive"),
+    file: list[UploadFile] = File(...),
+):
+    """Create a new project check task from a local upload.
+
+    Two modes (backend is authoritative):
+    - ``archive``: a single .zip / .tar.gz / .tgz file, magic-sniffed and
+      safely extracted.
+    - ``folder``: multiple files whose filenames are relative paths
+      (browser ``webkitRelativePath``); the tree is rebuilt on disk.
+
+    Same queue capacity (5 pending) and limit set as URL submissions.
+    Content is validated and staged BEFORE the task is created; a rejected
+    upload never creates a task.
+    """
+    # Check queue capacity (shared with URL submissions).
+    if is_queue_full():
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "error_code": QUEUE_FULL,
+                "error_message": get_error_message(QUEUE_FULL),
+            },
+        )
+
+    if not file:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error_code": INVALID_UPLOAD,
+                "error_message": get_error_message(INVALID_UPLOAD),
+            },
+        )
+
+    # Stage into an isolated temp dir under tmpfs.
+    dest_root = prepare_extract_dest(settings.tmp_dir)
+    try:
+        if mode == "archive":
+            if len(file) != 1:
+                raise UploadError(
+                    INVALID_UPLOAD, "Archive mode accepts exactly one file"
+                )
+            await store_archive_upload(file[0], dest_root)
+        elif mode == "folder":
+            await store_folder_upload(file, dest_root)
+        else:
+            raise UploadError(INVALID_UPLOAD, f"Unknown upload mode: {mode!r}")
+    except UploadError as e:
+        cleanup_temp_dir(dest_root)
+        raise HTTPException(
+            status_code=_upload_error_http_status(e.code),
+            detail={
+                "error_code": e.code,
+                "error_message": get_error_message(e.code),
+            },
+        )
+    except Exception as e:
+        cleanup_temp_dir(dest_root)
+        logger.error("Unexpected upload failure: %s", type(e).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error_code": INTERNAL_ERROR,
+                "error_message": get_error_message(INTERNAL_ERROR),
+            },
+        )
+
+    # Only now create the task (rejected uploads never create tasks).
+    try:
+        task = create_task(
+            repo_url=f"{LOCAL_UPLOAD_PREFIX}{uuid.uuid4().hex}",
+            owner="local",
+            repo_name="上传项目",
+        )
+        staged = upload_source_dir(task.id)
+        dest_root.rename(staged)
+    except Exception as e:
+        cleanup_temp_dir(dest_root)
+        logger.error("Failed to create upload task: %s", type(e).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error_code": INTERNAL_ERROR,
+                "error_message": get_error_message(INTERNAL_ERROR),
+            },
+        )
+
     asyncio.create_task(trigger_queue_processing())
 
     return CheckResponse(
