@@ -39,6 +39,9 @@ out/
 .npm
 .pnpm-debug.log*
 
+# === Logs (may contain request metadata) ===
+*.log
+
 # === IDE ===
 .idea/
 .vscode/

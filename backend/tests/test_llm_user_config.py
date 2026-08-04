@@ -368,7 +368,10 @@ class TestCallLlmApiUserConfig:
             user_config={"api_key": "partial-key"},
         )
         assert result is not None
-        assert captured["url"] == "https://api.srv.example.com"
+        assert (
+            captured["url"]
+            == "https://api.srv.example.com/chat/completions"
+        )
         assert captured["auth"] == "Bearer srv-key"
 
 

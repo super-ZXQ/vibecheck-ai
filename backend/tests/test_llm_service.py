@@ -30,6 +30,7 @@ from app.services.llm_service import (
     _extract_non_blocking_findings,
     _generate_analysis_item,
     _is_blocking_finding,
+    _normalize_llm_endpoint,
     _parse_llm_response,
     generate_and_save_llm_analysis,
     get_llm_analysis,
@@ -338,6 +339,64 @@ class TestResponseParsing:
 # ---------------------------------------------------------------------------
 
 class TestLLMAPICall:
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("https://api.deepseek.com", "https://api.deepseek.com/chat/completions"),
+            ("https://api.deepseek.com/", "https://api.deepseek.com/chat/completions"),
+            ("https://host/v1", "https://host/v1/chat/completions"),
+            (
+                "https://host/v1/chat/completions",
+                "https://host/v1/chat/completions",
+            ),
+            ("https://api.deepseek.com/chat/completions", "https://api.deepseek.com/chat/completions"),
+        ],
+    )
+    def test_normalize_endpoint(self, raw, expected):
+        """base_url 自动补全为完整 /chat/completions 端点。"""
+        assert _normalize_llm_endpoint(raw) == expected
+
+    def test_request_uses_normalized_endpoint(self, monkeypatch):
+        """实际请求 URL 必须是完整的 /chat/completions 端点。"""
+        monkeypatch.setattr("app.core.config.settings.llm_enabled", True)
+        monkeypatch.setattr(
+            "app.core.config.settings.llm_base_url",
+            "https://api.deepseek.com",
+        )
+        monkeypatch.setattr(
+            "app.core.config.settings.llm_api_key", "test-key"
+        )
+        monkeypatch.setattr(
+            "app.core.config.settings.llm_model", "deepseek-chat"
+        )
+        monkeypatch.setattr(
+            "app.core.config.settings.llm_max_retries", 0
+        )
+        seen = {}
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {"choices": [{"message": {"content": "ok"}}]}
+                ).encode()
+
+        def fake_urlopen(req, timeout):
+            seen["url"] = req.full_url
+            return FakeResp()
+
+        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+        result = _call_llm_api("test prompt")
+        assert result == "ok"
+        assert seen["url"] == (
+            "https://api.deepseek.com/chat/completions"
+        )
 
     def test_disabled_returns_none(self, monkeypatch):
         """LLM 禁用时返回 None。"""

@@ -28,6 +28,7 @@ import json
 import logging
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 from app.core.config import settings
@@ -217,6 +218,19 @@ def _resolve_llm_config(user_config: Optional[dict]) -> tuple[bool, str, str, st
     )
 
 
+def _normalize_llm_endpoint(raw: str) -> str:
+    """Normalize a base URL to a full /chat/completions endpoint.
+
+    Accepts a bare prefix (https://api.deepseek.com or https://host/v1)
+    or the full endpoint (…/chat/completions) and always returns the
+    full endpoint, since urllib requests the URL as-is.
+    """
+    url = raw.strip().rstrip("/")
+    if url.endswith("/chat/completions"):
+        return url
+    return f"{url}/chat/completions"
+
+
 def _call_llm_api(
     prompt: str,
     user_config: Optional[dict] = None,
@@ -258,10 +272,11 @@ def _call_llm_api(
     }).encode("utf-8")
 
     last_error = None
+    endpoint = _normalize_llm_endpoint(base_url)
     for attempt in range(settings.llm_max_retries + 1):
         try:
             req = urllib.request.Request(
-                base_url,
+                endpoint,
                 data=body,
                 headers=headers,
                 method="POST",
@@ -423,6 +438,36 @@ def _generate_analysis_item(
 # --- Persistence ---
 # ---------------------------------------------------------------------------
 
+def _generate_analysis_items(
+    findings: list[dict],
+    use_llm: bool,
+    user_config: Optional[dict] = None,
+) -> tuple[list[dict], int, int]:
+    """Generate analysis items for all findings, concurrently.
+
+    LLM calls are issued in parallel (bounded by
+    settings.llm_max_concurrent_requests) so a full batch of
+    findings fits within the llm_analysis_timeout budget.
+    Item order is preserved. Returns (items, total_llm, total_fallback).
+    """
+    items: list[dict] = []
+    if not findings:
+        return items, 0, 0
+
+    max_workers = settings.llm_max_concurrent_requests
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [
+            pool.submit(
+                _generate_analysis_item, finding, use_llm, user_config
+            )
+            for finding in findings
+        ]
+        items = [future.result() for future in futures]
+
+    total_llm = sum(1 for item in items if item["source"] == "llm")
+    return items, total_llm, len(items) - total_llm
+
+
 def _save_llm_analysis(
     task_id: str,
     analysis_items: list[dict],
@@ -562,21 +607,14 @@ def generate_and_save_llm_analysis(
                 task_id, [], scan_updated_at, 0, 0,
             )
 
-        # Step 3: Generate analysis items.
+        # Step 3: Generate analysis items (concurrent to fit the
+        # llm_analysis_timeout budget; ordering is preserved).
         use_llm, _, _, _ = _resolve_llm_config(user_config)
-        analysis_items: list[dict] = []
-        total_llm = 0
-        total_fallback = 0
-
-        for finding in findings:
-            item = _generate_analysis_item(
-                finding, use_llm, user_config=user_config
+        analysis_items, total_llm, total_fallback = (
+            _generate_analysis_items(
+                findings, use_llm, user_config=user_config
             )
-            analysis_items.append(item)
-            if item["source"] == "llm":
-                total_llm += 1
-            else:
-                total_fallback += 1
+        )
 
         # Step 4: Persist.
         return _save_llm_analysis(

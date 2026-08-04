@@ -90,7 +90,7 @@ class Settings(BaseSettings):
     extract_timeout: int = Field(default=60, ge=1)  # extraction (tarball parsing)
     assess_timeout: int = Field(default=30, ge=1)  # assessment computation
     repair_plan_timeout: int = Field(default=30, ge=1)  # repair plan generation
-    llm_analysis_timeout: int = Field(default=60, ge=1)  # LLM analysis (non-blocking stage)
+    llm_analysis_timeout: int = Field(default=300, ge=1)  # LLM analysis (non-blocking stage)
     # No line limit: files under scan_max_file_size are scanned in full.
     # Removing max_line_read prevents missing secrets in later lines.
     scan_max_file_size: int = 1024 * 1024  # 1 MB — skip files larger than this
@@ -173,6 +173,9 @@ class Settings(BaseSettings):
     llm_base_url: str | None = None  # read from env LLM_BASE_URL
     llm_model: str = ""  # model name, read from env LLM_MODEL
     llm_max_retries: int = 2  # max retry attempts on transient failure
+    # Max concurrent LLM requests per task (sequential generation of 50
+    # findings exceeds a reasonable stage budget).
+    llm_max_concurrent_requests: int = Field(default=5, ge=1, le=20)
     # Max non-blocking findings to send to LLM per task.
     # Prevents unbounded LLM calls on repos with hundreds of findings.
     llm_max_findings_per_task: int = Field(default=50, ge=1)
