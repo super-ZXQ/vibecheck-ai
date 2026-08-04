@@ -372,6 +372,16 @@ _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*")
 _PASSWORD_KEYWORDS: frozenset[str] = frozenset({"PASSWORD", "PASSWD", "PWD"})
 _SECRET_KEYWORDS: frozenset[str] = frozenset({"SECRET", "TOKEN", "APIKEY"})
 
+# When TOKEN appears alongside any of these segments in the SAME key,
+# the key is a configuration/limit identifier, NOT a credential.
+# Examples: token_limit, max_tokens, FACT_TOKEN_PATTERNS, token_count.
+# A bare `token` (no other segments) or AUTH_TOKEN / GITHUB_TOKEN still
+# classify as secrets — those go through the pair/single logic below.
+_TOKEN_NOISE_SEGMENTS: frozenset[str] = frozenset({
+    "LIMIT", "PATTERNS", "MAX", "MIN", "COUNT", "SIZE",
+    "LENGTH", "DEFAULT", "VALUE", "MODEL", "SCHEMA",
+})
+
 # Consecutive-pair keywords for the secret category.
 _SECRET_PAIR_KEYWORDS: frozenset[tuple[str, str]] = frozenset({
     ("API", "KEY"),
@@ -451,7 +461,8 @@ def classify_key(key: str) -> str | None:
 
     Does NOT match (returns None):
         SECRETARY_EMAIL, TOKENIZER_MODEL, PASSWORDLESS_MODE,
-        API_KEYBOARD_LAYOUT, ACCESS_TOKENIZER
+        API_KEYBOARD_LAYOUT, ACCESS_TOKENIZER,
+        TOKEN_LIMIT, MAX_TOKENS, FACT_TOKEN_PATTERNS, TOKEN_COUNT
 
     Does NOT produce CATEGORY_AWS_SECRET (but may produce CATEGORY_SECRET):
         AWS_CLIENT_SECRET, MY_SECRET_ACCESS_KEY_BACKUP,
@@ -473,7 +484,18 @@ def classify_key(key: str) -> str | None:
         return CATEGORY_PASSWORD
 
     # Secret / token (single segment)
-    if any(s in _SECRET_KEYWORDS for s in segments):
+    # A TOKEN alongside a noise segment (LIMIT/MAX/PATTERNS/...) is a
+    # configuration identifier, not a credential — skip it. A bare TOKEN
+    # or AUTH_TOKEN etc. still matches.
+    for s in segments:
+        if s not in _SECRET_KEYWORDS:
+            continue
+        if (
+            s == "TOKEN"
+            and len(segments) > 1
+            and _TOKEN_NOISE_SEGMENTS.intersection(segments)
+        ):
+            continue
         return CATEGORY_SECRET
 
     # Secret / token (consecutive pair)

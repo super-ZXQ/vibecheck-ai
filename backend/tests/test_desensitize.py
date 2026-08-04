@@ -469,6 +469,32 @@ class TestCompoundKeyClassification:
     def test_access_tokenizer_not_classified(self):
         assert classify_key("ACCESS_TOKENIZER") is None
 
+    # --- TOKEN + noise segment (config identifiers, not secrets) ---
+    def test_token_limit_not_classified(self):
+        """token_limit is a numeric config, not a credential."""
+        assert classify_key("token_limit") is None
+
+    def test_max_tokens_not_classified(self):
+        """max_tokens is an API parameter, not a credential."""
+        assert classify_key("max_tokens") is None
+
+    def test_fact_token_patterns_not_classified(self):
+        """FACT_TOKEN_PATTERNS is a regex pattern list, not a credential."""
+        assert classify_key("FACT_TOKEN_PATTERNS") is None
+
+    def test_token_count_not_classified(self):
+        assert classify_key("token_count") is None
+
+    def test_token_size_not_classified(self):
+        assert classify_key("token_size") is None
+
+    # --- AUTH/ACCESS token variants still classify as secrets ---
+    def test_auth_token_still_classified(self):
+        assert classify_key("auth_token") == CATEGORY_SECRET
+
+    def test_anthropic_auth_token_still_classified(self):
+        assert classify_key("ANTHROPIC_AUTH_TOKEN") == CATEGORY_SECRET
+
 
 # ============================================================================
 # --- iter_assignments compound key tests ---
