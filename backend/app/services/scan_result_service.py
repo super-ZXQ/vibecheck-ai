@@ -710,7 +710,7 @@ def get_scan_summary(task_id: str) -> Optional[dict]:
         result_dict = json.loads(row["result_json"])
         summary = result_dict.get("summary")
         if not isinstance(summary, dict):
-            return summary
+            return None
         return normalize_scan_summary_dimensions(summary)
     finally:
         conn.close()

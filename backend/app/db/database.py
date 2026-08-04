@@ -35,9 +35,6 @@ from pathlib import Path
 
 from app.core.config import settings
 
-# Thread-local storage for connections
-_local = threading.local()
-
 # Lock for DDL operations
 _init_lock = threading.Lock()
 _initialized = False

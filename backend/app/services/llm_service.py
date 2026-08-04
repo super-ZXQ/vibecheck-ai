@@ -59,15 +59,6 @@ _MAX_SNIPPET_CHARS = 500
 # --- Exception classes ---
 # ---------------------------------------------------------------------------
 
-class LLMAnalysisInternalError(Exception):
-    """Internal error during LLM analysis computation.
-
-    This exception is caught internally — generate_and_save_llm_analysis
-    never raises it to the caller.
-    """
-    pass
-
-
 class LLMAnalysisPersistError(Exception):
     """SQLite persistence failure for LLM analysis."""
     pass
@@ -415,13 +406,12 @@ def _save_llm_analysis(
         LLMAnalysisPersistError: If SQLite write fails.
         LLMAnalysisTooLargeError: If serialized JSON exceeds size limit.
     """
-    source = "llm" if total_llm > 0 else "fallback"
-    # If all items are fallback, source is "fallback".
-    if total_llm == 0 and total_fallback > 0:
-        source = "fallback"
-    # Mixed: if any LLM items exist, mark as "llm".
     if total_llm > 0 and total_fallback > 0:
         source = "mixed"
+    elif total_llm > 0:
+        source = "llm"
+    else:
+        source = "fallback"
 
     output = {
         "schema_version": SCHEMA_VERSION,
@@ -642,7 +632,8 @@ def get_llm_analysis(task_id: str) -> Optional[dict]:
         if row is None:
             return None
         return json.loads(row["analysis_json"])
-    except (json.JSONDecodeError, Exception):
+    except Exception:
+        # Malformed JSON or DB failure — treat as "not available".
         logger.error(
             "Failed to read LLM analysis for task %s", task_id
         )
