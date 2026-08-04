@@ -81,7 +81,6 @@ class Settings(BaseSettings):
 
     # --- Scan limits ---
     scan_timeout: int = 120  # seconds — wraps scan_directory in asyncio.wait_for
-    scan_concurrency: int = 1  # single worker, low concurrency
 
     # --- Stage timeouts (P2-3) ---
     # Each CPU-intensive stage is wrapped in asyncio.wait_for.

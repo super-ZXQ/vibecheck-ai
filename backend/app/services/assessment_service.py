@@ -71,8 +71,6 @@ from app.services.assessment_policy import (
     determine_verdict,
     get_repeat_percent,
     sort_caps,
-    COVERAGE_COMPLETE,
-    COVERAGE_PARTIAL,
 )
 
 # Severity ordering for deterministic sort (lower = higher priority).

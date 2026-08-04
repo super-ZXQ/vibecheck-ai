@@ -24,7 +24,7 @@ import shutil
 from pathlib import Path
 
 from app.core.config import settings
-from app.db.database import _get_connection, init_db, now_iso
+from app.db.database import _get_connection, init_db
 
 logger = logging.getLogger(__name__)
 

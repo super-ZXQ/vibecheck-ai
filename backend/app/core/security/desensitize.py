@@ -83,6 +83,14 @@ class Assignment:
       enter API models, persistence objects, or LLM input.
     """
 
+    _key_raw: str
+    _key_normalized: str
+    _value_start: int
+    _value_end: int
+    _value: str
+    _is_quoted: bool
+    _operator: str
+
     __slots__ = (
         "_key_raw",
         "_key_normalized",
@@ -659,18 +667,18 @@ def parse_assignment_value(
     # Supports backslash escape characters.
     value_start = i
     j = i
-    content_chars: list[str] = []
+    unquoted_chars: list[str] = []
     while j < len(line):
         if line[j] == "\\" and j + 1 < len(line):
-            content_chars.append(line[j + 1])
+            unquoted_chars.append(line[j + 1])
             j += 2
         elif line[j].isspace():
             break
         else:
-            content_chars.append(line[j])
+            unquoted_chars.append(line[j])
             j += 1
     value_end = j
-    value_content = "".join(content_chars)
+    value_content = "".join(unquoted_chars)
     if not value_content:
         return None
     return (value_start, value_end, value_content, False, operator)
@@ -942,7 +950,6 @@ def _mask_connection_strings(text: str) -> str:
     for match in iter_connection_strings(text):
         scheme = match.group(1)
         user = match.group(2)
-        password = match.group(3)
         host_rest = match.group(4)
         masked_full = f"{scheme}://{user}:***@{host_rest}"
         ranges.append(_SecretRange(

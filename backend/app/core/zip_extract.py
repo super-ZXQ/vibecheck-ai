@@ -20,7 +20,7 @@ import stat
 import threading
 import zipfile
 from pathlib import Path
-from typing import BinaryIO, Callable
+from typing import IO, Callable
 
 from app.core.config import settings
 from app.core.safe_extract import (
@@ -208,7 +208,7 @@ def _reject_special_modes(info: zipfile.ZipInfo) -> None:
 
 
 def _copy_member(
-    src: BinaryIO,
+    src: IO[bytes],
     target_path: Path,
     max_single_size: int,
     name: str,

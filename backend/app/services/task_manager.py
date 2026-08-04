@@ -236,7 +236,10 @@ def create_task(repo_url: str, owner: str, repo_name: str) -> TaskRecord:
     from app.services.cleanup_service import maybe_trigger_cleanup
     maybe_trigger_cleanup()
 
-    return get_task(task_id)
+    task = get_task(task_id)
+    if task is None:
+        raise RuntimeError(f"Failed to reload newly created task {task_id}")
+    return task
 
 
 # --- Read ---
@@ -248,22 +251,6 @@ def get_task(task_id: str) -> Optional[TaskRecord]:
     try:
         row = conn.execute(
             "SELECT * FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone()
-        if row is None:
-            return None
-        return TaskRecord.from_row(row)
-    finally:
-        conn.close()
-
-
-def get_running_task() -> Optional[TaskRecord]:
-    """Get the currently running task, if any."""
-    init_db()
-    conn = _get_connection()
-    try:
-        row = conn.execute(
-            "SELECT * FROM tasks WHERE status = ? ORDER BY created_at ASC LIMIT 1",
-            (STATUS_RUNNING,),
         ).fetchone()
         if row is None:
             return None

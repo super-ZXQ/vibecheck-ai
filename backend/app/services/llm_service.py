@@ -29,13 +29,12 @@ import logging
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Optional
+from typing import Optional
 
 from app.core.config import settings
 from app.core.security.desensitize import mask_untrusted_text
 from app.db.database import _get_connection, init_db, now_iso
 from app.services.llm_fallback_templates import (
-    FALLBACK_TEMPLATES,
     GENERIC_FALLBACK,
     get_fallback_template,
 )
@@ -271,7 +270,7 @@ def _call_llm_api(
         "temperature": 0.3,
     }).encode("utf-8")
 
-    last_error = None
+    last_error: Exception | None = None
     endpoint = _normalize_llm_endpoint(base_url)
     for attempt in range(settings.llm_max_retries + 1):
         try:

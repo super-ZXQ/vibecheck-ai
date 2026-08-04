@@ -140,12 +140,12 @@ def _analyze_source_lines(
     multiline_string_end: str | None = None
 
     if ext in _HASH_COMMENT_EXTENSIONS:
-        single_comment_tokens = ("#",)
+        single_comment_tokens: tuple[str, ...] = ("#",)
     elif ext == ".php":
         single_comment_tokens = ("//", "#")
     else:
         single_comment_tokens = ("//",)
-    block_comment_tokens = (("/*", "*/"),)
+    block_comment_tokens: tuple[tuple[str, str], ...] = (("/*", "*/"),)
     if ext in {".vue", ".svelte"}:
         block_comment_tokens += (("<!--", "-->"),)
 

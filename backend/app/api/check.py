@@ -64,7 +64,6 @@ from app.core.error_codes import (
     QUEUE_FULL,
     SCAN_RESULT_MISSING,
     SCAN_RESULT_NOT_READY,
-    UNSAFE_ARCHIVE,
     UPLOAD_TOO_LARGE,
     get_error_message,
 )
@@ -85,7 +84,6 @@ from app.services.task_manager import (
     create_task,
     get_task,
     is_queue_full,
-    mark_failed,
 )
 from app.services.upload_service import (
     LOCAL_UPLOAD_PREFIX,
@@ -185,7 +183,7 @@ async def create_check(
     # Validate repo URL
     try:
         repo_info = parse_repo_url(request.repo_url)
-    except GitHubDownloadError as e:
+    except GitHubDownloadError:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
@@ -328,8 +326,8 @@ async def create_upload_check(
             },
         )
 
-    asyncio.create_task(trigger_queue_processing())
     store_user_config(task.id, x_llm_api_key, x_llm_base_url, x_llm_model)
+    asyncio.create_task(trigger_queue_processing())
 
     return CheckResponse(
         task_id=task.id,

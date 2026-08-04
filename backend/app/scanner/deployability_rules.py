@@ -673,9 +673,9 @@ class DeployabilityProbe(RepositoryProbe):
             self.dependencies["dotnet"].locked or self.dotnet_all_exact
         )
         for key in sorted(self.dependencies):
-            state = self.dependencies[key]
-            if state.has_dependencies and not state.locked:
-                findings.append(_finding("D003_DEPENDENCY_LOCK", min(state.manifests)))
+            dep_state = self.dependencies[key]
+            if dep_state.has_dependencies and not dep_state.locked:
+                findings.append(_finding("D003_DEPENDENCY_LOCK", min(dep_state.manifests)))
 
         if not (
             self.readme_paths
@@ -690,22 +690,22 @@ class DeployabilityProbe(RepositoryProbe):
             findings.append(_finding("D005_DOCKER_MISSING", _REPOSITORY_PATH))
 
         for path in sorted(self.dockerfiles):
-            state = self.dockerfiles[path]
-            if not state.has_from:
+            docker_state = self.dockerfiles[path]
+            if not docker_state.has_from:
                 findings.append(_finding("D006_DOCKER_MISSING_FROM", path))
                 continue
-            if _is_mutable_base(state.final_base):
+            if _is_mutable_base(docker_state.final_base):
                 findings.append(_finding("D007_DOCKER_MUTABLE_BASE", path))
             if (
-                _is_root_user(state.final_user)
+                _is_root_user(docker_state.final_user)
                 or self.compose_root_user
                 or not (
-                    _is_non_root_user(state.final_user)
+                    _is_non_root_user(docker_state.final_user)
                     or self.compose_non_root_user
                 )
             ):
                 findings.append(_finding("D008_DOCKER_ROOT_USER", path))
-            if not (state.final_has_start or self.compose_has_start):
+            if not (docker_state.final_has_start or self.compose_has_start):
                 findings.append(_finding("D009_DOCKER_MISSING_START", path))
 
         if self.has_compose and not self.dockerfiles:

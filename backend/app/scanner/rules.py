@@ -27,21 +27,18 @@ Import structure (no circular imports):
 from __future__ import annotations
 
 import re
-from typing import Optional
 
 from app.core.config import settings
 from app.core.security.desensitize import (
     CATEGORY_AWS_SECRET,
     CATEGORY_PASSWORD,
     CATEGORY_SECRET,
-    GENERIC,
     classify_key,
     is_already_masked,
     is_env_reference,
     is_low_entropy,
     iter_assignments,
     iter_connection_strings,
-    mask_secret,
     mask_snippet,
 )
 from app.scanner.base import (
@@ -726,12 +723,12 @@ class PrivateKeyRule(Rule):
         for i, line in enumerate(lines):
             # --- If we have a pending BEGIN, ONLY look for the matching END ---
             if pending is not None:
-                begin_header, end_header, begin_line, col_s, col_e = pending
+                pending_begin, end_header, begin_line, col_s, col_e = pending
                 if end_header in line:
                     # Found matching END — emit complete finding.
                     if len(findings) >= limit:
                         return findings
-                    key_type = begin_header.strip("-").strip()
+                    key_type = pending_begin.strip("-").strip()
                     findings.append(Finding(
                         rule_id=self.rule_id,
                         rule_name=self.rule_name,

@@ -73,10 +73,10 @@ from app.core.error_codes import (
     SCAN_RESULT_TOO_LARGE,
     SCAN_TIMEOUT,
     UNSAFE_ARCHIVE,
-    CLEANUP_FAILED,
     get_error_message,
 )
 from app.core.github import (
+    DownloadResult,
     GitHubDownloadError,
     download_tarball,
     cleanup_download,
@@ -197,7 +197,7 @@ def _stat_directory(path: Path) -> ExtractionResult:
 
 async def _download_and_extract(
     task_id: str, repo_url: str,
-) -> tuple[object | None, str | None, ExtractionResult | None]:
+) -> tuple[DownloadResult | None, str | None, ExtractionResult | None]:
     """Stage 1 + 2 for URL-sourced tasks: download tarball and extract it.
 
     On success returns ``(download_result, extract_dest, extract_result)``.
@@ -235,7 +235,7 @@ async def _download_and_extract(
         # the thread so a stage timeout still knows where partial files
         # were written and can signal the thread to abort.
         pending_extract = reserve_extract(settings.tmp_dir)
-        extract_dest = pending_extract.dest_dir
+        extract_dest = str(pending_extract.dest_dir)
 
         # P2-3: Wrap extraction in asyncio.wait_for with timeout.
         extract_result = await asyncio.wait_for(
@@ -303,8 +303,8 @@ async def _process_task(task_id: str) -> None:
     failure, persistence failure, assessment failure, and repair plan
     failure paths.
     """
-    download_result = None
-    extract_dest = None
+    download_result: DownloadResult | None = None
+    extract_dest: str | None = None
     extract_result = None
     cleanup_failed = False
     is_upload = False
@@ -335,7 +335,7 @@ async def _process_task(task_id: str) -> None:
             download_result, extract_dest, extract_result = (
                 await _download_and_extract(task_id, task.repo_url)
             )
-            if extract_result is None:
+            if extract_result is None or extract_dest is None:
                 return
 
         # --- Stage 3: Scan ---

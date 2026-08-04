@@ -10,6 +10,7 @@ import functools
 import tomllib
 from dataclasses import dataclass
 from pathlib import PurePosixPath
+from typing import Final
 from app.core.config import settings
 from app.core.security.desensitize import mask_untrusted_text
 from app.scanner.base import (
@@ -188,8 +189,18 @@ _GO_BUILDVCS_VALID_VALUES = frozenset({
     "true", "false", "True", "False", "TRUE", "FALSE",
     "auto",
 })
-_SKIP_COMMAND = object()
-_AMBIGUOUS = object()
+class _SkipCommand:
+    """Sentinel: command recognized as package-manager workspace usage."""
+    __slots__ = ()
+
+
+_SKIP_COMMAND: Final = _SkipCommand()
+class _AmbiguousResult:
+    """Sentinel: workspace name matched more than one directory."""
+    __slots__ = ()
+
+
+_AMBIGUOUS: Final = _AmbiguousResult()
 _NPM_IF_PRESENT = "--if-present"
 
 # ---- P0-13 Support Boundary Freeze (FINAL) ----
@@ -650,7 +661,7 @@ def _parse_workspace_command(
     command: str,
     line_number: int,
     base_dir: str,
-) -> _CommandReference | object | None:
+) -> _CommandReference | _SkipCommand | None:
     """Parse a workspace command.
 
     Returns:
@@ -1185,7 +1196,7 @@ def _parse_command(
         return streamlit_flask
 
     workspace = _parse_workspace_command(command, line_number, base_dir)
-    if workspace is _SKIP_COMMAND:
+    if isinstance(workspace, _SkipCommand):
         return None
     if workspace is not None:
         return workspace
@@ -1350,12 +1361,16 @@ def _command_references(
                             working_directory, directory_change.group(1)
                         )
                     continue
-                if is_code and working_directory is None:
-                    continue
+                if is_code:
+                    if working_directory is None:
+                        continue
+                    base_dir: str = working_directory
+                else:
+                    base_dir = "."
                 parsed = _parse_command(
                     candidate,
                     candidate_line,
-                    working_directory if is_code else ".",
+                    base_dir,
                 )
                 if parsed is not None:
                     references.append(parsed)
@@ -1419,7 +1434,7 @@ def _structure_references(
             if not path_value:
                 continue
             normalized = _safe_relative_path(".", path_value)
-            if normalized in {None, "."}:
+            if normalized is None or normalized == ".":
                 continue
             parts = PurePosixPath(normalized).parts
             if any(part.lower() in _IGNORED_DOCUMENTED_PARTS for part in parts):
@@ -1553,8 +1568,9 @@ class DocumentationConsistencyProbe(RepositoryProbe):
             include = _REQUIREMENT_INCLUDE_RE.match(stripped)
             if include:
                 target = _safe_relative_path(directory, include.group(1))
-                if target not in {None, "."}:
-                    includes.add(target)
+                if target is None or target == ".":
+                    continue
+                includes.add(target)
                 continue
             if stripped.startswith("-"):
                 continue
@@ -1698,7 +1714,7 @@ class DocumentationConsistencyProbe(RepositoryProbe):
 
     def _resolve_npm_workspace_by_name(
         self, name: str, root_prefix: str,
-    ) -> str | object | None:
+    ) -> str | _AmbiguousResult | None:
         """Resolve an npm workspace package name to its directory.
 
         1. Read root package.json workspaces patterns.
@@ -1758,7 +1774,7 @@ class DocumentationConsistencyProbe(RepositoryProbe):
                     directory = self._resolve_npm_workspace_by_name(
                         ws, root_prefix,
                     )
-                    if directory is _AMBIGUOUS:
+                    if isinstance(directory, _AmbiguousResult):
                         # Multiple workspaces with same name → INVALID
                         return False
                     if directory is None:
@@ -1814,7 +1830,7 @@ class DocumentationConsistencyProbe(RepositoryProbe):
                     directory = self._resolve_npm_workspace_by_name(
                         ws, root_prefix,
                     )
-                    if directory is _AMBIGUOUS:
+                    if isinstance(directory, _AmbiguousResult):
                         # Multiple workspaces with same name → INVALID
                         return False
                     if directory is None:
@@ -1915,9 +1931,7 @@ class DocumentationConsistencyProbe(RepositoryProbe):
         if reference.kind == "make":
             return reference.target in self.make_targets.get(base or ".", set())
         if reference.kind == "go":
-            all_targets = (reference.target,)
-            if reference.targets:
-                all_targets = reference.targets
+            all_targets: tuple[str, ...] = reference.targets or (reference.target,)
             for target in all_targets:
                 if "..." in target:
                     if joined("go.mod") not in self.paths:
@@ -1977,22 +1991,22 @@ class DocumentationConsistencyProbe(RepositoryProbe):
                     break
 
         command_count = 0
-        for reference in readme.commands:
-            if not self._command_is_valid(reference, root_prefix):
-                findings.append(_finding("C003_START_COMMAND_MISMATCH", readme.path, reference.line))
+        for cmd_reference in readme.commands:
+            if not self._command_is_valid(cmd_reference, root_prefix):
+                findings.append(_finding("C003_START_COMMAND_MISMATCH", readme.path, cmd_reference.line))
                 command_count += 1
                 if command_count >= self.limit:
                     break
 
         structure_count = 0
-        for reference in readme.structure:
+        for struct_reference in readme.structure:
             repository_path = (
-                f"{root_prefix}/{reference.path}" if root_prefix else reference.path
+                f"{root_prefix}/{struct_reference.path}" if root_prefix else struct_reference.path
             )
             if not self._path_exists(
-                repository_path, directory=reference.is_directory
+                repository_path, directory=struct_reference.is_directory
             ):
-                findings.append(_finding("C004_PROJECT_STRUCTURE_MISMATCH", readme.path, reference.line))
+                findings.append(_finding("C004_PROJECT_STRUCTURE_MISMATCH", readme.path, struct_reference.line))
                 structure_count += 1
                 if structure_count >= self.limit:
                     break

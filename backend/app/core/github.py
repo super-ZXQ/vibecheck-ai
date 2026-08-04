@@ -15,7 +15,6 @@ import os
 import re
 import shutil
 import stat
-import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path

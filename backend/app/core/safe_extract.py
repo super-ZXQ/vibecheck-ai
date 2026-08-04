@@ -149,7 +149,7 @@ def _validate_member_type(member: tarfile.TarInfo) -> str:
 
     # Catch any other non-regular type (socket, etc.)
     raise ExtractionError(
-        f"Rejected non-regular entry (type={member.type}): {member.name!r}"
+        f"Rejected non-regular entry (type={member.type!r}): {member.name!r}"
     )
 
 
@@ -322,11 +322,12 @@ def safe_extract(
                     target_path.mkdir(parents=True, exist_ok=True)
                 elif member_type == "file":
                     target_path.parent.mkdir(parents=True, exist_ok=True)
-                    with tar.extractfile(member) as src:
-                        if src is None:
-                            raise ExtractionError(
-                                f"Cannot extract file: {member.name!r}"
-                            )
+                    src = tar.extractfile(member)
+                    if src is None:
+                        raise ExtractionError(
+                            f"Cannot extract file: {member.name!r}"
+                        )
+                    with src:
                         with open(target_path, "wb") as dst:
                             # Read in chunks to handle large files safely
                             while True:
