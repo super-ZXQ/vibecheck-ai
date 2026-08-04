@@ -373,6 +373,49 @@ body::before {
   margin-top: 18px;
 }
 
+/* --- 超限引导（失败页）与上传卡片高亮 ------------------------------------ */
+
+.upload-guidance {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  background: linear-gradient(135deg, var(--primary-soft), #f5f3ff);
+  border: 1px solid rgba(99, 102, 241, 0.28);
+  border-radius: 14px;
+  padding: 16px 18px;
+  margin-bottom: 16px;
+  color: var(--primary-dark);
+}
+
+.upload-guidance > svg {
+  flex: none;
+  margin-top: 2px;
+}
+
+.upload-guidance-body {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.upload-guidance-title {
+  font-size: 0.95rem;
+  font-weight: 700;
+}
+
+.upload-guidance-text {
+  font-size: 0.82rem;
+  line-height: 1.65;
+  color: var(--text-secondary);
+  margin: 0;
+}
+
+.upload-card-highlight {
+  border-color: var(--primary) !important;
+  box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.18) !important;
+}
+
 /* --- 4. 页脚 --------------------------------------------------------------- */
 
 .app-footer {

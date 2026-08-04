@@ -8,7 +8,7 @@
 
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 
@@ -160,9 +160,32 @@ export default function Home() {
   const [folderFiles, setFolderFiles] = useState<File[]>([]);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [uploadHighlight, setUploadHighlight] = useState(false);
+  const uploadCardRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     setHistory(getHistory());
+  }, []);
+
+  // ?upload=1 (from the failure-page guidance) scrolls to and highlights
+  // the upload card so the user can switch to a local upload directly.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (new URLSearchParams(window.location.search).get("upload") !== "1") {
+      return;
+    }
+    setUploadHighlight(true);
+    const scrollTimer = setTimeout(() => {
+      uploadCardRef.current?.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+      });
+    }, 60);
+    const clearTimer = setTimeout(() => setUploadHighlight(false), 3000);
+    return () => {
+      clearTimeout(scrollTimer);
+      clearTimeout(clearTimer);
+    };
   }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -300,7 +323,10 @@ export default function Home() {
           </form>
         </div>
 
-        <div className="upload-card">
+        <div
+          ref={uploadCardRef}
+          className={`upload-card${uploadHighlight ? " upload-card-highlight" : ""}`}
+        >
           <div className="upload-title">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
               <path

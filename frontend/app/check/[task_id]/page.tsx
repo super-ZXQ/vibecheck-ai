@@ -20,6 +20,7 @@ import { ErrorState } from "@/components/ErrorState";
 import { RepairPlan } from "@/components/RepairPlan";
 import { ResultTabs } from "@/components/ResultTabs";
 import { ScoreSummary } from "@/components/ScoreSummary";
+import { UploadGuidance, isUploadGuidanceCode } from "@/components/UploadGuidance";
 import { useCheckTask } from "@/hooks/use-check-task";
 import { exportReport } from "@/lib/export";
 import { addHistory, entryFromTaskStatus } from "@/lib/history";
@@ -157,6 +158,7 @@ export default function CheckPage() {
       <main className="container">
         <h1 className="page-title">检测失败</h1>
         {errorMessage && <ErrorState message={errorMessage} />}
+        {isUploadGuidanceCode(taskStatus?.error_code) && <UploadGuidance />}
         <div className="page-header-actions">
           <Link href="/" className="btn btn-primary">
             重新检测
