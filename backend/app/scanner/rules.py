@@ -84,6 +84,20 @@ def _is_placeholder(value: str) -> bool:
     return value.lower() in PLACEHOLDER_VALUES
 
 
+# Leading-token shapes of code expressions. Assignment values are extracted
+# up to the first whitespace, so call expressions may be truncated
+# mid-argument (e.g. `ai_cfg.pop("auth_token",`).
+_DYNAMIC_EXPRESSION_PATTERN = re.compile(
+    r"^[A-Za-z_][\w.]*\(|^[A-Za-z_][\w.]*\[|^lambda"
+)
+
+
+def _is_dynamic_expression(value: str) -> bool:
+    """Check if a value is a code expression (call/subscript/lambda) rather
+    than a hardcoded literal. Such values are resolved at runtime."""
+    return bool(_DYNAMIC_EXPRESSION_PATTERN.match(value))
+
+
 def _is_likely_non_secret(value: str) -> bool:
     """Heuristic: check if a value in a production env file is likely not a secret.
 
@@ -852,6 +866,8 @@ class GenericTokenAssignmentRule(Rule):
 
     False positive control:
     - Env var references are skipped.
+    - Code expressions (function/method calls, subscripts, lambdas) and
+      boolean/null values are skipped — they are resolved at runtime.
     - Placeholder values are downgraded to low/low/non-blocking.
     - Explicit-format tokens (ghp_, AKIA, AIza) are NOT affected by downgrade
       because they are caught by their specific rules with higher priority.
@@ -893,8 +909,14 @@ class GenericTokenAssignmentRule(Rule):
                 value = assignment.value
                 if not value:
                     continue
-                if value.lower() in ("true", "false"):
-                    # Boolean flag (e.g. has_auth_token: true) — not a credential.
+                if value.lower() in ("true", "false", "none", "null"):
+                    # Boolean/null placeholder (e.g. has_auth_token: true,
+                    # api_key = None) — not a credential.
+                    continue
+                if _is_dynamic_expression(value):
+                    # Code expression (function/method call, subscript,
+                    # lambda) — value is resolved at runtime, not a
+                    # hardcoded literal.
                     continue
                 if is_env_reference(value, assignment.is_quoted):
                     continue

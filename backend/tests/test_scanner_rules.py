@@ -361,6 +361,57 @@ class TestGenericTokenAssignmentRule:
         assert f.severity == Severity.HIGH
         assert f.confidence == Confidence.MEDIUM
 
+    def test_function_call_value_skipped(self):
+        """Function-call RHS (get_ai_api_key(config)) is resolved at runtime,
+        not a hardcoded literal."""
+        rule = GenericTokenAssignmentRule()
+        lines = ["    api_key = get_ai_api_key(config)"]
+        findings = rule.scan_content("src/app/credentials.py", lines)
+        assert len(findings) == 0
+
+    def test_str_cast_dict_value_skipped(self):
+        """str() cast inside a dict pair is not a hardcoded literal."""
+        rule = GenericTokenAssignmentRule()
+        lines = ['\t\t\telse {"x-api-key": str(credential)}']
+        findings = rule.scan_content("src/web/preflight.py", lines)
+        assert len(findings) == 0
+
+    def test_method_call_value_skipped(self):
+        """Method-call RHS truncated at whitespace is not a hardcoded literal."""
+        rule = GenericTokenAssignmentRule()
+        lines = ['        auth_token = ai_cfg.pop("auth_token", None)']
+        findings = rule.scan_content("src/web/server.py", lines)
+        assert len(findings) == 0
+
+    def test_subscript_value_skipped(self):
+        """Dict-subscript RHS (config[\"KEY\"]) is a runtime lookup."""
+        rule = GenericTokenAssignmentRule()
+        lines = ['api_key = config["KEY"]']
+        findings = rule.scan_content("src/app/credentials.py", lines)
+        assert len(findings) == 0
+
+    def test_lambda_value_skipped(self):
+        """Lambda RHS is a runtime expression, not a hardcoded literal."""
+        rule = GenericTokenAssignmentRule()
+        lines = ["token = lambda: get_token()"]
+        findings = rule.scan_content("src/app/credentials.py", lines)
+        assert len(findings) == 0
+
+    def test_none_null_value_skipped(self):
+        """None/null assignments are placeholders, not credentials."""
+        rule = GenericTokenAssignmentRule()
+        lines = ["api_key = None", "auth_token = null"]
+        findings = rule.scan_content("src/app/credentials.py", lines)
+        assert len(findings) == 0
+
+    def test_quoted_literal_after_call_prefix_still_detected(self):
+        """Real quoted literals are still detected high/medium."""
+        rule = GenericTokenAssignmentRule()
+        lines = ['api_key = "sk-ant-real-1234567890abcdef1234"']
+        findings = rule.scan_content("src/app/credentials.py", lines)
+        assert len(findings) == 1
+        assert findings[0].severity == Severity.HIGH
+
 
 # ============================================================================
 # --- Connection string (1 test) ---
