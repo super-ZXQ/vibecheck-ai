@@ -28,12 +28,14 @@ export function AssessmentDetails({ assessment }: AssessmentDetailsProps) {
             <div className="stage-label">最终评分</div>
             <div className="score-number">{assessment.score}</div>
           </div>
-          <div>
-            <div className="stage-label">扣分前评分</div>
-            <div style={{ fontSize: "1.5rem", fontWeight: 600 }}>
-              {assessment.score_before_caps}
+          {assessment.score_before_caps !== assessment.score && (
+            <div>
+              <div className="stage-label">扣分前评分</div>
+              <div style={{ fontSize: "1.5rem", fontWeight: 600 }}>
+                {assessment.score_before_caps}
+              </div>
             </div>
-          </div>
+          )}
         </div>
         <div style={{ marginTop: "0.5rem", fontSize: "0.85rem", color: "#64748b" }}>
           策略版本: {assessment.policy_version}

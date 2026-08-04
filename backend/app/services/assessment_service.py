@@ -91,6 +91,19 @@ _CONFIDENCE_ORDER: dict[str, int] = {
     "low": 2,
 }
 
+# rule_id → human-readable display name for score_breakdown entries.
+_RULE_DISPLAY_NAMES: dict[str, str] = {
+    "R001_GITHUB_TOKEN": "GitHub Token",
+    "R002_AWS_ACCESS_KEY": "AWS Access Key",
+    "R003_GOOGLE_API_KEY": "Google API Key",
+    "R004_GENERIC_API_KEY": "Generic API Key",
+    "R005_GENERIC_TOKEN_KEYWORD": "Generic Token Keyword",
+    "R006_PASSWORD_ASSIGNMENT": "Password Assignment",
+    "R007_GENERIC_TOKEN_ASSIGNMENT": "Generic Token Assignment",
+    "R008_CONNECTION_STRING": "Connection String",
+    "R009_PRIVATE_KEY": "Private Key",
+}
+
 
 class AssessmentResultTooLargeError(Exception):
     """Raised when serialized assessment_json exceeds assessment_max_json_bytes.
@@ -387,9 +400,9 @@ def _serialize_score_breakdown_entry(entry: dict[str, Any]) -> dict[str, Any]:
     """Whitelist and mask a single score_breakdown entry.
 
     Allowed fields:
-    - reason_code, rule_id, category, severity (masked strings)
-    - finding_count, deduction_before_rule_cap, rule_cap,
-      applied_deduction (ints)
+    - reason_code, rule_id, rule_name, category, severity (masked strings)
+    - finding_count, deduction_before_rule_cap, max_deduction,
+      deduction (ints)
     - occurrence_deductions (list of ints)
     - description (masked string with path cleaning)
     """
@@ -410,6 +423,7 @@ def _serialize_score_breakdown_entry(entry: dict[str, Any]) -> dict[str, Any]:
     return {
         "reason_code": _safe_masked_str(entry.get("reason_code")),
         "rule_id": _safe_masked_str(entry.get("rule_id")),
+        "rule_name": _safe_masked_str(entry.get("rule_name")),
         "category": _safe_masked_str(entry.get("category")),
         "severity": _safe_masked_str(entry.get("severity")),
         "finding_count": _strict_int(entry.get("finding_count", 0)),
@@ -417,8 +431,8 @@ def _serialize_score_breakdown_entry(entry: dict[str, Any]) -> dict[str, Any]:
         "deduction_before_rule_cap": _strict_int(
             entry.get("deduction_before_rule_cap", 0)
         ),
-        "rule_cap": _strict_int(entry.get("rule_cap", 0)),
-        "applied_deduction": _strict_int(entry.get("applied_deduction", 0)),
+        "max_deduction": _strict_int(entry.get("rule_cap", 0)),
+        "deduction": _strict_int(entry.get("applied_deduction", 0)),
         "description": _safe_masked_desc(entry.get("description")),
     }
 
@@ -917,6 +931,7 @@ def _compute_rule_deduction(
     return {
         "reason_code": "RULE_DEDUCTION",
         "rule_id": rule_id,
+        "rule_name": _RULE_DISPLAY_NAMES.get(rule_id, rule_id),
         "category": category,
         "severity": highest_severity,
         "finding_count": len(findings),
@@ -1402,6 +1417,28 @@ def save_assessment_result(
     return safe_assessment
 
 
+def _normalize_score_breakdown(breakdown: list[dict[str, Any]]) -> None:
+    """Normalize score_breakdown entries in-place.
+
+    Old serialized data may use field names ``applied_deduction`` and
+    ``rule_cap``.  Map these to the current API names ``deduction``
+    and ``max_deduction``, and add ``rule_name`` from the display-name
+    mapping if missing.
+    """
+    for entry in breakdown:
+        if not isinstance(entry, dict):
+            continue
+        # Map old field names → current API names (idempotent)
+        if "applied_deduction" in entry and "deduction" not in entry:
+            entry["deduction"] = entry.pop("applied_deduction")
+        if "rule_cap" in entry and "max_deduction" not in entry:
+            entry["max_deduction"] = entry.pop("rule_cap")
+        # Add rule_name if missing
+        if "rule_name" not in entry or not entry["rule_name"]:
+            rid = entry.get("rule_id", "")
+            entry["rule_name"] = _RULE_DISPLAY_NAMES.get(rid, rid)
+
+
 def get_assessment_result(task_id: str) -> Optional[dict[str, Any]]:
     """Read the full persisted assessment result for a task.
 
@@ -1509,6 +1546,11 @@ def get_assessment_result(task_id: str) -> Optional[dict[str, Any]]:
     verdict = result.get("verdict")
     if verdict not in _VALID_VERDICTS:
         raise AssessmentInternalError("Assessment verdict invalid")
+
+    # --- Normalize score_breakdown field names ---
+    # Stored data may use old field names (applied_deduction, rule_cap)
+    # from pre-v1 serializers. Map to current API field names.
+    _normalize_score_breakdown(result.get("score_breakdown", []))
 
     return result
 

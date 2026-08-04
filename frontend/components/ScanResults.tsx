@@ -16,12 +16,38 @@
 
 import { Fragment, useState } from "react";
 
-import type { ScanResult } from "@/lib/types";
+import type { Finding, LLMAnalysisItem, LLMAnalysisResult, ScanResult } from "@/lib/types";
 import { lookup } from "@/lib/lookup";
 import { SEVERITY_CLASSES, SEVERITY_LABELS } from "@/lib/severity";
 
 interface ScanResultsProps {
   scanResult: ScanResult;
+  llmAnalysis?: LLMAnalysisResult | null;
+}
+
+/**
+ * Look up LLM analysis for a finding by file_path + line_start + rule_id.
+ * Falls back to rule_id-only match if line-based match is not found.
+ */
+function findAnalysis(
+  items: LLMAnalysisItem[],
+  finding: Finding,
+): LLMAnalysisItem | undefined {
+  // Primary: match by file_path + line_start + rule_id
+  const exact = items.find(
+    (a) =>
+      a.file_path.endsWith(finding.file_path) &&
+      a.line_start === finding.line_start &&
+      a.rule_id === finding.rule_id,
+  );
+  if (exact) return exact;
+
+  // Fallback: match by file_path + rule_id (for file-level findings without line)
+  return items.find(
+    (a) =>
+      a.file_path.endsWith(finding.file_path) &&
+      a.rule_id === finding.rule_id,
+  );
 }
 
 const SENSITIVE_DIMENSION = "sensitive_data_security";
@@ -50,7 +76,7 @@ function dimensionLabel(dimension: string) {
   return "敏感信息";
 }
 
-export function ScanResults({ scanResult }: ScanResultsProps) {
+export function ScanResults({ scanResult, llmAnalysis }: ScanResultsProps) {
   const [pageSize, setPageSize] = useState<number>(25);
   const [currentPage, setCurrentPage] = useState<number>(0);
   const [filter, setFilter] = useState<FindingFilter>("all");
@@ -274,15 +300,22 @@ export function ScanResults({ scanResult }: ScanResultsProps) {
                     </button>
                   </td>
                 </tr>
-                {isExpanded && (
-                  <tr className="finding-detail-row">
-                    <td colSpan={8}>
-                      <strong>说明：</strong>{f.description}
-                      <br />
-                      <strong>处理建议：</strong>{f.message}
-                    </td>
-                  </tr>
-                )}
+                {isExpanded && (() => {
+                  const analysis = llmAnalysis
+                    ? findAnalysis(llmAnalysis.items, f)
+                    : undefined;
+                  return (
+                    <tr className="finding-detail-row">
+                      <td colSpan={8}>
+                        <strong>说明：</strong>
+                        {analysis?.explanation || f.description}
+                        <br />
+                        <strong>处理建议：</strong>
+                        {analysis?.instruction || f.message}
+                      </td>
+                    </tr>
+                  );
+                })()}
                 </Fragment>
                 );
               })}

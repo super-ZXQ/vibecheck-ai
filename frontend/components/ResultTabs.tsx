@@ -150,7 +150,9 @@ export function ResultTabs({
           <TabContent
             status={scanResultStatus}
             data={scanResult}
-            renderContent={(data) => <ScanResults scanResult={data} />}
+            renderContent={(data) => (
+              <ScanResults scanResult={data} llmAnalysis={llmAnalysis} />
+            )}
           />
         )}
 
