@@ -456,6 +456,84 @@ body::before {
   box-shadow: var(--shadow-lg);
 }
 
+/* 本地文件上传 */
+.upload-card {
+  margin-top: 12px;
+  background: rgba(255, 255, 255, 0.92);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px dashed rgba(255, 255, 255, 0.55);
+  border-radius: var(--radius-lg);
+  padding: 14px 16px;
+  box-shadow: var(--shadow-lg);
+  text-align: left;
+}
+
+.upload-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: #1f2937;
+}
+
+.upload-hint {
+  margin: 6px 0 10px;
+  font-size: 0.76rem;
+  line-height: 1.55;
+  color: #6b7280;
+}
+
+.upload-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.upload-option {
+  flex: 1 1 220px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  background: #fff;
+  cursor: pointer;
+  transition: border-color 0.18s var(--ease-out);
+}
+
+.upload-option:hover {
+  border-color: var(--primary);
+}
+
+.upload-option-label {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #374151;
+}
+
+.upload-option input[type="file"] {
+  width: 100%;
+  font-size: 0.72rem;
+  color: #6b7280;
+}
+
+.upload-selection {
+  margin-top: 10px;
+  min-height: 18px;
+  font-size: 0.76rem;
+  color: #374151;
+  word-break: break-all;
+}
+
+.upload-actions {
+  margin-top: 10px;
+  display: flex;
+  justify-content: flex-end;
+}
+
 /* 示例仓库 chips */
 .example-chips {
   display: flex;

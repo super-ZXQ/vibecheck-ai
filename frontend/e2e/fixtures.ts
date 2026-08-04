@@ -410,6 +410,42 @@ export function mockSubmitError(
   });
 }
 
+/** Mock POST /api/check/upload → return task created */
+export function mockUploadSuccess(page: Page, taskId = TEST_TASK_ID) {
+  return page.route(`${API_BASE}/api/check/upload`, (route: Route) => {
+    route.fulfill({
+      status: 202,
+      contentType: "application/json",
+      body: JSON.stringify({
+        task_id: taskId,
+        status: "pending",
+        check_url: `/api/check/${taskId}`,
+      }),
+    });
+  });
+}
+
+/** Mock POST /api/check/upload → return error with given status and error_code */
+export function mockUploadError(
+  page: Page,
+  httpStatus: number,
+  errorCode: string,
+  errorMessage?: string,
+) {
+  return page.route(`${API_BASE}/api/check/upload`, (route: Route) => {
+    route.fulfill({
+      status: httpStatus,
+      contentType: "application/json",
+      body: JSON.stringify({
+        detail: {
+          error_code: errorCode,
+          error_message: errorMessage ?? "Error message",
+        },
+      }),
+    });
+  });
+}
+
 /** Mock GET /api/check/{task_id} → return given status response */
 export function mockTaskStatus(page: Page, statusResponse: unknown) {
   return page.route(`${API_BASE}/api/check/${TEST_TASK_ID}`, (route: Route) => {

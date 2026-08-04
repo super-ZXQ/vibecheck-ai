@@ -207,6 +207,114 @@ export async function submitCheck(
   });
 }
 
+// ---------------------------------------------------------------------------
+// POST /api/check/upload — local archive / folder upload
+// ---------------------------------------------------------------------------
+
+/** Upload source shape: a single archive file or a folder of files. */
+export type UploadMode = "archive" | "folder";
+
+/** Upload request timeout — large payloads need more than the 10s default. */
+const UPLOAD_TIMEOUT_MS = 60_000;
+
+/**
+ * POST /api/check/upload — submit a local archive or folder for checking.
+ *
+ * Sends multipart/form-data (browser sets the boundary). For folder mode
+ * each file is appended with its webkitRelativePath as the filename so the
+ * backend can rebuild the tree. Errors use the same ApiHttpError /
+ * ApiNetworkError / ApiAbortError contract as every other call.
+ */
+export async function submitUpload(
+  mode: UploadMode,
+  files: File[],
+  signal?: AbortSignal,
+): Promise<CheckResponse> {
+  const baseUrl = getApiBaseUrl();
+  const url = `${baseUrl}/api/check/upload`;
+
+  const internalController = new AbortController();
+  const internalSignal = internalController.signal;
+  let abortCause: "caller" | "timeout" | null = null;
+
+  const abort = (cause: "caller" | "timeout") => {
+    if (abortCause === null) {
+      abortCause = cause;
+    }
+    internalController.abort();
+  };
+
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  timeoutId = setTimeout(() => {
+    abort("timeout");
+  }, UPLOAD_TIMEOUT_MS);
+
+  let callerAbortListener: (() => void) | null = null;
+  if (signal) {
+    if (signal.aborted) {
+      if (timeoutId) clearTimeout(timeoutId);
+      throw new ApiAbortError();
+    }
+    callerAbortListener = () => {
+      abort("caller");
+    };
+    signal.addEventListener("abort", callerAbortListener, { once: true });
+  }
+
+  try {
+    const formData = new FormData();
+    formData.append("mode", mode);
+    for (const file of files) {
+      // Folder mode: relative path from the browser (webkitdirectory).
+      // Archive mode: falls back to the plain filename.
+      const relPath =
+        (file as File & { webkitRelativePath?: string }).webkitRelativePath ||
+        file.name;
+      formData.append("file", file, relPath);
+    }
+
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: "POST",
+        body: formData,
+        cache: "no-store" as RequestCache,
+        signal: internalSignal,
+      });
+    } catch {
+      throwAbortOutcome(internalSignal, abortCause);
+      throw new ApiNetworkError();
+    }
+
+    if (!response.ok) {
+      let errorCode: string | null = null;
+      try {
+        const body = (await response.json()) as ApiErrorBody;
+        if (body?.detail?.error_code) {
+          errorCode = body.detail.error_code;
+        }
+      } catch {
+        throwAbortOutcome(internalSignal, abortCause);
+      }
+      throw new ApiHttpError(response.status, errorCode);
+    }
+
+    try {
+      return (await response.json()) as CheckResponse;
+    } catch {
+      throwAbortOutcome(internalSignal, abortCause);
+      throw new ApiHttpError(500, "INTERNAL_ERROR");
+    }
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+    if (callerAbortListener && signal) {
+      signal.removeEventListener("abort", callerAbortListener);
+    }
+  }
+}
+
 /**
  * GET /api/check/{task_id} — poll task status.
  * Returns status, stage, progress, scan_summary, score, etc.

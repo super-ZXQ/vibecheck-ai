@@ -31,6 +31,10 @@ const ERROR_MESSAGES: Record<string, string> = {
   // Cleanup errors
   CLEANUP_FAILED: "临时文件清理失败，但不影响检测结果。",
 
+  // Upload errors
+  UPLOAD_TOO_LARGE: "上传内容超过大小限制（压缩包 50MB / 解压总量 200MB / 单文件 25MB / 文件数 2000），已拒绝。",
+  INVALID_UPLOAD: "上传文件格式无效或包含不安全内容，请选择有效的压缩包或文件夹。",
+
   // Queue errors
   QUEUE_FULL: "检测队列已满，请稍后重试。",
 

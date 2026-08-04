@@ -19,6 +19,8 @@ import {
   ApiNetworkError,
   ApiRequestTimeoutError,
   submitCheck,
+  submitUpload,
+  type UploadMode,
 } from "@/lib/api";
 import {
   CONFIG_ERROR_MESSAGE,
@@ -27,6 +29,17 @@ import {
 } from "@/lib/error-messages";
 import { clearHistory, getHistory, type HistoryEntry } from "@/lib/history";
 import { normalizeGitHubRepoUrl } from "@/lib/repository-url.mjs";
+
+// Upload convenience pre-check (the backend enforces authoritative caps).
+const UPLOAD_SINGLE_FILE_LIMIT = 25 * 1024 * 1024;
+const UPLOAD_TOTAL_LIMIT = 200 * 1024 * 1024;
+const UPLOAD_FILE_COUNT_LIMIT = 2000;
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${bytes} B`;
+}
 
 function scoreClass(score: number | null): string {
   if (score === null) return "history-score history-score-none";
@@ -143,6 +156,10 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [archiveFile, setArchiveFile] = useState<File | null>(null);
+  const [folderFiles, setFolderFiles] = useState<File[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
 
   useEffect(() => {
     setHistory(getHistory());
@@ -175,6 +192,63 @@ export default function Home() {
         setError(getErrorMessage(null));
       }
       setLoading(false);
+    }
+  };
+
+  const handleArchivePick = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const picked = e.target.files?.[0] ?? null;
+    setArchiveFile(picked);
+    setFolderFiles([]);
+    setUploadError(null);
+  };
+
+  const handleFolderPick = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const picked = e.target.files ? Array.from(e.target.files) : [];
+    setFolderFiles(picked);
+    setArchiveFile(null);
+    setUploadError(null);
+  };
+
+  const handleUpload = async () => {
+    const mode: UploadMode = archiveFile ? "archive" : "folder";
+    const files = archiveFile ? [archiveFile] : folderFiles;
+    if (!files.length || uploading) return;
+
+    // Convenience pre-checks — the backend caps are authoritative.
+    const total = files.reduce((sum, f) => sum + f.size, 0);
+    if (files.some((f) => f.size > UPLOAD_SINGLE_FILE_LIMIT)) {
+      setUploadError("单个文件不能超过 25MB，请压缩或拆分后重试。");
+      return;
+    }
+    if (total > UPLOAD_TOTAL_LIMIT) {
+      setUploadError("上传内容总量不能超过 200MB，请精简后重试。");
+      return;
+    }
+    if (files.length > UPLOAD_FILE_COUNT_LIMIT) {
+      setUploadError("文件数量不能超过 2000 个，请精简后重试。");
+      return;
+    }
+
+    setUploading(true);
+    setUploadError(null);
+
+    try {
+      const response = await submitUpload(mode, files);
+      router.push(`/check/${response.task_id}`);
+    } catch (err) {
+      if (err instanceof ApiConfigError) {
+        setUploadError(CONFIG_ERROR_MESSAGE);
+      } else if (err instanceof ApiHttpError) {
+        setUploadError(getErrorMessage(err.errorCode));
+      } else if (
+        err instanceof ApiNetworkError ||
+        err instanceof ApiRequestTimeoutError
+      ) {
+        setUploadError(NETWORK_ERROR_MESSAGE);
+      } else {
+        setUploadError(getErrorMessage(null));
+      }
+      setUploading(false);
     }
   };
 
@@ -224,6 +298,68 @@ export default function Home() {
               </button>
             </div>
           </form>
+        </div>
+
+        <div className="upload-card">
+          <div className="upload-title">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path
+                d="M12 16V4m0 0l-4 4m4-4l4 4M4 20h16"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+            或上传本地文件检测
+          </div>
+          <p className="upload-hint">
+            支持 .zip / .tar.gz 压缩包或本地文件夹（单文件 ≤25MB，总量 ≤200MB，最多 2000 个文件）
+          </p>
+          <div className="upload-options">
+            <label className="upload-option">
+              <span className="upload-option-label">压缩包</span>
+              <input
+                type="file"
+                accept=".zip,.tar.gz,.tgz"
+                onChange={handleArchivePick}
+                disabled={uploading}
+                aria-label="上传压缩包"
+              />
+            </label>
+            <label className="upload-option">
+              <span className="upload-option-label">文件夹</span>
+              <input
+                type="file"
+                {...({ webkitdirectory: "", multiple: true } as React.InputHTMLAttributes<HTMLInputElement>)}
+                onChange={handleFolderPick}
+                disabled={uploading}
+                aria-label="上传文件夹"
+              />
+            </label>
+          </div>
+          <div className="upload-selection" aria-live="polite">
+            {archiveFile
+              ? `已选择压缩包：${archiveFile.name}（${formatBytes(archiveFile.size)}）`
+              : folderFiles.length > 0
+                ? `已选择文件夹：${folderFiles.length} 个文件（${formatBytes(
+                    folderFiles.reduce((sum, f) => sum + f.size, 0),
+                  )}）`
+                : ""}
+          </div>
+          <div className="upload-actions">
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={
+                uploading || (!archiveFile && folderFiles.length === 0)
+              }
+              onClick={handleUpload}
+            >
+              {uploading ? <span className="spinner" /> : "上传检测"}
+            </button>
+          </div>
+          {uploadError && <ErrorState message={uploadError} />}
         </div>
 
         <div className="example-chips" aria-label="示例仓库">
