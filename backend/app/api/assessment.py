@@ -117,7 +117,7 @@ async def get_assessment(task_id: str):
         uuid.UUID(task_id)
     except (ValueError, AttributeError):
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail={
                 "error_code": "INVALID_TASK_ID",
                 "error_message": "任务ID格式无效。",

@@ -35,6 +35,7 @@ htmlcov/
 node_modules/
 .next/
 frontend/next-env.d.ts
+frontend/tsconfig.tsbuildinfo
 out/
 .npm
 .pnpm-debug.log*

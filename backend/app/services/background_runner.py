@@ -1,4 +1,4 @@
-"""Background task runner 鈥?processes download + extract + scan + assess + repair sequentially.
+"""Background task runner —processes download + extract + scan + assess + repair sequentially.
 
 Concurrency model (MVP):
 - Only 1 task runs at a time (global asyncio.Lock).
@@ -11,7 +11,7 @@ Pipeline stages (P0-7):
 
 Error handling:
 - All errors are mapped to machine-readable error codes.
-- error_message is always desensitized 鈥?no tokens, paths, or stacks.
+- error_message is always desensitized —no tokens, paths, or stacks.
 - Temp files are always cleaned up via try/finally.
 - No code from the repository is ever executed.
 - Scanner exceptions are caught and mapped to SCAN_INTERNAL_ERROR.
@@ -39,7 +39,7 @@ Repair plan boundary (P0-7):
 - Repair plan reads ONLY from persisted scan_results and
   assessment_results (never from temp directory or memory).
 - Repair plan must succeed BEFORE mark_completed.
-- If repair plan generation fails, the task is marked failed 鈥?even if
+- If repair plan generation fails, the task is marked failed —even if
   scan_results and assessment_results were already persisted.
   The failed task's repair plan API will NOT return residual data.
 """
@@ -122,7 +122,7 @@ from app.services.task_manager import (
 
 logger = logging.getLogger(__name__)
 
-# Global lock 鈥?ensures only 1 task runs at a time
+# Global lock —ensures only 1 task runs at a time
 _lock = asyncio.Lock()
 _is_processing = False
 
@@ -273,7 +273,7 @@ async def _download_and_extract(
         return download_result, None, None
     except Exception as e:
         # Genuine I/O or unexpected failures during extraction are NOT
-        # proof of a malicious archive 鈥?report them as internal errors.
+        # proof of a malicious archive —report them as internal errors.
         logger.error(
             "Extraction failed for task %s: %s", task_id, type(e).__name__
         )
@@ -294,12 +294,12 @@ async def _process_task(task_id: str) -> None:
        deterministic repair plan, persist to repair_results.
     7. Generate LLM analysis: read persisted scan result, generate
        plain-language explanations for non-blocking findings, persist
-       to llm_analysis_results. This stage is NON-BLOCKING 鈥?failures
+       to llm_analysis_results. This stage is NON-BLOCKING —failures
        fall back to templates and never prevent task completion.
     8. Mark task as completed (only after successful repair plan persistence).
 
     On any failure, marks the task as failed with a desensitized error.
-    Temp files are always cleaned up via try/finally 鈥?in success, scan
+    Temp files are always cleaned up via try/finally —in success, scan
     failure, persistence failure, assessment failure, and repair plan
     failure paths.
     """
@@ -359,7 +359,7 @@ async def _process_task(task_id: str) -> None:
             )
             return
         except Exception as e:
-            # Log only the exception type 鈥?never str(exc), repr(exc),
+            # Log only the exception type —never str(exc), repr(exc),
             # stack traces, or repo content.
             logger.error(
                 "Scan failed for task %s: %s", task_id, type(e).__name__
@@ -371,7 +371,7 @@ async def _process_task(task_id: str) -> None:
             return
 
         # --- Stage 4: Persist scan result ---
-        # Persist BEFORE marking completed 鈥?if persistence fails,
+        # Persist BEFORE marking completed —if persistence fails,
         # the task must NOT be marked as completed.
         # save_scan_result is synchronous (CPU/IO-bound). Run it in a
         # thread via asyncio.to_thread so the event loop stays responsive.
@@ -384,7 +384,7 @@ async def _process_task(task_id: str) -> None:
             )
         except ScanResultTooLargeError as e:
             # Serialized result_json exceeded scan_max_result_json_bytes.
-            # Log only the exception type 鈥?never str(exc) or DB details.
+            # Log only the exception type —never str(exc) or DB details.
             logger.error(
                 "Scan result too large for task %s: %s",
                 task_id, type(e).__name__,
@@ -395,7 +395,7 @@ async def _process_task(task_id: str) -> None:
             )
             return
         except Exception as e:
-            # Log only the exception type 鈥?never str(exc) or DB errors.
+            # Log only the exception type —never str(exc) or DB errors.
             logger.error(
                 "Scan result persistence failed for task %s: %s",
                 task_id, type(e).__name__,
@@ -413,7 +413,7 @@ async def _process_task(task_id: str) -> None:
         # run_assessment is synchronous (CPU/IO-bound). Run it in a thread
         # via asyncio.to_thread so the event loop stays responsive.
         # The await guarantees the thread has completed before cleanup.
-        # Assessment MUST succeed before mark_completed 鈥?if it fails,
+        # Assessment MUST succeed before mark_completed —if it fails,
         # the task is marked failed even though scan_results was persisted.
         # The failed task's assessment API will NOT return residual data.
         mark_running(task_id, STAGE_ASSESSING, 90)
@@ -434,7 +434,7 @@ async def _process_task(task_id: str) -> None:
             return
         except AssessmentResultTooLargeError as e:
             # Serialized assessment_json exceeded assessment_max_json_bytes.
-            # Log only the exception type 鈥?never str(exc) or DB details.
+            # Log only the exception type —never str(exc) or DB details.
             logger.error(
                 "Assessment result too large for task %s: %s",
                 task_id, type(e).__name__,
@@ -447,7 +447,7 @@ async def _process_task(task_id: str) -> None:
         except AssessmentInternalError as e:
             # Reading or parsing the persisted scan result failed, or
             # assessment computation failed.
-            # Log only the exception type 鈥?never str(exc) or stack traces.
+            # Log only the exception type —never str(exc) or stack traces.
             logger.error(
                 "Assessment internal error for task %s: %s",
                 task_id, type(e).__name__,
@@ -459,7 +459,7 @@ async def _process_task(task_id: str) -> None:
             return
         except AssessmentPersistError as e:
             # SQLite assessment_results write failed.
-            # Log only the exception type 鈥?never str(exc) or DB errors.
+            # Log only the exception type —never str(exc) or DB errors.
             logger.error(
                 "Assessment persistence failed for task %s: %s",
                 task_id, type(e).__name__,
@@ -475,7 +475,7 @@ async def _process_task(task_id: str) -> None:
             # SQLite save failures are already caught by
             # AssessmentPersistError above. Other unknown exceptions
             # belong to internal computation or orchestration.
-            # Log only the exception type 鈥?never str(exc) or DB errors.
+            # Log only the exception type —never str(exc) or DB errors.
             logger.error(
                 "Assessment failed for task %s: %s",
                 task_id, type(e).__name__,
@@ -494,7 +494,7 @@ async def _process_task(task_id: str) -> None:
         # generate_and_save_repair_plan is synchronous (CPU/IO-bound).
         # Run it in a thread via asyncio.to_thread so the event loop
         # stays responsive.
-        # Repair plan MUST succeed before mark_completed 鈥?if it fails,
+        # Repair plan MUST succeed before mark_completed —if it fails,
         # the task is marked failed even though scan_results and
         # assessment_results were already persisted.
         # The failed task's repair plan API will NOT return residual data.
@@ -516,7 +516,7 @@ async def _process_task(task_id: str) -> None:
             return
         except RepairPlanTooLargeError as e:
             # Serialized repair_json exceeded repair_max_json_bytes.
-            # Log only the exception type 鈥?never str(exc) or DB details.
+            # Log only the exception type —never str(exc) or DB details.
             logger.error(
                 "Repair plan too large for task %s: %s",
                 task_id, type(e).__name__,
@@ -530,7 +530,7 @@ async def _process_task(task_id: str) -> None:
             # Reading or parsing the persisted scan/assessment failed,
             # consistency validation failed, or repair plan computation
             # failed.
-            # Log only the exception type 鈥?never str(exc) or stack traces.
+            # Log only the exception type —never str(exc) or stack traces.
             logger.error(
                 "Repair plan internal error for task %s: %s",
                 task_id, type(e).__name__,
@@ -542,7 +542,7 @@ async def _process_task(task_id: str) -> None:
             return
         except RepairPlanPersistError as e:
             # SQLite repair_results write failed.
-            # Log only the exception type 鈥?never str(exc) or DB errors.
+            # Log only the exception type —never str(exc) or DB errors.
             logger.error(
                 "Repair plan persistence failed for task %s: %s",
                 task_id, type(e).__name__,
@@ -554,7 +554,7 @@ async def _process_task(task_id: str) -> None:
             return
         except Exception as e:
             # Catch-all for any unexpected error not covered above.
-            # Log only the exception type 鈥?never str(exc) or DB errors.
+            # Log only the exception type —never str(exc) or DB errors.
             logger.error(
                 "Repair plan failed for task %s: %s",
                 task_id, type(e).__name__,
@@ -569,7 +569,7 @@ async def _process_task(task_id: str) -> None:
         # Generate plain-language explanations and repair instructions
         # for non-blocking findings. This stage reads ONLY from the
         # persisted scan_results table.
-        # This stage NEVER fails the task 鈥?generate_and_save_llm_analysis
+        # This stage NEVER fails the task —generate_and_save_llm_analysis
         # catches all internal errors and falls back to templates.
         # LLM analysis is an enhancement, not a requirement. Assessment
         # scoring (P0-6) is completely independent and unaffected.
@@ -589,14 +589,14 @@ async def _process_task(task_id: str) -> None:
                 timeout=settings.llm_analysis_timeout,
             )
         except asyncio.TimeoutError:
-            # Non-blocking 鈥?LLM analysis timeout doesn't fail the task.
+            # Non-blocking —LLM analysis timeout doesn't fail the task.
             logger.warning(
                 "LLM analysis timed out for task %s (non-blocking, "
                 "continuing to completion)",
                 task_id,
             )
         except Exception as e:
-            # This should never happen 鈥?generate_and_save_llm_analysis
+            # This should never happen —generate_and_save_llm_analysis
             # is designed to never raise. But if it does, log and continue.
             logger.warning(
                 "LLM analysis stage failed for task %s: %s "
@@ -620,7 +620,7 @@ async def _process_task(task_id: str) -> None:
             total_size=extract_result.total_size,
             top_level_dir=(
                 extract_result.top_level_dir
-                or ("鏈湴椤圭洰" if is_upload else "unknown")
+                or ("本地上传" if is_upload else "unknown")
             ),
         )
 
@@ -659,7 +659,7 @@ async def _process_task(task_id: str) -> None:
         # If cleanup failed but task was completed, log it (task result is still valid)
         if cleanup_failed:
             logger.warning(
-                "Cleanup failed for task %s 鈥?temp files may remain", task_id
+                "Cleanup failed for task %s —temp files may remain", task_id
             )
 
 
@@ -670,7 +670,7 @@ async def trigger_queue_processing() -> None:
     If processing is already running, this is a no-op (the running processor
     will pick up new pending tasks).
 
-    Safe to call multiple times 鈥?only one processor runs at a time.
+    Safe to call multiple times —only one processor runs at a time.
     """
     global _is_processing
 
@@ -698,6 +698,6 @@ async def trigger_queue_processing() -> None:
 
 
 def reset_runner_state() -> None:
-    """Reset the runner state 鈥?for testing only."""
+    """Reset the runner state —for testing only."""
     global _is_processing
     _is_processing = False
