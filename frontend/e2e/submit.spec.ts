@@ -38,6 +38,33 @@ test.describe("URL submission", () => {
     });
     expect(page.url()).toContain(`/check/${TEST_TASK_ID}`);
   });
+
+  test("adds HTTPS before submitting a github.com shorthand", async ({ page }) => {
+    let submittedRepoUrl: string | undefined;
+    await page.route(`${API_BASE}/api/check`, async (route) => {
+      submittedRepoUrl = route.request().postDataJSON().repo_url;
+      await route.fulfill({
+        status: 202,
+        contentType: "application/json",
+        body: JSON.stringify({
+          task_id: TEST_TASK_ID,
+          status: "pending",
+          check_url: `/api/check/${TEST_TASK_ID}`,
+        }),
+      });
+    });
+
+    await page.goto("/");
+    await page
+      .getByLabel("GitHub 仓库地址")
+      .fill("github.com/powercy/BossHunter");
+    await page.getByRole("button", { name: "开始检测" }).click();
+    await page.waitForURL(`/check/${TEST_TASK_ID}`);
+
+    expect(submittedRepoUrl).toBe(
+      "https://github.com/powercy/BossHunter",
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -26,6 +26,7 @@ import {
   NETWORK_ERROR_MESSAGE,
 } from "@/lib/error-messages";
 import { clearHistory, getHistory, type HistoryEntry } from "@/lib/history";
+import { normalizeGitHubRepoUrl } from "@/lib/repository-url.mjs";
 
 function scoreClass(score: number | null): string {
   if (score === null) return "history-score history-score-none";
@@ -74,7 +75,7 @@ function FeaturePill({ children }: { children: React.ReactNode }) {
 
 const EXAMPLE_REPOS = [
   { owner: "super-ZXQ", repo: "vibecheck-ai", url: "https://github.com/super-ZXQ/vibecheck-ai" },
-  { owner: "facebook", repo: "react", url: "https://github.com/facebook/react" },
+  { owner: "expressjs", repo: "express", url: "https://github.com/expressjs/express" },
   { owner: "pallets", repo: "flask", url: "https://github.com/pallets/flask" },
 ];
 
@@ -149,14 +150,15 @@ export default function Home() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    const trimmed = repoUrl.trim();
-    if (!trimmed || loading) return;
+    const normalized = normalizeGitHubRepoUrl(repoUrl);
+    if (!normalized || loading) return;
 
     setLoading(true);
     setError(null);
+    setRepoUrl(normalized);
 
     try {
-      const response = await submitCheck(trimmed);
+      const response = await submitCheck(normalized);
       // Redirect to check page — polling happens there
       router.push(`/check/${response.task_id}`);
     } catch (err) {

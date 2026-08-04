@@ -8,6 +8,7 @@ services:
     environment:
       - GITHUB_TOKEN=${GITHUB_TOKEN:-}
       - LLM_API_KEY=${LLM_API_KEY:-}
+      - MAX_SINGLE_FILE_SIZE=${MAX_SINGLE_FILE_SIZE:-26214400}
     restart: unless-stopped
     healthcheck:
       test:

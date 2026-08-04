@@ -64,8 +64,15 @@ class Settings(BaseSettings):
     # --- Archive size limits (enforced during download & extraction) ---
     max_archive_size: int = 50 * 1024 * 1024  # 50 MB compressed
     max_extracted_total_size: int = 200 * 1024 * 1024  # 200 MB total
-    max_file_count: int = 2000  # max number of files
-    max_single_file_size: int = 10 * 1024 * 1024  # 10 MB per file
+    max_file_count: int = 2000  # max number of archive entries
+    # Large data assets are extracted with a strict cap, then skipped by the
+    # independent 1 MB scanner limit. Streaming extraction avoids loading the
+    # file into memory, while the total 200 MB archive limit still applies.
+    max_single_file_size: int = Field(
+        default=25 * 1024 * 1024,
+        ge=1,
+        le=50 * 1024 * 1024,
+    )
 
     # --- Scan limits ---
     scan_timeout: int = 120  # seconds — wraps scan_directory in asyncio.wait_for

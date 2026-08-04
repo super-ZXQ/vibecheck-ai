@@ -18,6 +18,7 @@ services:
       CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:?set CORS_ALLOWED_ORIGINS}"
       TRUSTED_HOSTS: "${TRUSTED_HOSTS:?set TRUSTED_HOSTS}"
       GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
+      MAX_SINGLE_FILE_SIZE: "${MAX_SINGLE_FILE_SIZE:-26214400}"
     volumes:
       - backend_data:/data
     read_only: true
