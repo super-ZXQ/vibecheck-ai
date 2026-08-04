@@ -14,15 +14,17 @@
 import { useState } from "react";
 
 import { AssessmentDetails } from "@/components/AssessmentDetails";
+import LLMAnalysis from "@/components/LLMAnalysis";
 import { ScanResults } from "@/components/ScanResults";
 import type {
   AssessmentResult,
+  LLMAnalysisResult,
   RepairPlan,
   ScanResult,
 } from "@/lib/types";
 import type { ResultTabStatus } from "@/hooks/use-check-task";
 
-type TabKey = "scan" | "assessment" | "repair";
+type TabKey = "scan" | "assessment" | "repair" | "llm";
 
 interface ResultTabsProps {
   scanResult: ScanResult | null;
@@ -31,6 +33,8 @@ interface ResultTabsProps {
   assessmentStatus: ResultTabStatus;
   repairPlan: RepairPlan | null;
   repairPlanStatus: ResultTabStatus;
+  llmAnalysis: LLMAnalysisResult | null;
+  llmAnalysisStatus: ResultTabStatus;
   /** Optional render override for the repair plan tab (added in Phase 5). */
   renderRepairPlan?: (plan: RepairPlan) => React.ReactNode;
 }
@@ -39,6 +43,73 @@ const TAB_LABELS: Record<TabKey, string> = {
   scan: "扫描结果",
   assessment: "安全评估",
   repair: "修复计划",
+  llm: "AI 分析",
+};
+
+const TAB_ICONS: Record<TabKey, React.ReactNode> = {
+  scan: (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <circle cx="11" cy="11" r="7" stroke="currentColor" strokeWidth="2" />
+      <path
+        d="M20 20l-3.5-3.5M11 8v3l2 1.5"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  ),
+  assessment: (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path
+        d="M12 3l7 4v5c0 4.5-3 8.5-7 9.5-4-1-7-5-7-9.5V7l7-4z"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M9.2 12.4l2 2 3.6-3.8"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        fill="none"
+      />
+    </svg>
+  ),
+  repair: (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path
+        d="M14.7 6.3a4 4 0 00-5.4 5.4L4 17v3h3l5.3-5.3a4 4 0 005.4-5.4l-3 3-2-2 3-3z"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  ),
+  llm: (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path
+        d="M12 3l1.9 4.7L18.5 9l-4.6 1.3L12 15l-1.9-4.7L5.5 9l4.6-1.3L12 3z"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M18.5 14l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8.8-2z"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M5.5 14l.7 1.8 1.8.7-1.8.7L5.5 19l-.7-1.8-1.8-.7 1.8-.7.7-1.8z"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinejoin="round"
+      />
+    </svg>
+  ),
 };
 
 export function ResultTabs({
@@ -48,6 +119,8 @@ export function ResultTabs({
   assessmentStatus,
   repairPlan,
   repairPlanStatus,
+  llmAnalysis,
+  llmAnalysisStatus,
   renderRepairPlan,
 }: ResultTabsProps) {
   const [activeTab, setActiveTab] = useState<TabKey>("scan");
@@ -62,6 +135,7 @@ export function ResultTabs({
             className={`tab ${activeTab === key ? "tab-active" : ""}`}
             onClick={() => setActiveTab(key)}
           >
+            <span className="tab-icon">{TAB_ICONS[key]}</span>
             {TAB_LABELS[key]}
             {getStatusBadge(key)}
           </button>
@@ -69,7 +143,7 @@ export function ResultTabs({
       </div>
 
       {/* Tab content */}
-      <div>
+      <div className="tab-content" key={activeTab}>
         {activeTab === "scan" && (
           <TabContent
             status={scanResultStatus}
@@ -97,6 +171,14 @@ export function ResultTabs({
             }
           />
         )}
+
+        {activeTab === "llm" && (
+          <TabContent
+            status={llmAnalysisStatus}
+            data={llmAnalysis}
+            renderContent={(data) => <LLMAnalysis result={data} />}
+          />
+        )}
       </div>
     </div>
   );
@@ -107,7 +189,9 @@ export function ResultTabs({
         ? scanResultStatus
         : key === "assessment"
           ? assessmentStatus
-          : repairPlanStatus;
+          : key === "repair"
+            ? repairPlanStatus
+            : llmAnalysisStatus;
     if (status === "available") return " ✓";
     if (status === "unavailable") return " −";
     return " !";

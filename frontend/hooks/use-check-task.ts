@@ -16,6 +16,7 @@ import {
   ApiNetworkError,
   ApiRequestTimeoutError,
   getAssessment,
+  getLLMAnalysis,
   getRepairPlan,
   getScanResult,
   getTaskStatus,
@@ -28,6 +29,7 @@ import {
 } from "@/lib/error-messages";
 import type {
   AssessmentResult,
+  LLMAnalysisResult,
   RepairPlan,
   ScanResult,
   TaskStatusResponse,
@@ -63,6 +65,8 @@ export interface UseCheckTaskResult {
   assessmentStatus: ResultTabStatus;
   repairPlan: RepairPlan | null;
   repairPlanStatus: ResultTabStatus;
+  llmAnalysis: LLMAnalysisResult | null;
+  llmAnalysisStatus: ResultTabStatus;
   submit: (repoUrl: string) => Promise<void>;
   startPolling: (existingTaskId: string) => () => void;
   reset: () => void;
@@ -92,6 +96,9 @@ export function useCheckTask(options?: UseCheckTaskOptions): UseCheckTaskResult 
     useState<ResultTabStatus>("unavailable");
   const [repairPlan, setRepairPlan] = useState<RepairPlan | null>(null);
   const [repairPlanStatus, setRepairPlanStatus] =
+    useState<ResultTabStatus>("unavailable");
+  const [llmAnalysis, setLLMAnalysis] = useState<LLMAnalysisResult | null>(null);
+  const [llmAnalysisStatus, setLLMAnalysisStatus] =
     useState<ResultTabStatus>("unavailable");
 
   const activeSessionRef = useRef<PollingSession | null>(null);
@@ -181,6 +188,8 @@ export function useCheckTask(options?: UseCheckTaskOptions): UseCheckTaskResult 
     setAssessmentStatus("unavailable");
     setRepairPlan(null);
     setRepairPlanStatus("unavailable");
+    setLLMAnalysis(null);
+    setLLMAnalysisStatus("unavailable");
   }, []);
 
   const loadResults = useCallback(
@@ -188,15 +197,17 @@ export function useCheckTask(options?: UseCheckTaskOptions): UseCheckTaskResult 
       if (!isSessionActive(session)) return;
       setState("loading_results");
 
-      const [resultRes, assessmentRes, repairRes] = await Promise.allSettled([
-        getScanResult(id, session.controller.signal),
-        getAssessment(id, session.controller.signal),
-        getRepairPlan(id, session.controller.signal),
-      ]);
+      const [resultRes, assessmentRes, repairRes, llmRes] =
+        await Promise.allSettled([
+          getScanResult(id, session.controller.signal),
+          getAssessment(id, session.controller.signal),
+          getRepairPlan(id, session.controller.signal),
+          getLLMAnalysis(id, session.controller.signal),
+        ]);
 
       if (!isSessionActive(session)) return;
       if (
-        [resultRes, assessmentRes, repairRes].some(
+        [resultRes, assessmentRes, repairRes, llmRes].some(
           (result) =>
             result.status === "rejected" &&
             result.reason instanceof ApiAbortError,
@@ -239,6 +250,19 @@ export function useCheckTask(options?: UseCheckTaskOptions): UseCheckTaskResult 
         setRepairPlanStatus(
           repairRes.reason instanceof ApiHttpError &&
             repairRes.reason.statusCode === 409
+            ? "unavailable"
+            : "error",
+        );
+      }
+
+      if (llmRes.status === "fulfilled") {
+        setLLMAnalysis(llmRes.value);
+        setLLMAnalysisStatus("available");
+      } else {
+        setLLMAnalysis(null);
+        setLLMAnalysisStatus(
+          llmRes.reason instanceof ApiHttpError &&
+            llmRes.reason.statusCode === 409
             ? "unavailable"
             : "error",
         );
@@ -456,6 +480,8 @@ export function useCheckTask(options?: UseCheckTaskOptions): UseCheckTaskResult 
     assessmentStatus,
     repairPlan,
     repairPlanStatus,
+    llmAnalysis,
+    llmAnalysisStatus,
     submit,
     startPolling,
     reset,

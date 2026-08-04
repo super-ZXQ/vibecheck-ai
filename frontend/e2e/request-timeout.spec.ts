@@ -273,7 +273,7 @@ for (const [hungResult, endpoint] of Object.entries(RESULT_ENDPOINTS)) {
     await page.clock.fastForward(10_001);
 
     const tabs = page.locator(".tab");
-    await expect(tabs).toHaveCount(3);
+    await expect(tabs).toHaveCount(4);
     await expect(tabs.nth(endpoint.tabIndex)).toContainText("!");
 
     for (const availableEndpoint of Object.values(RESULT_ENDPOINTS)) {

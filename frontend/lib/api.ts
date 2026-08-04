@@ -19,6 +19,7 @@ import type {
   AssessmentResult,
   CheckRequest,
   CheckResponse,
+  LLMAnalysisResult,
   RepairPlan,
   ScanResult,
   TaskStatusResponse,
@@ -255,6 +256,20 @@ export async function getRepairPlan(
 ): Promise<RepairPlan> {
   return apiFetch<RepairPlan>(
     `/api/check/${encodeURIComponent(taskId)}/repair-plan`,
+    { method: "GET", signal },
+  );
+}
+
+/**
+ * GET /api/check/{task_id}/llm-analysis — LLM analysis of non-blocking findings.
+ * Non-blocking endpoint: 409 means analysis not available for this task.
+ */
+export async function getLLMAnalysis(
+  taskId: string,
+  signal?: AbortSignal,
+): Promise<LLMAnalysisResult> {
+  return apiFetch<LLMAnalysisResult>(
+    `/api/check/${encodeURIComponent(taskId)}/llm-analysis`,
     { method: "GET", signal },
   );
 }

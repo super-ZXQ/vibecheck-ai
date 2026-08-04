@@ -261,7 +261,7 @@ test("a result body timeout marks only its tab as error", async ({ page }) => {
   await page.clock.fastForward(10_001);
 
   const tabs = page.locator(".tab");
-  await expect(tabs).toHaveCount(3);
+  await expect(tabs).toHaveCount(4);
   await expect(tabs.nth(0)).toContainText("!");
   await expect(tabs.nth(1)).not.toContainText("!");
   await expect(tabs.nth(2)).not.toContainText("!");

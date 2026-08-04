@@ -13,7 +13,7 @@
 
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 
 import { CheckProgress } from "@/components/CheckProgress";
 import { ErrorState } from "@/components/ErrorState";
@@ -21,6 +21,8 @@ import { RepairPlan } from "@/components/RepairPlan";
 import { ResultTabs } from "@/components/ResultTabs";
 import { ScoreSummary } from "@/components/ScoreSummary";
 import { useCheckTask } from "@/hooks/use-check-task";
+import { exportReport } from "@/lib/export";
+import { addHistory, entryFromTaskStatus } from "@/lib/history";
 
 // UUID v4 format validation (case-insensitive)
 const UUID_REGEX =
@@ -39,6 +41,18 @@ export default function CheckPage() {
     if (!isValidUuid) return;
     return startPolling(taskId);
   }, [isValidUuid, startPolling, taskId]);
+
+  // Save to localStorage history exactly once when the task completes
+  // or fails (failed status only when reported by the backend status API).
+  const historySavedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!hook.taskStatus) return;
+    const status = hook.taskStatus.status;
+    if (status !== "completed" && status !== "failed") return;
+    if (historySavedRef.current === hook.taskStatus.task_id) return;
+    historySavedRef.current = hook.taskStatus.task_id;
+    addHistory(entryFromTaskStatus(hook.taskStatus));
+  }, [hook.taskStatus]);
 
   // --- Invalid task_id ---
   if (!isValidUuid) {
@@ -94,7 +108,29 @@ export default function CheckPage() {
   if (state === "completed") {
     return (
       <main className="container">
-        <h1 className="page-title">检测结果</h1>
+        <div className="page-header-row">
+          <h1 className="page-title">检测结果</h1>
+          <div className="page-header-actions">
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={() =>
+                exportReport(
+                  taskId,
+                  hook.scanResult,
+                  hook.assessment,
+                  hook.repairPlan,
+                  hook.llmAnalysis,
+                )
+              }
+            >
+              导出报告
+            </button>
+            <Link href="/" className="btn btn-secondary">
+              返回首页
+            </Link>
+          </div>
+        </div>
         {taskStatus && <ScoreSummary taskStatus={taskStatus} />}
         <ResultTabs
           scanResult={hook.scanResult}
@@ -103,6 +139,8 @@ export default function CheckPage() {
           assessmentStatus={hook.assessmentStatus}
           repairPlan={hook.repairPlan}
           repairPlanStatus={hook.repairPlanStatus}
+          llmAnalysis={hook.llmAnalysis}
+          llmAnalysisStatus={hook.llmAnalysisStatus}
           renderRepairPlan={(plan) => <RepairPlan plan={plan} />}
         />
       </main>
@@ -115,9 +153,14 @@ export default function CheckPage() {
       <main className="container">
         <h1 className="page-title">检测失败</h1>
         {errorMessage && <ErrorState message={errorMessage} />}
-        <Link href="/" className="btn btn-primary">
-          重新检测
-        </Link>
+        <div className="page-header-actions">
+          <Link href="/" className="btn btn-primary">
+            重新检测
+          </Link>
+          <Link href="/" className="btn btn-secondary">
+            返回首页
+          </Link>
+        </div>
       </main>
     );
   }
@@ -128,9 +171,14 @@ export default function CheckPage() {
       <main className="container">
         <h1 className="page-title">检测超时</h1>
         <ErrorState message="检测超时，请稍后重试。" />
-        <Link href="/" className="btn btn-primary">
-          重新检测
-        </Link>
+        <div className="page-header-actions">
+          <Link href="/" className="btn btn-primary">
+            重新检测
+          </Link>
+          <Link href="/" className="btn btn-secondary">
+            返回首页
+          </Link>
+        </div>
       </main>
     );
   }

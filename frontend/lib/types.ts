@@ -65,6 +65,8 @@ export interface TaskStatusResponse {
   assessment_url: string | null;
   repair_plan_available: boolean | null;
   repair_plan_url: string | null;
+  llm_analysis_available: boolean | null;
+  llm_analysis_url: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -227,6 +229,31 @@ export interface RepairPlan {
   source_assessment_policy_version: string;
   created_at: string;
   updated_at: string;
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/check/{task_id}/llm-analysis
+// ---------------------------------------------------------------------------
+
+export interface LLMAnalysisItem {
+  rule_id: string;
+  rule_name: string;
+  severity: string;
+  file_path: string;
+  line_start: number | null;
+  explanation: string;
+  instruction: string;
+  source: string; // "llm" | "fallback" | "none"
+}
+
+export interface LLMAnalysisResult {
+  schema_version: number;
+  scope: string;
+  total_analyzed: number;
+  total_llm: number;
+  total_fallback: number;
+  source: string;
+  items: LLMAnalysisItem[];
 }
 
 // ---------------------------------------------------------------------------
