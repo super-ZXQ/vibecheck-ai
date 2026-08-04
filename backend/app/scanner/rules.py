@@ -73,6 +73,8 @@ PLACEHOLDER_VALUES: frozenset[str] = frozenset({
     "todo", "tbd", "fixme",
     "none", "null", "nil", "undefined",
     "password", "secret", "token", "apikey", "api_key",
+    "pass", "pwd", "user", "username",
+    "***", "your-password", "your-secret", "your-token", "your-key",
     "<password>", "<secret>", "<token>", "<api_key>",
     "string", "str", "value", "val",
     "redacted", "masked", "hidden",
@@ -88,14 +90,70 @@ def _is_placeholder(value: str) -> bool:
 # up to the first whitespace, so call expressions may be truncated
 # mid-argument (e.g. `ai_cfg.pop("auth_token",`).
 _DYNAMIC_EXPRESSION_PATTERN = re.compile(
-    r"^[A-Za-z_][\w.]*\(|^[A-Za-z_][\w.]*\[|^lambda"
+    r"^[A-Za-z_][\w.]*\(|^[A-Za-z_][\w.]*\[|^lambda|^await\b|^\"?\$\("
+)
+# Attribute chains (a.b.c) are only code references when unquoted — a
+# quoted chain-shaped string (e.g. ``"os.supersecret"``) is a literal.
+_ATTRIBUTE_CHAIN_PATTERN = re.compile(r"^[A-Za-z_][\w]*(\.[A-Za-z_][\w]*)+$")
+# Plain identifiers (optionally with trailing comma/close paren) — variable
+# references in code, but bare values in config files may be real secrets.
+_PLAIN_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*[,)]?$")
+
+_CONFIG_FILE_SUFFIXES = (
+    ".env", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
+    ".properties", ".json",
 )
 
 
-def _is_dynamic_expression(value: str) -> bool:
-    """Check if a value is a code expression (call/subscript/lambda) rather
-    than a hardcoded literal. Such values are resolved at runtime."""
-    return bool(_DYNAMIC_EXPRESSION_PATTERN.match(value))
+def _is_config_file(file_path: str) -> bool:
+    """Check if a file is a config/declarative file where bare values are
+    actual secrets rather than code references."""
+    lower = file_path.lower()
+    return lower.endswith(_CONFIG_FILE_SUFFIXES) or lower.endswith(".env")
+
+
+def _is_dynamic_expression(value: str, is_quoted: bool = False,
+                           file_path: str = "") -> bool:
+    """Check if a value is a code expression (call/subscript/lambda/await/
+    attribute chain/shell substitution) rather than a hardcoded literal.
+
+    Attribute chains and plain identifiers are only treated as references
+    when NOT quoted — a quoted identifier-shaped string (e.g.
+    ``"hardcoded_password_789"`` or ``"os.supersecret"``) or a bare value
+    in a config file (e.g. ``TOKEN=my_secret_token_value`` in .env) is a
+    literal.
+    """
+    if _DYNAMIC_EXPRESSION_PATTERN.match(value):
+        return True
+    if not is_quoted and _ATTRIBUTE_CHAIN_PATTERN.match(value):
+        return True
+    if is_quoted or _is_config_file(file_path):
+        return False
+    return bool(_PLAIN_IDENTIFIER_PATTERN.match(value))
+
+
+# Documentation/example text that is not a credential: Chinese prompt text
+# (e.g. `你的MySQL密码`), asterisk masks (`***`).
+_CJK_OR_MASK = re.compile(r"[\u4e00-\u9fff]|^\"?\*{2,}\"?$")
+
+
+def _is_likely_documentation(value: str) -> bool:
+    """Check if a value is documentation/example text rather than a credential."""
+    return bool(_CJK_OR_MASK.search(value))
+
+
+# Placeholder-shaped values: exact matches plus values starting with a
+# common placeholder prefix (your-xxx, change-me, test-pw, ...).
+_PLACEHOLDER_PREFIX = re.compile(
+    r"^(your|example|sample|change|replace|placeholder|dummy|changeme"
+    r"|foobar|test|demo)([-_ ].*)?$",
+    re.IGNORECASE,
+)
+
+
+def _is_placeholder_like(value: str) -> bool:
+    """Check if a value is a known placeholder (exact or prefix-shaped)."""
+    return _is_placeholder(value) or bool(_PLACEHOLDER_PREFIX.match(value))
 
 
 def _is_likely_non_secret(value: str) -> bool:
@@ -776,8 +834,12 @@ class PasswordAssignmentRule(Rule):
 
     False positive control:
     - Env var references are skipped.
-    - Placeholder values (changeme, foobar, etc.) are downgraded to
-      low severity / low confidence / non-blocking.
+    - Code expressions (function/method calls, subscripts, lambdas, await,
+      attribute chains, plain identifiers) and boolean/null values are
+      skipped — they are resolved at runtime.
+    - Documentation/example text (Chinese prompts, asterisk masks) is skipped.
+    - Placeholder values are downgraded to low/low/non-blocking.
+    - Findings in test files are downgraded to low/low/non-blocking.
 
     NOTE: This is a generic heuristic — non-blocking. Only explicit-format
     tokens (R001-R005) and complete private keys are blocking.
@@ -800,13 +862,35 @@ class PasswordAssignmentRule(Rule):
                 value = assignment.value
                 if not value:
                     continue
+                if value.lower() in ("true", "false", "none", "null"):
+                    # Boolean/null placeholder — not a credential.
+                    continue
+                is_placeholder = _is_placeholder_like(value)
+                if not is_placeholder and _is_dynamic_expression(value, assignment.is_quoted, file_path):
+                    # Code expression — value is resolved at runtime, not a
+                    # hardcoded literal. Placeholders are themselves
+                    # identifier-shaped, so they are kept for downgrade.
+                    continue
+                if _is_likely_documentation(value):
+                    # Documentation/example text — not a credential.
+                    continue
                 if is_env_reference(value, assignment.is_quoted):
                     continue
                 if is_already_masked(value):
                     continue
 
+                # Findings in test files are heuristic matches on test
+                # fixtures (fake passwords) — downgrade to low severity
+                # instead of scoring as high.
+                is_test_file = (
+                    file_path.startswith("tests/")
+                    or "/tests/" in file_path
+                    or file_path.startswith("test/")
+                    or "/test/" in file_path
+                )
+
                 # Determine severity/confidence based on placeholder check
-                if _is_placeholder(value):
+                if is_placeholder or is_test_file:
                     severity = Severity.LOW
                     confidence = Confidence.LOW
                     blocking = False
@@ -866,8 +950,10 @@ class GenericTokenAssignmentRule(Rule):
 
     False positive control:
     - Env var references are skipped.
-    - Code expressions (function/method calls, subscripts, lambdas) and
-      boolean/null values are skipped — they are resolved at runtime.
+    - Code expressions (function/method calls, subscripts, lambdas, await,
+      attribute chains, plain identifiers) and boolean/null values are
+      skipped — they are resolved at runtime.
+    - Documentation/example text (Chinese prompts, asterisk masks) is skipped.
     - Placeholder values are downgraded to low/low/non-blocking.
     - Explicit-format tokens (ghp_, AKIA, AIza) are NOT affected by downgrade
       because they are caught by their specific rules with higher priority.
@@ -913,10 +999,16 @@ class GenericTokenAssignmentRule(Rule):
                     # Boolean/null placeholder (e.g. has_auth_token: true,
                     # api_key = None) — not a credential.
                     continue
-                if _is_dynamic_expression(value):
+                is_placeholder = _is_placeholder_like(value)
+                if not is_placeholder and _is_dynamic_expression(value, assignment.is_quoted, file_path):
                     # Code expression (function/method call, subscript,
-                    # lambda) — value is resolved at runtime, not a
-                    # hardcoded literal.
+                    # lambda, await, attribute chain, identifier) — value is
+                    # resolved at runtime, not a hardcoded literal.
+                    # Placeholders are themselves identifier-shaped, so they
+                    # are kept for downgrade.
+                    continue
+                if _is_likely_documentation(value):
+                    # Documentation/example text — not a credential.
                     continue
                 if is_env_reference(value, assignment.is_quoted):
                     continue
@@ -933,7 +1025,7 @@ class GenericTokenAssignmentRule(Rule):
                     or "/test/" in file_path
                 )
 
-                if _is_placeholder(value) or is_test_file:
+                if is_placeholder or is_test_file:
                     severity = Severity.LOW
                     confidence = Confidence.LOW
                     blocking = False
@@ -1025,7 +1117,7 @@ class ConnectionStringRule(Rule):
                     continue
 
                 # 3. Placeholder / weak passwords: generate low/low/non-blocking
-                if _is_placeholder(password):
+                if _is_placeholder(password) or _is_likely_documentation(password):
                     severity = Severity.LOW
                     confidence = Confidence.LOW
                     blocking = False
