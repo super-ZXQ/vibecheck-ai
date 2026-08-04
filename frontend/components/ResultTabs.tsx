@@ -176,7 +176,12 @@ export function ResultTabs({
           <TabContent
             status={llmAnalysisStatus}
             data={llmAnalysis}
-            renderContent={(data) => <LLMAnalysis result={data} />}
+            renderContent={(data) => (
+              <LLMAnalysis
+                result={data}
+                totalFindings={scanResult?.summary.total_findings}
+              />
+            )}
           />
         )}
       </div>

@@ -38,6 +38,9 @@ export function AssessmentDetails({ assessment }: AssessmentDetailsProps) {
         <div style={{ marginTop: "0.5rem", fontSize: "0.85rem", color: "#64748b" }}>
           策略版本: {assessment.policy_version}
         </div>
+        <div style={{ marginTop: "0.25rem", fontSize: "0.85rem", color: "#64748b" }}>
+          评估范围: {assessment.assessment_scope}
+        </div>
       </div>
 
       {/* --- Blocking reasons --- */}

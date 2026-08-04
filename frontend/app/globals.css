@@ -1115,6 +1115,12 @@ body::before {
   margin-top: 8px;
 }
 
+.score-scope-note {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  margin-top: 4px;
+}
+
 /* --- 12. Tabs（滑动指示条） ------------------------------------------------ */
 
 .tabs {
@@ -1823,6 +1829,15 @@ body::before {
 .llm-stat strong {
   color: var(--text-primary);
   font-variant-numeric: tabular-nums;
+}
+
+.llm-coverage-note {
+  font-size: 0.82rem;
+  color: #854d0e;
+  background: rgba(254, 243, 199, 0.55);
+  border-radius: var(--radius-md);
+  padding: 8px 14px;
+  margin-bottom: 1rem;
 }
 
 .llm-source-badge {

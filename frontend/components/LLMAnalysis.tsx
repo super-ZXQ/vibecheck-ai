@@ -9,6 +9,8 @@ import type { LLMAnalysisItem, LLMAnalysisResult } from "@/lib/types";
 
 interface LLMAnalysisProps {
   result: LLMAnalysisResult;
+  /** Total findings from the scan summary, used to show analysis coverage. */
+  totalFindings?: number;
 }
 
 const SOURCE_LABELS: Record<string, string> = {
@@ -50,12 +52,20 @@ function LLMItemCard({ item }: { item: LLMAnalysisItem }) {
   );
 }
 
-export default function LLMAnalysis({ result }: LLMAnalysisProps) {
+export default function LLMAnalysis({ result, totalFindings }: LLMAnalysisProps) {
+  const coverageNote =
+    totalFindings !== undefined && totalFindings > result.total_analyzed
+      ? `（未覆盖 ${totalFindings - result.total_analyzed} 项：AI 分析仅覆盖扫描发现的高优先级项目）`
+      : null;
+
   return (
     <div>
       <div className="llm-stats">
         <span className="llm-stat">
-          共分析 <strong>{result.total_analyzed}</strong> 项
+          已分析 <strong>{result.total_analyzed}</strong>{" "}
+          {totalFindings !== undefined
+            ? `/ 共 ${totalFindings} 项发现`
+            : "项"}
         </span>
         <span className="llm-stat">
           LLM 分析 <strong>{result.total_llm}</strong> 项
@@ -67,6 +77,9 @@ export default function LLMAnalysis({ result }: LLMAnalysisProps) {
           数据来源：{sourceLabel(result.source)}
         </span>
       </div>
+      {coverageNote && (
+        <div className="llm-coverage-note">{coverageNote}</div>
+      )}
       {result.items.length === 0 ? (
         <div className="empty-state">没有需要 AI 分析的非阻断发现</div>
       ) : (

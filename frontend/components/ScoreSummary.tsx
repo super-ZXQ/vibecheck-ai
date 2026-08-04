@@ -123,6 +123,9 @@ export function ScoreSummary({ taskStatus }: ScoreSummaryProps) {
               {taskStatus.scan_summary.findings_truncated && "（结果已截断）"}
             </div>
           )}
+          <div className="score-meta score-scope-note">
+            评分范围：敏感数据安全维度（非综合上线成熟度评分）
+          </div>
         </div>
       </div>
     </div>
