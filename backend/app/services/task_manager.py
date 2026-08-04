@@ -138,6 +138,8 @@ class TaskRecord:
             "status": self.status,
             "stage": self.stage,
             "progress": self.progress,
+            "owner": self.owner,
+            "repo_name": self.repo_name,
             "error_code": self.error_code,
             "error_message": self.error_message,
         }
@@ -335,7 +337,7 @@ def mark_running(task_id: str, stage: str, progress: int) -> None:
         try:
             _validate_transition(task_id, task.status, STATUS_RUNNING)
         except IllegalStateTransitionError:
-            logger.warning(
+            logger.error(
                 "Rejected illegal transition for task %s: "
                 "%s -> running", task_id, task.status,
             )
@@ -360,7 +362,7 @@ def mark_completed(
         try:
             _validate_transition(task_id, task.status, STATUS_COMPLETED)
         except IllegalStateTransitionError:
-            logger.warning(
+            logger.error(
                 "Rejected illegal transition for task %s: "
                 "%s -> completed", task_id, task.status,
             )
@@ -399,7 +401,7 @@ def mark_failed(task_id: str, error_code: str, error_message: Optional[str] = No
         try:
             _validate_transition(task_id, task.status, STATUS_FAILED)
         except IllegalStateTransitionError:
-            logger.warning(
+            logger.error(
                 "Rejected illegal transition for task %s: "
                 "%s -> failed", task_id, task.status,
             )

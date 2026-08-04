@@ -114,6 +114,8 @@ class TaskStatusResponse(BaseModel):
     status: str
     stage: str
     progress: int
+    owner: str | None = None
+    repo_name: str | None = None
     error_code: str | None = None
     error_message: str | None = None
     report_url: str | None = None

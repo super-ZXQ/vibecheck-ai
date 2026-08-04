@@ -167,8 +167,9 @@ def _map_extraction_error(error: ExtractionError) -> tuple[str, str]:
 def _stat_directory(path: Path) -> ExtractionResult:
     """Compute file count / total size / top-level dir of a staged upload.
 
-    Runs in a worker thread via asyncio.to_thread (walks at most
-    settings.max_file_count files).
+    Walks the full tree (no file cap — the size and count limits are
+    enforced during extraction/staging, before this is called).
+    Runs in a worker thread via asyncio.to_thread.
     """
     count = 0
     total = 0

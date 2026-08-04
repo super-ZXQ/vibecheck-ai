@@ -26,7 +26,7 @@
 | --- | --- |
 | 前端 | Next.js (App Router) + React + TypeScript |
 | 前端测试 | Playwright (e2e) + Node 内置测试运行器 (单元) |
-| 后端 | FastAPI + SQLAlchemy + Pydantic |
+| 后端 | FastAPI + Pydantic（SQLite 直连，无 ORM） |
 | 后端测试 | pytest |
 | 存储 | SQLite |
 | 运行 | Docker Compose（开发 / 生产双模式） |
@@ -190,8 +190,12 @@ vibecheck/
 │   │   │   ├── config.py        # 配置与安全限制
 │   │   │   ├── error_codes.py   # 脱敏错误码与文案
 │   │   │   ├── github.py        # GitHub URL 校验与安全下载
-│   │   │   └── safe_extract.py  # 安全解压（防穿越/拒链接/限大小）
-│   │   ├── models/ services/    # 数据模型与任务流水线
+│   │   │   ├── safe_extract.py  # 安全解压（防穿越/拒链接/限大小）
+│   │   │   ├── zip_extract.py   # 安全 ZIP 解压
+│   │   │   └── security/        # 脱敏（统一赋值解析与掩码）
+│   │   ├── db/                  # SQLite（WAL / busy_timeout）
+│   │   ├── scanner/             # 扫描规则（基础/部署/文档/敏感信息等）
+│   │   ├── services/            # 任务流水线（下载/解压/扫描/评估/修复/LLM）
 │   │   └── ...
 │   ├── tests/                   # pytest 安全与回归测试
 │   └── Dockerfile(.production)

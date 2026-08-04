@@ -67,9 +67,10 @@ export function clearHistory(): void {
 /**
  * Build a HistoryEntry from a completed/failed task status.
  *
- * The status response does not include the original repo URL, so the
- * repo identity is derived from top_level_dir (GitHub tarball layout:
- * "owner-repo-ref"). Falls back gracefully when the layout is unusual.
+ * The status response now includes the authoritative owner/repo_name
+ * from the backend (A-06); repo identity is no longer derived from
+ * top_level_dir. The heuristic split("-") parsing is kept only as a
+ * fallback for legacy entries written before those fields existed.
  */
 export function entryFromTaskStatus(status: {
   task_id: string;
@@ -77,21 +78,32 @@ export function entryFromTaskStatus(status: {
   top_level_dir: string | null;
   security_score: number | null;
   security_verdict: string | null;
+  owner?: string | null;
+  repo_name?: string | null;
 }): HistoryEntry {
   let owner = "";
   let repoName = status.top_level_dir ?? "unknown-repo";
-  if (status.top_level_dir) {
+  let repoUrl = status.top_level_dir ?? "";
+  if (status.owner && status.repo_name) {
+    owner = status.owner;
+    repoName = status.repo_name;
+    if (owner !== "local") {
+      repoUrl = `https://github.com/${owner}/${repoName}`;
+    }
+  } else if (status.top_level_dir) {
+    // Legacy fallback: GitHub tarball layout "owner-repo-ref".
     const parts = status.top_level_dir.split("-");
     if (parts.length >= 3) {
       owner = parts[0];
       repoName = parts.slice(1, -1).join("-");
+      repoUrl = `https://github.com/${owner}/${repoName}`;
+    } else {
+      repoUrl = status.top_level_dir;
     }
   }
   return {
     task_id: status.task_id,
-    repo_url: owner
-      ? `https://github.com/${owner}/${repoName}`
-      : status.top_level_dir ?? "",
+    repo_url: repoUrl,
     owner,
     repo_name: repoName,
     created_at: new Date().toISOString(),

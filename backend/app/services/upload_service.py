@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import logging
 import tarfile
-from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import UploadFile
@@ -63,15 +62,6 @@ class UploadError(Exception):
         self.code = code
 
 
-@dataclass
-class UploadArtifact:
-    """Staged upload content — ready for the scanner."""
-    dest_dir: str
-    file_count: int
-    total_size: int
-    top_level_dir: str | None
-
-
 def upload_source_dir(task_id: str) -> Path:
     """Directory where upload content for a task is staged."""
     return Path(settings.tmp_dir) / f"upload-{task_id}"
@@ -90,7 +80,7 @@ def _map_extraction_error(error: ExtractionError) -> UploadError:
 async def store_archive_upload(
     file: UploadFile,
     dest_root: Path,
-) -> UploadArtifact:
+) -> None:
     """Sniff, size-check and safely extract a single archive upload.
 
     Raises:
@@ -143,9 +133,9 @@ async def store_archive_upload(
     data = bytes(chunks)
     try:
         if sniffed == "zip":
-            result = safe_extract_zip(data, dest_root)
+            safe_extract_zip(data, dest_root)
         else:
-            result = safe_extract(data, dest_root)
+            safe_extract(data, dest_root)
     except tarfile.TarError:
         cleanup_temp_dir(dest_root)
         raise UploadError(INVALID_UPLOAD, "Malformed archive")
@@ -157,18 +147,11 @@ async def store_archive_upload(
         cleanup_temp_dir(dest_root)
         raise UploadError(UNSAFE_ARCHIVE, "Upload could not be processed")
 
-    return UploadArtifact(
-        dest_dir=str(dest_root),
-        file_count=result.file_count,
-        total_size=result.total_size,
-        top_level_dir=result.top_level_dir,
-    )
-
 
 async def store_folder_upload(
     files: list[UploadFile],
     dest_root: Path,
-) -> UploadArtifact:
+) -> None:
     """Rebuild a folder tree from relative-path multipart files.
 
     Every file is validated (path traversal, null bytes, backslashes,
@@ -240,10 +223,3 @@ async def store_folder_upload(
                 f"Total upload size exceeds limit: {total_size} bytes "
                 f"(limit: {settings.max_extracted_total_size} bytes)",
             )
-
-    return UploadArtifact(
-        dest_dir=str(dest_root),
-        file_count=file_count,
-        total_size=total_size,
-        top_level_dir=None,
-    )

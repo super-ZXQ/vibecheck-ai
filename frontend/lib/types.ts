@@ -53,6 +53,8 @@ export interface TaskStatusResponse {
   status: string; // "pending" | "running" | "completed" | "failed"
   stage: string; // "queued" | "downloading" | "extracting" | "scanning" | "assessing" | "repairing" | "finished"
   progress: number;
+  owner: string | null;
+  repo_name: string | null;
   error_code: string | null;
   error_message: string | null;
   report_url: string | null;
