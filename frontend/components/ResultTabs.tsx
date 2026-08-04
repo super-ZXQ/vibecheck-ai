@@ -1,5 +1,6 @@
 /**
- * ResultTabs — tab navigation for scan results, assessment, and repair plan.
+ * ResultTabs — tab navigation for scan results, assessment, repair plan,
+ * and LLM analysis.
  *
  * Each tab independently tracks its status:
  * - available → show content component
@@ -15,6 +16,7 @@ import { useState } from "react";
 
 import { AssessmentDetails } from "@/components/AssessmentDetails";
 import LLMAnalysis from "@/components/LLMAnalysis";
+import { RepairPlan as RepairPlanView } from "@/components/RepairPlan";
 import { ScanResults } from "@/components/ScanResults";
 import type {
   AssessmentResult,
@@ -35,7 +37,7 @@ interface ResultTabsProps {
   repairPlanStatus: ResultTabStatus;
   llmAnalysis: LLMAnalysisResult | null;
   llmAnalysisStatus: ResultTabStatus;
-  /** Optional render override for the repair plan tab (added in Phase 5). */
+  /** Optional render override for the repair plan tab. */
   renderRepairPlan?: (plan: RepairPlan) => React.ReactNode;
 }
 
@@ -164,10 +166,8 @@ export function ResultTabs({
           <TabContent
             status={repairPlanStatus}
             data={repairPlan}
-            renderContent={
-              renderRepairPlan
-                ? (data) => renderRepairPlan(data)
-                : (data) => <RepairPlanPlaceholder plan={data} />
+            renderContent={(data) =>
+              renderRepairPlan ? renderRepairPlan(data) : <RepairPlanView plan={data} />
             }
           />
         )}
@@ -235,25 +235,4 @@ function TabContent<T>({ status, data, renderContent }: TabContentProps<T>) {
   }
 
   return <>{renderContent(data)}</>;
-}
-
-// ---------------------------------------------------------------------------
-// Repair plan placeholder (replaced by RepairPlan component in Phase 5)
-// ---------------------------------------------------------------------------
-
-function RepairPlanPlaceholder({ plan }: { plan: RepairPlan }) {
-  return (
-    <div className="card">
-      <p style={{ fontWeight: 600, marginBottom: "0.5rem" }}>
-        修复计划已加载
-      </p>
-      <p style={{ fontSize: "0.85rem", color: "#64748b" }}>
-        计划状态: {plan.plan_status === "complete" ? "完整" : "部分"}
-      </p>
-      <p style={{ fontSize: "0.85rem", color: "#64748b" }}>
-        修复组数量: {plan.summary.total_repair_groups}
-        （阻断: {plan.summary.blocking_repair_groups}）
-      </p>
-    </div>
-  );
 }
