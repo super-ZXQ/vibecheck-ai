@@ -92,70 +92,78 @@ export function AssessmentDetails({ assessment }: AssessmentDetailsProps) {
         </div>
       )}
 
-      {/* --- Score breakdown --- */}
+      {/* --- Score breakdown (collapsible) --- */}
       {assessment.score_breakdown.length > 0 && (
-        <div style={{ marginTop: "1rem" }}>
-          <h3 style={{ fontSize: "1.1rem", marginBottom: "0.75rem" }}>
+        <details className="collapsible-details">
+          <summary>
+            <span className="chevron" aria-hidden="true">▶</span>
             评分明细
-          </h3>
-          <table className="findings-table">
-            <thead>
-              <tr>
-                <th>规则</th>
-                <th>严重程度</th>
-                <th>发现数</th>
-                <th>扣分</th>
-                <th>最大扣分</th>
-              </tr>
-            </thead>
-            <tbody>
-              {assessment.score_breakdown.map((e, i) => (
-                <tr key={i}>
-                  <td>{e.rule_name}</td>
-                  <td>
-                    <span
-                      className={`severity-badge ${
-                        SEVERITY_CLASSES[e.severity] ?? "severity-info"
-                      }`}
-                    >
-                      {SEVERITY_LABELS[e.severity] ?? e.severity}
-                    </span>
-                  </td>
-                  <td>{e.finding_count}</td>
-                  <td>{e.deduction}</td>
-                  <td>{e.max_deduction}</td>
+            <span className="filter-count">（{assessment.score_breakdown.length} 项）</span>
+          </summary>
+          <div className="details-body">
+            <table className="findings-table">
+              <thead>
+                <tr>
+                  <th>规则</th>
+                  <th>严重程度</th>
+                  <th>发现数</th>
+                  <th>扣分</th>
+                  <th>最大扣分</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+              </thead>
+              <tbody>
+                {assessment.score_breakdown.map((e, i) => (
+                  <tr key={i}>
+                    <td>{e.rule_name}</td>
+                    <td>
+                      <span
+                        className={`severity-badge ${
+                          SEVERITY_CLASSES[e.severity] ?? "severity-info"
+                        }`}
+                      >
+                        {SEVERITY_LABELS[e.severity] ?? e.severity}
+                      </span>
+                    </td>
+                    <td>{e.finding_count}</td>
+                    <td>{e.deduction}</td>
+                    <td>{e.max_deduction}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </details>
       )}
 
-      {/* --- Score caps --- */}
+      {/* --- Score caps (collapsible) --- */}
       {assessment.score_caps.length > 0 && (
-        <div style={{ marginTop: "1rem" }}>
-          <h3 style={{ fontSize: "1.1rem", marginBottom: "0.75rem" }}>
+        <details className="collapsible-details">
+          <summary>
+            <span className="chevron" aria-hidden="true">▶</span>
             评分上限
-          </h3>
-          <table className="findings-table">
-            <thead>
-              <tr>
-                <th>原因代码</th>
-                <th>上限值</th>
-                <th>说明</th>
-              </tr>
-            </thead>
-            <tbody>
-              {assessment.score_caps.map((c, i) => (
-                <tr key={i}>
-                  <td><code>{c.reason_code}</code></td>
-                  <td>{c.cap_value}</td>
-                  <td>{c.description}</td>
+            <span className="filter-count">（{assessment.score_caps.length} 项）</span>
+          </summary>
+          <div className="details-body">
+            <table className="findings-table">
+              <thead>
+                <tr>
+                  <th>原因代码</th>
+                  <th>上限值</th>
+                  <th>说明</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+              </thead>
+              <tbody>
+                {assessment.score_caps.map((c, i) => (
+                  <tr key={i}>
+                    <td><code>{c.reason_code}</code></td>
+                    <td>{c.cap_value}</td>
+                    <td>{c.description}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </details>
       )}
 
       {/* --- Coverage --- */}

@@ -68,6 +68,8 @@ export function ScanResults({ scanResult }: ScanResultsProps) {
   const [pageSize, setPageSize] = useState<number>(25);
   const [currentPage, setCurrentPage] = useState<number>(0);
   const [filter, setFilter] = useState<FindingFilter>("all");
+  const [severityFilter, setSeverityFilter] = useState<string>("all");
+  const [searchQuery, setSearchQuery] = useState<string>("");
   const [expandedFinding, setExpandedFinding] = useState<string | null>(null);
 
   const findings = scanResult.findings;
@@ -82,19 +84,48 @@ export function ScanResults({ scanResult }: ScanResultsProps) {
     ?? findings.filter((finding) => findingDimension(finding.dimension) === BASIC_SECURITY_DIMENSION).length;
   const documentationCount = counts?.documentation_consistency
     ?? findings.filter((finding) => findingDimension(finding.dimension) === DOCUMENTATION_DIMENSION).length;
-  const filteredFindings = filter === "all"
-    ? findings
-    : findings.filter((finding) => findingDimension(finding.dimension) === filter);
+
+  const query = searchQuery.trim().toLowerCase();
+  const filteredFindings = findings.filter((finding) => {
+    if (filter !== "all" && findingDimension(finding.dimension) !== filter) {
+      return false;
+    }
+    if (severityFilter !== "all" && finding.severity !== severityFilter) {
+      return false;
+    }
+    if (
+      query !== "" &&
+      !finding.file_path.toLowerCase().includes(query) &&
+      !finding.rule_name.toLowerCase().includes(query)
+    ) {
+      return false;
+    }
+    return true;
+  });
   const totalPages = Math.max(1, Math.ceil(filteredFindings.length / pageSize));
   const safePage = Math.min(currentPage, totalPages - 1);
   const startIndex = safePage * pageSize;
   const endIndex = Math.min(startIndex + pageSize, filteredFindings.length);
   const pageFindings = filteredFindings.slice(startIndex, endIndex);
 
-  const selectFilter = (nextFilter: FindingFilter) => {
-    setFilter(nextFilter);
+  const resetView = () => {
     setCurrentPage(0);
     setExpandedFinding(null);
+  };
+
+  const selectFilter = (nextFilter: FindingFilter) => {
+    setFilter(nextFilter);
+    resetView();
+  };
+
+  const selectSeverity = (nextSeverity: string) => {
+    setSeverityFilter(nextSeverity);
+    resetView();
+  };
+
+  const updateSearch = (nextQuery: string) => {
+    setSearchQuery(nextQuery);
+    resetView();
   };
 
   return (
@@ -151,9 +182,40 @@ export function ScanResults({ scanResult }: ScanResultsProps) {
         ))}
       </div>
 
+      <div className="filter-bar">
+        <select
+          className="filter-select"
+          value={severityFilter}
+          onChange={(e) => selectSeverity(e.target.value)}
+          aria-label="按严重级别筛选"
+        >
+          <option value="all">全部级别</option>
+          <option value="critical">严重</option>
+          <option value="high">高</option>
+          <option value="medium">中</option>
+          <option value="low">低</option>
+          <option value="info">信息</option>
+        </select>
+        <input
+          type="search"
+          className="filter-search"
+          placeholder="按文件路径或规则名搜索..."
+          value={searchQuery}
+          onChange={(e) => updateSearch(e.target.value)}
+          aria-label="搜索发现"
+        />
+        {(severityFilter !== "all" || query !== "") && (
+          <span className="filter-count">
+            匹配 {filteredFindings.length} / {findings.length} 条
+          </span>
+        )}
+      </div>
+
       {filteredFindings.length === 0 ? (
         <div className="empty-state">
-          {findings.length === 0 ? "未发现扫描问题。" : "当前维度没有发现问题。"}
+          {findings.length === 0
+            ? "未发现扫描问题。"
+            : "当前维度没有发现问题。"}
         </div>
       ) : (
         <>

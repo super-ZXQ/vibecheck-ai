@@ -95,21 +95,29 @@ export function RepairPlan({ plan }: RepairPlanProps) {
               key={group.group_id || i}
               className={`repair-group ${group.blocking ? "repair-group-blocking" : ""}`}
             >
-              <div className="repair-group-title">
-                {group.blocking && (
-                  <span className="severity-badge severity-critical" style={{ marginRight: "8px" }}>
-                    阻断
+              <div className="repair-group-header">
+                <div className="repair-group-title">
+                  {group.blocking && (
+                    <span className="severity-badge severity-critical" style={{ marginRight: "8px" }}>
+                      阻断
+                    </span>
+                  )}
+                  <span
+                    className={`severity-badge ${
+                      SEVERITY_CLASSES[group.highest_severity] ?? "severity-info"
+                    }`}
+                    style={{ marginRight: "8px" }}
+                  >
+                    {SEVERITY_LABELS[group.highest_severity] ?? group.highest_severity}
                   </span>
+                  {group.title}
+                </div>
+                {group.steps.length > 0 && (
+                  <CopyButton
+                    text={group.steps.map((s, si) => `${si + 1}. ${s}`).join("\n")}
+                    label="复制步骤"
+                  />
                 )}
-                <span
-                  className={`severity-badge ${
-                    SEVERITY_CLASSES[group.highest_severity] ?? "severity-info"
-                  }`}
-                  style={{ marginRight: "8px" }}
-                >
-                  {SEVERITY_LABELS[group.highest_severity] ?? group.highest_severity}
-                </span>
-                {group.title}
               </div>
 
               <div className="repair-group-description">
@@ -205,6 +213,32 @@ export function RepairPlan({ plan }: RepairPlanProps) {
 }
 
 // ---------------------------------------------------------------------------
+// Copy button — copies text, shows "已复制" for 2 seconds
+// ---------------------------------------------------------------------------
+
+function CopyButton({ text, label }: { text: string; label: string }) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+    } catch {
+      setCopied(false);
+    }
+    setTimeout(() => {
+      setCopied(false);
+    }, 2000);
+  };
+
+  return (
+    <button type="button" className="btn btn-secondary btn-sm" onClick={handleCopy}>
+      {copied ? "已复制" : label}
+    </button>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Agent prompt section with copy button
 // ---------------------------------------------------------------------------
 
@@ -232,15 +266,13 @@ function AgentPromptSection({ prompt }: { prompt: string }) {
       </h3>
       <div className="agent-prompt-container">
         <div style={{ marginBottom: "0.5rem" }}>
-          <button
-            className="btn btn-secondary"
-            style={{ padding: "6px 16px", fontSize: "0.85rem" }}
-            onClick={handleCopy}
-          >
-            复制指令
+          <button className="btn btn-secondary btn-sm" onClick={handleCopy}>
+            {copyState === "success" ? "已复制" : "复制指令"}
           </button>
           {copyState === "success" && (
-            <span className="copy-feedback copy-success">已复制到剪贴板</span>
+            <span className="copy-feedback copy-success">
+              已复制到剪贴板
+            </span>
           )}
           {copyState === "error" && (
             <span className="copy-feedback copy-error">
