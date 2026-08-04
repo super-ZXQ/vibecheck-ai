@@ -228,6 +228,28 @@ class TestIsEnvReference:
         """os.getenv("NAME") is recognized as env reference."""
         assert is_env_reference('os.getenv("DB_PASSWORD")') is True
 
+    def test_os_environ_get_is_env_ref(self):
+        """os.environ.get("NAME") is recognized as env reference."""
+        assert is_env_reference('os.environ.get("DB_PASSWORD")') is True
+
+    def test_os_environ_get_default_is_env_ref(self):
+        """os.environ.get("NAME", default) is recognized as env reference."""
+        assert is_env_reference('os.environ.get("DB_PASSWORD", "")') is True
+        assert is_env_reference('os.environ.get("DB_PASSWORD", None)') is True
+        assert is_env_reference("os.environ.get('DB_PASSWORD', 'x')") is True
+
+    def test_os_getenv_default_is_env_ref(self):
+        """os.getenv("NAME", default) is recognized as env reference."""
+        assert is_env_reference('os.getenv("DB_PASSWORD", "fallback")') is True
+
+    def test_getenv_bare_is_env_ref(self):
+        """getenv("NAME") is recognized as env reference."""
+        assert is_env_reference('getenv("DB_PASSWORD")') is True
+
+    def test_env_ref_with_expr_default_NOT_env_ref(self):
+        """Expression default (os.environ.get("K", os.getenv("X"))) is NOT matched."""
+        assert is_env_reference('os.environ.get("DB_PASSWORD", os.getenv("X"))') is False
+
     def test_dollar_lowercase_NOT_env_ref(self):
         """'$uperSecret123' is NOT an env reference (lowercase after $)."""
         assert is_env_reference("$uperSecret123") is False
@@ -488,12 +510,32 @@ class TestCompoundKeyClassification:
     def test_token_size_not_classified(self):
         assert classify_key("token_size") is None
 
+    # --- Display/boolean fields are not credentials ---
+    def test_api_key_masked_not_classified(self):
+        assert classify_key("api_key_masked") is None
+
+    def test_auth_token_masked_not_classified(self):
+        assert classify_key("auth_token_masked") is None
+
+    def test_has_auth_token_not_classified(self):
+        assert classify_key("has_auth_token") is None
+
+    def test_token_enabled_not_classified(self):
+        assert classify_key("token_enabled") is None
+
+    def test_secret_flag_not_classified(self):
+        assert classify_key("secret_flag") is None
+
     # --- AUTH/ACCESS token variants still classify as secrets ---
     def test_auth_token_still_classified(self):
         assert classify_key("auth_token") == CATEGORY_SECRET
 
     def test_anthropic_auth_token_still_classified(self):
         assert classify_key("ANTHROPIC_AUTH_TOKEN") == CATEGORY_SECRET
+
+    def test_my_api_key_backup_still_classified(self):
+        """BACKUP is not a noise segment — real credential backups still match."""
+        assert classify_key("MY_API_KEY_BACKUP") == CATEGORY_SECRET
 
 
 # ============================================================================

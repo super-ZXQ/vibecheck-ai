@@ -893,12 +893,25 @@ class GenericTokenAssignmentRule(Rule):
                 value = assignment.value
                 if not value:
                     continue
+                if value.lower() in ("true", "false"):
+                    # Boolean flag (e.g. has_auth_token: true) — not a credential.
+                    continue
                 if is_env_reference(value, assignment.is_quoted):
                     continue
                 if is_already_masked(value):
                     continue
 
-                if _is_placeholder(value):
+                # Findings in test files are heuristic matches on test
+                # fixtures (fake keys/tokens) — downgrade to low severity
+                # instead of scoring as high.
+                is_test_file = (
+                    file_path.startswith("tests/")
+                    or "/tests/" in file_path
+                    or file_path.startswith("test/")
+                    or "/test/" in file_path
+                )
+
+                if _is_placeholder(value) or is_test_file:
                     severity = Severity.LOW
                     confidence = Confidence.LOW
                     blocking = False

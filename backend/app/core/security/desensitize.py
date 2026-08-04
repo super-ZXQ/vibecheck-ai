@@ -202,6 +202,8 @@ def is_already_masked(value: str) -> bool:
 # Only these EXACT patterns are recognized as env references.
 # $VAR requires uppercase (standard env var convention) so that values like
 # "$uperSecret123" (lowercase u) are NOT treated as env references.
+# The optional default-value clause only allows a simple literal or empty
+# string, never arbitrary expressions.
 _ENV_REF_PATTERNS: tuple[re.Pattern, ...] = (
     # $VAR (uppercase env var name)
     re.compile(r"^\$[A-Z_][A-Z0-9_]*$"),
@@ -215,8 +217,22 @@ _ENV_REF_PATTERNS: tuple[re.Pattern, ...] = (
     re.compile(r"""^process\.env\["[A-Za-z_][A-Za-z0-9_]*"\]$"""),
     # os.environ["NAME"]
     re.compile(r"""^os\.environ\["[A-Za-z_][A-Za-z0-9_]*"\]$"""),
+    # os.environ.get("NAME")
+    re.compile(r"""^os\.environ\.get\(["'][A-Za-z_][A-Za-z0-9_]*["']\)$"""),
+    # os.environ.get("NAME", default)
+    re.compile(
+        r"""^os\.environ\.get\(["'][A-Za-z_][A-Za-z0-9_]*["']"""
+        r""",\s*["']?[A-Za-z0-9_\-.]*["']?\)$"""
+    ),
     # os.getenv("NAME")
-    re.compile(r"""^os\.getenv\("[A-Za-z_][A-Za-z0-9_]*"\)$"""),
+    re.compile(r"""^os\.getenv\(["'][A-Za-z_][A-Za-z0-9_]*["']\)$"""),
+    # os.getenv("NAME", default)
+    re.compile(
+        r"""^os\.getenv\(["'][A-Za-z_][A-Za-z0-9_]*["']"""
+        r""",\s*["']?[A-Za-z0-9_\-.]*["']?\)$"""
+    ),
+    # getenv("NAME")
+    re.compile(r"""^getenv\(["'][A-Za-z_][A-Za-z0-9_]*["']\)$"""),
 )
 
 
@@ -372,14 +388,20 @@ _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*")
 _PASSWORD_KEYWORDS: frozenset[str] = frozenset({"PASSWORD", "PASSWD", "PWD"})
 _SECRET_KEYWORDS: frozenset[str] = frozenset({"SECRET", "TOKEN", "APIKEY"})
 
-# When TOKEN appears alongside any of these segments in the SAME key,
-# the key is a configuration/limit identifier, NOT a credential.
-# Examples: token_limit, max_tokens, FACT_TOKEN_PATTERNS, token_count.
-# A bare `token` (no other segments) or AUTH_TOKEN / GITHUB_TOKEN still
-# classify as secrets — those go through the pair/single logic below.
-_TOKEN_NOISE_SEGMENTS: frozenset[str] = frozenset({
+# When a secret keyword (SECRET/TOKEN/APIKEY or the API+KEY pair) appears
+# alongside any of these segments in the SAME key, the key is a
+# configuration identifier or display field, NOT a credential.
+# Examples:
+#   token_limit, max_tokens, FACT_TOKEN_PATTERNS, token_count  (config)
+#   api_key_masked, auth_token_masked                          (display field)
+#   has_auth_token, token_enabled, secret_flag                 (boolean flag)
+# A bare `token`, AUTH_TOKEN, GITHUB_TOKEN, API_KEY, OPENAI_API_KEY
+# still classify as secrets — no noise segment present.
+_SECRET_NOISE_SEGMENTS: frozenset[str] = frozenset({
     "LIMIT", "PATTERNS", "MAX", "MIN", "COUNT", "SIZE",
     "LENGTH", "DEFAULT", "VALUE", "MODEL", "SCHEMA",
+    "MASKED", "HAS", "FLAG", "ENABLED", "PRESENT", "DISPLAY",
+    "NAME", "TYPE",
 })
 
 # Consecutive-pair keywords for the secret category.
@@ -462,7 +484,9 @@ def classify_key(key: str) -> str | None:
     Does NOT match (returns None):
         SECRETARY_EMAIL, TOKENIZER_MODEL, PASSWORDLESS_MODE,
         API_KEYBOARD_LAYOUT, ACCESS_TOKENIZER,
-        TOKEN_LIMIT, MAX_TOKENS, FACT_TOKEN_PATTERNS, TOKEN_COUNT
+        TOKEN_LIMIT, MAX_TOKENS, FACT_TOKEN_PATTERNS, TOKEN_COUNT,
+        API_KEY_MASKED, AUTH_TOKEN_MASKED, HAS_AUTH_TOKEN,
+        TOKEN_ENABLED, SECRET_FLAG
 
     Does NOT produce CATEGORY_AWS_SECRET (but may produce CATEGORY_SECRET):
         AWS_CLIENT_SECRET, MY_SECRET_ACCESS_KEY_BACKUP,
@@ -484,16 +508,15 @@ def classify_key(key: str) -> str | None:
         return CATEGORY_PASSWORD
 
     # Secret / token (single segment)
-    # A TOKEN alongside a noise segment (LIMIT/MAX/PATTERNS/...) is a
-    # configuration identifier, not a credential — skip it. A bare TOKEN
-    # or AUTH_TOKEN etc. still matches.
+    # A secret keyword alongside a noise segment (LIMIT/MASKED/HAS/...)
+    # is a configuration identifier or display field, not a credential.
+    # A bare TOKEN or AUTH_TOKEN etc. still matches.
     for s in segments:
         if s not in _SECRET_KEYWORDS:
             continue
         if (
-            s == "TOKEN"
-            and len(segments) > 1
-            and _TOKEN_NOISE_SEGMENTS.intersection(segments)
+            len(segments) > 1
+            and _SECRET_NOISE_SEGMENTS.intersection(segments)
         ):
             continue
         return CATEGORY_SECRET
@@ -501,6 +524,11 @@ def classify_key(key: str) -> str | None:
     # Secret / token (consecutive pair)
     for i in range(len(segments) - 1):
         if (segments[i], segments[i + 1]) in _SECRET_PAIR_KEYWORDS:
+            if (
+                len(segments) > 2
+                and _SECRET_NOISE_SEGMENTS.intersection(segments)
+            ):
+                continue
             return CATEGORY_SECRET
 
     return None

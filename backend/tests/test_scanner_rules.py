@@ -312,6 +312,55 @@ class TestGenericTokenAssignmentRule:
         assert f.is_blocking is False
         assert "my_api_secret_value" not in f.snippet_masked
 
+    def test_env_reference_assignment_skipped(self):
+        """os.environ.get("NAME") or fallback is NOT a hardcoded secret."""
+        rule = GenericTokenAssignmentRule()
+        lines = ['api_key = os.environ.get("ANTHROPIC_API_KEY") or ai_cfg.get("api_key")']
+        findings = rule.scan_content("src/app/credentials.py", lines)
+        assert len(findings) == 0
+
+    def test_env_reference_with_default_skipped(self):
+        """os.getenv("NAME","") without inner whitespace is NOT a hardcoded secret."""
+        rule = GenericTokenAssignmentRule()
+        lines = ['auth_token = os.getenv("AUTH_TOKEN","")']
+        findings = rule.scan_content("src/app/credentials.py", lines)
+        assert len(findings) == 0
+
+    def test_boolean_value_skipped(self):
+        """Boolean flag assignment is NOT a credential."""
+        rule = GenericTokenAssignmentRule()
+        lines = ['"has_auth_token": true']
+        findings = rule.scan_content("config.json", lines)
+        assert len(findings) == 0
+
+    def test_quoted_empty_string_skipped(self):
+        """Empty-string default is NOT a credential."""
+        rule = GenericTokenAssignmentRule()
+        lines = ['api_key = "" or ai_cfg.get("api_key")']
+        findings = rule.scan_content("config.py", lines)
+        assert len(findings) == 0
+
+    def test_test_file_downgraded_to_low(self):
+        """Findings in test files are downgraded to low severity/confidence."""
+        rule = GenericTokenAssignmentRule()
+        lines = ['"ANTHROPIC_API_KEY": "sk-ant-test-1234"']
+        findings = rule.scan_content("tests/test_ai_credentials.py", lines)
+        assert len(findings) == 1
+        f = findings[0]
+        assert f.severity == Severity.LOW
+        assert f.confidence == Confidence.LOW
+        assert f.is_blocking is False
+
+    def test_production_file_stays_high(self):
+        """Findings outside test paths keep high severity/medium confidence."""
+        rule = GenericTokenAssignmentRule()
+        lines = ['"ANTHROPIC_API_KEY": "sk-ant-test-1234"']
+        findings = rule.scan_content("src/app/credentials.py", lines)
+        assert len(findings) == 1
+        f = findings[0]
+        assert f.severity == Severity.HIGH
+        assert f.confidence == Confidence.MEDIUM
+
 
 # ============================================================================
 # --- Connection string (1 test) ---
