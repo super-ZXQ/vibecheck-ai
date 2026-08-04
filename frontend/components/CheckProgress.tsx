@@ -1,11 +1,15 @@
 /**
  * CheckProgress — displays task progress during polling.
  *
- * Shows the current stage, a progress bar, and file/size info when available.
+ * Shows a step indicator (download → extract → scan → assess → repair →
+ * analyze), a gradient progress bar, and file/size info when available.
  * All data comes from the backend TaskStatusResponse which is already
  * desensitized.
  */
 
+"use client";
+
+import { useCountUp } from "@/hooks/use-count-up";
 import type { TaskStatusResponse } from "@/lib/types";
 
 interface CheckProgressProps {
@@ -23,16 +27,53 @@ const STAGE_LABELS: Record<string, string> = {
   finished: "完成",
 };
 
+// Ordered pipeline steps shown in the step indicator.
+const PIPELINE_STEPS: { key: string; label: string }[] = [
+  { key: "downloading", label: "下载" },
+  { key: "extracting", label: "解压" },
+  { key: "scanning", label: "扫描" },
+  { key: "assessing", label: "评估" },
+  { key: "repairing", label: "修复" },
+  { key: "finished", label: "分析" },
+];
+
+function stageIndex(stage: string): number {
+  if (stage === "queued") return 0;
+  const idx = PIPELINE_STEPS.findIndex((s) => s.key === stage);
+  return idx === -1 ? 0 : idx;
+}
+
 export function CheckProgress({ taskStatus }: CheckProgressProps) {
   const stageLabel = STAGE_LABELS[taskStatus.stage] ?? taskStatus.stage;
   const progress = Math.max(0, Math.min(100, taskStatus.progress));
+  const currentIdx = stageIndex(taskStatus.stage);
+  const displayProgress = useCountUp(progress);
 
   return (
     <div className="card">
+      <ol className="steps">
+        {PIPELINE_STEPS.map((step, idx) => {
+          const stateClass =
+            idx < currentIdx || taskStatus.stage === "finished"
+              ? "step-done"
+              : idx === currentIdx
+                ? "step-current"
+                : "";
+          return (
+            <li key={step.key} className={`step ${stateClass}`}>
+              <span className="step-icon">
+                {idx < currentIdx || taskStatus.stage === "finished"
+                  ? "✓"
+                  : idx + 1}
+              </span>
+              <span className="step-label">{step.label}</span>
+            </li>
+          );
+        })}
+      </ol>
+
       <div className="stage-label">当前阶段</div>
-      <div style={{ fontSize: "1.1rem", fontWeight: 600, marginBottom: "0.5rem" }}>
-        {stageLabel}
-      </div>
+      <div className="progress-stage-name">{stageLabel}</div>
 
       <div className="progress-bar-container">
         <div
@@ -41,18 +82,14 @@ export function CheckProgress({ taskStatus }: CheckProgressProps) {
         />
       </div>
 
-      <div style={{ fontSize: "0.85rem", color: "#64748b" }}>
-        {progress}%
-      </div>
+      <div className="progress-meta">{displayProgress}%</div>
 
       {taskStatus.file_count !== null && (
-        <div style={{ fontSize: "0.85rem", color: "#64748b", marginTop: "0.5rem" }}>
-          文件数量: {taskStatus.file_count}
-        </div>
+        <div className="progress-meta">文件数量: {taskStatus.file_count}</div>
       )}
 
       {taskStatus.total_size !== null && (
-        <div style={{ fontSize: "0.85rem", color: "#64748b" }}>
+        <div className="progress-meta">
           总大小: {formatSize(taskStatus.total_size)}
         </div>
       )}
