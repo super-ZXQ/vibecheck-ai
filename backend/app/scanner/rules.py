@@ -94,10 +94,13 @@ _DYNAMIC_EXPRESSION_PATTERN = re.compile(
 )
 # Attribute chains (a.b.c) are only code references when unquoted — a
 # quoted chain-shaped string (e.g. ``"os.supersecret"``) is a literal.
-_ATTRIBUTE_CHAIN_PATTERN = re.compile(r"^[A-Za-z_][\w]*(\.[A-Za-z_][\w]*)+$")
-# Plain identifiers (optionally with trailing comma/close paren) — variable
+# Trailing separators (`,;)]`) belong to surrounding syntax, not the value.
+_ATTRIBUTE_CHAIN_PATTERN = re.compile(
+    r"^[A-Za-z_][\w]*(\.[A-Za-z_][\w]*)+[,;)]?$"
+)
+# Plain identifiers (optionally with trailing separator) — variable
 # references in code, but bare values in config files may be real secrets.
-_PLAIN_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*[,)]?$")
+_PLAIN_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*[,;)]?$")
 
 _CONFIG_FILE_SUFFIXES = (
     ".env", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
@@ -150,10 +153,21 @@ _PLACEHOLDER_PREFIX = re.compile(
     re.IGNORECASE,
 )
 
+# Boolean/null values (optionally with trailing separators like `null;`).
+_NULLISH_VALUES = ("true", "false", "none", "null")
+
+
+def _is_nullish(value: str) -> bool:
+    """Check if a value is a boolean/null placeholder (e.g. ``null;``)."""
+    return value.rstrip(",;)]").lower() in _NULLISH_VALUES
+
 
 def _is_placeholder_like(value: str) -> bool:
-    """Check if a value is a known placeholder (exact or prefix-shaped)."""
-    return _is_placeholder(value) or bool(_PLACEHOLDER_PREFIX.match(value))
+    """Check if a value is a known placeholder (exact or prefix-shaped) or a
+    truncated example value (``eyJ0eXAi...``)."""
+    return (_is_placeholder(value)
+            or bool(_PLACEHOLDER_PREFIX.match(value))
+            or value.rstrip().endswith(("...", "…")))
 
 
 def _is_likely_non_secret(value: str) -> bool:
@@ -862,7 +876,7 @@ class PasswordAssignmentRule(Rule):
                 value = assignment.value
                 if not value:
                     continue
-                if value.lower() in ("true", "false", "none", "null"):
+                if _is_nullish(value):
                     # Boolean/null placeholder — not a credential.
                     continue
                 is_placeholder = _is_placeholder_like(value)
@@ -995,7 +1009,7 @@ class GenericTokenAssignmentRule(Rule):
                 value = assignment.value
                 if not value:
                     continue
-                if value.lower() in ("true", "false", "none", "null"):
+                if _is_nullish(value):
                     # Boolean/null placeholder (e.g. has_auth_token: true,
                     # api_key = None) — not a credential.
                     continue
