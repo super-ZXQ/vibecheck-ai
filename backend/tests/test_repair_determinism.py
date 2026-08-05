@@ -190,7 +190,6 @@ class TestRepairDeterminism:
         # Serialize and reparse with different key orders
         json_str = json.dumps(finding, sort_keys=True)
         finding_a = json.loads(json_str)
-        finding_b = json.loads(json_str)
         # Manually construct a version with different key order
         finding_c = {k: finding[k] for k in reversed(list(finding.keys()))}
         plan_a = _generate("task-1", [finding_a])

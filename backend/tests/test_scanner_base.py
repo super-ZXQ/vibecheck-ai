@@ -12,8 +12,6 @@ from app.scanner.base import (
     Confidence,
     Finding,
     FindingType,
-    Rule,
-    ScanNotice,
     ScanResult,
     Severity,
 )

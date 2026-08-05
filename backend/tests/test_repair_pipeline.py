@@ -16,16 +16,13 @@
 """
 
 import asyncio
-import json
 import uuid
-from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.db import database
-from app.db.database import _get_connection, now_iso
 from app.services import background_runner, task_manager
 from app.services.repair_service import (
     generate_and_save_repair_plan,

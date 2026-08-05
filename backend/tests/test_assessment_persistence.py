@@ -31,15 +31,12 @@ from app.services.assessment_service import (
     get_assessment_score_verdict,
     get_scan_result_with_timestamp,
     run_assessment,
-    serialize_assessment_result,
     AssessmentInternalError,
-    AssessmentPersistError,
     AssessmentResultTooLargeError,
 )
-from app.services.scan_result_service import save_scan_result, serialize_scan_result
+from app.services.scan_result_service import save_scan_result
 from app.scanner.base import (
     Finding, ScanResult, Severity, Confidence, FindingType,
-    ScanNotice, SkippedFile, ScanError,
 )
 from tests.conftest import (
     SYNTHETIC_GITHUB_TOKEN,

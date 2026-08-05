@@ -50,12 +50,7 @@ import pytest
 
 from app.services.assessment_service import assess_scan_result
 from app.services.assessment_policy import (
-    BASE_SCORE,
-    BLOCKING_CONFIDENCE_OVERRIDE,
-    CONFIDENCE_PERCENT,
     MIN_SCORE,
-    RULE_CAP_BY_SEVERITY,
-    SEVERITY_BASE_POINTS,
     compute_single_deduction,
     get_repeat_percent,
 )

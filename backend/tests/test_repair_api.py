@@ -19,10 +19,8 @@
 16. 安全空修复计划的结构验证（所有字段匹配预期值）
 """
 
-import asyncio
 import json
 import uuid
-from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -35,8 +33,7 @@ from app.services.repair_policy import (
     ACTION_REVOKE_OR_ROTATE_SECRET,
 )
 from app.services.repair_service import (
-    save_repair_result, get_repair_result, serialize_repair_plan,
-    RepairPlanInternalError,
+    serialize_repair_plan,
 )
 from app.core.error_codes import (
     REPAIR_PLAN_NOT_READY, REPAIR_PLAN_NOT_AVAILABLE, REPAIR_PLAN_INTERNAL_ERROR,
@@ -211,7 +208,7 @@ def _insert_repair_plan(task_id, plan_status="complete"):
 
 def _set_task_status(task_id, status):
     """直接更新 tasks 表中的 status 字段（用于模拟未知状态）。"""
-    from app.db.database import _get_connection, now_iso
+    from app.db.database import _get_connection
     conn = _get_connection()
     try:
         conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))

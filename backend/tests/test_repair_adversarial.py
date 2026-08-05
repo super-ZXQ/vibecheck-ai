@@ -30,14 +30,12 @@ from app.core.config import settings
 from app.db import database
 from app.db.database import _get_connection
 from app.services.repair_policy import *  # noqa: F401, F403
-from app.services import repair_policy as _rp
 from app.services.repair_service import (
     generate_repair_plan,
     serialize_repair_plan,
     save_repair_result,
     get_repair_result,
     RepairPlanInternalError,
-    RepairPlanPersistError,
     RepairPlanTooLargeError,
     RepairPlanSerializationError,
 )
@@ -794,7 +792,6 @@ class TestReadValidation:
         """JSON and DB source timestamps mismatch -> RepairPlanInternalError."""
         task_id = _make_task()
         safe = _make_valid_safe_plan(task_id=task_id)
-        json_ts = safe["source_scan_updated_at"]  # "2026-01-01T00:00:00Z"
         db_ts = "2026-12-31T00:00:00Z"  # different
         _insert_raw_repair_row_custom(
             task_id, json.dumps(safe, ensure_ascii=False),
@@ -819,7 +816,6 @@ class TestReadValidation:
         """created_at mismatch -> RepairPlanInternalError."""
         task_id = _make_task()
         safe = _make_valid_safe_plan(task_id=task_id)
-        json_created = safe["created_at"]  # "2026-01-01T00:00:00Z"
         db_created = "2025-01-01T00:00:00Z"  # different
         _insert_raw_repair_row_custom(
             task_id, json.dumps(safe, ensure_ascii=False),
@@ -1317,10 +1313,6 @@ class TestPersistedPlanValidationRound2:
         safe = _make_valid_safe_plan(task_id=task_id)
         # Find a command that's in the total whitelist but not for
         # REVOKE_OR_ROTATE_SECRET
-        from app.services.repair_policy import get_allowed_commands
-        revoke_cmds = set(get_allowed_commands(
-            safe["repair_groups"][0]["action_code"]
-        ))
         # Try git log --oneline -20 which is likely in the total whitelist
         safe["repair_groups"][0]["commands"] = ["git log --oneline -20"]
         _insert_raw_repair_row_custom(
@@ -1468,8 +1460,6 @@ class TestAgentPromptRebuiltRound3:
         """
         task_id = _make_task()
         safe = _make_valid_safe_plan(task_id=task_id)
-        # Add a second group to make order matter
-        safe2 = _make_valid_safe_plan(task_id=task_id)
         # Swap: if there's only one group, we need a different approach.
         # Instead, modify the agent_prompt slightly to break equality.
         safe["agent_prompt"] = safe["agent_prompt"] + " "

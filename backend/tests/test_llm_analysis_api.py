@@ -11,10 +11,8 @@
 8. 轮询端点返回 llm_analysis_available 和 llm_analysis_url
 """
 
-import asyncio
 import json
 import uuid
-from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient

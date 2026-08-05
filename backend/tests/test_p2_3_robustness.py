@@ -6,12 +6,9 @@
 3. 状态机验证：非法状态转换被拒绝
 """
 
-import asyncio
-import json
 import os
-import tempfile
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
 
@@ -20,7 +17,6 @@ from app.services import background_runner, task_manager
 from app.services.cleanup_service import (
     cleanup_expired_tasks,
     cleanup_residual_temp_files,
-    maybe_trigger_cleanup,
     reset_cleanup_counter,
 )
 from app.services.task_manager import (
@@ -202,7 +198,7 @@ class TestCleanupExpiredTasks:
 
     def test_deletes_expired_tasks(self, test_db, monkeypatch):
         """删除过期的已完成任务。"""
-        from app.db.database import _get_connection, now_iso
+        from app.db.database import _get_connection
         from datetime import datetime, timedelta, timezone
 
         # Create a task and mark it completed
@@ -265,7 +261,6 @@ class TestCleanupExpiredTasks:
         """删除任务时同时删除关联数据。"""
         from app.db.database import _get_connection, now_iso
         from datetime import datetime, timedelta, timezone
-        import json
 
         monkeypatch.setattr(
             "app.core.config.settings.report_ttl_hours", 72

@@ -13,19 +13,14 @@ Test count: 9
 
 import os
 import sys
-from pathlib import Path
 
 import pytest
 
 from app.scanner.base import (
-    Finding,
-    FindingType,
     SENSITIVE_DATA_DIMENSION,
     ScanNotice,
     ScanResult,
-    Severity,
 )
-from app.scanner.default_rules import DEFAULT_RULES
 from app.scanner.rules import (
     EnvExampleFileRule,
     GitHubTokenRule,

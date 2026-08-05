@@ -28,7 +28,6 @@ from app.services.llm_service import (
     _resolve_llm_config,
     generate_and_save_llm_analysis,
 )
-from tests.conftest import make_normal_tarball
 
 
 # --- Fixtures (mirror test_upload_api) ---

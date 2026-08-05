@@ -35,7 +35,6 @@ import asyncio
 import json
 import threading
 import time
-import uuid
 from pathlib import Path
 from unittest.mock import patch
 

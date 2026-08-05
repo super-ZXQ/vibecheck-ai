@@ -6,12 +6,11 @@ permissions or validity. No real credentials are used in any test.
 Test count: 28
 """
 
-import json
-import string
 
 import pytest
 
 from app.core.security.desensitize import (
+    Assignment,
     AWS_ACCESS_KEY,
     AWS_SECRET_KEY,
     CATEGORY_AWS_SECRET,
@@ -858,8 +857,7 @@ class TestAssignmentReprProtection:
     # Malicious variable name: PASSWORD_ + format-correct synthetic token
     _MALICIOUS_KEY = f"PASSWORD_{SYNTH_GITHUB_TOKEN}"
 
-    def _make_assignment(self) -> "Assignment":
-        from app.core.security.desensitize import Assignment
+    def _make_assignment(self) -> Assignment:
         return Assignment(
             key_raw=self._MALICIOUS_KEY,
             key_normalized=self._MALICIOUS_KEY.upper(),

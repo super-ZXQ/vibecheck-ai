@@ -13,7 +13,6 @@
 """
 
 import asyncio
-import json
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -22,7 +21,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.db import database
-from app.services import task_manager, background_runner
+from app.services import task_manager
 from app.services.background_runner import _process_task, reset_runner_state
 from app.services.assessment_service import (
     get_assessment_result,
@@ -37,8 +36,6 @@ from app.core.error_codes import (
     ASSESSMENT_INTERNAL_ERROR,
     ASSESSMENT_PERSIST_FAILED,
     ASSESSMENT_RESULT_TOO_LARGE,
-    SCAN_INTERNAL_ERROR,
-    INTERNAL_ERROR,
 )
 from app.core.github import DownloadResult, parse_repo_url
 from app.core.safe_extract import ExtractionResult

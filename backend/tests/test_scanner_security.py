@@ -81,7 +81,7 @@ class TestSecretContainment:
             f'token="{SYNTH_GITHUB_TOKEN}"\n', encoding="utf-8",
         )
         with caplog.at_level(logging.DEBUG):
-            result = scan_directory(tmp_path)
+            scan_directory(tmp_path)
 
         for record in caplog.records:
             assert SYNTH_GITHUB_TOKEN not in record.message
@@ -281,8 +281,6 @@ class TestErrorSafety:
         )
 
         # Patch open to raise OSError with sensitive info in the message
-        original_open = builtins.open
-
         def failing_open(file, *args, **kwargs):
             raise OSError(f"Permission denied: {file} content={SYNTH_GITHUB_TOKEN}")
 
@@ -965,7 +963,6 @@ class TestFindingContract:
             PrivateKeyRule,
             ProductionEnvWithSecretRule,
         )
-        from app.scanner.base import Confidence
 
         # Test data for each rule
         test_cases = [
@@ -1161,7 +1158,7 @@ class TestStableSorting:
             f'token="{SYNTH_GITHUB_TOKEN}"\n', encoding="utf-8",
         )
         (dir_a / "a_file.py").write_text(
-            f'password="secret_value_123"\n', encoding="utf-8",
+            'password="secret_value_123"\n', encoding="utf-8",
         )
         (dir_a / "m_file.py").write_text(
             f'AWS_KEY="{SYNTH_AWS_KEY}"\n', encoding="utf-8",
@@ -1174,7 +1171,7 @@ class TestStableSorting:
             f'AWS_KEY="{SYNTH_AWS_KEY}"\n', encoding="utf-8",
         )
         (dir_b / "a_file.py").write_text(
-            f'password="secret_value_123"\n', encoding="utf-8",
+            'password="secret_value_123"\n', encoding="utf-8",
         )
         (dir_b / "z_file.py").write_text(
             f'token="{SYNTH_GITHUB_TOKEN}"\n', encoding="utf-8",
@@ -2011,8 +2008,8 @@ class TestMultipleConnectionStringsOneLine:
         """Two connection strings separated by a comma: both passwords masked."""
         from app.core.security.desensitize import mask_untrusted_text, mask_snippet
         line = (
-            f'postgres://u1:password1@host1/db,'
-            f'mysql://u2:password2@host2/db'
+            'postgres://u1:password1@host1/db,'
+            'mysql://u2:password2@host2/db'
         )
         # mask_untrusted_text
         result = mask_untrusted_text(line)
@@ -2027,8 +2024,8 @@ class TestMultipleConnectionStringsOneLine:
         """Two connection strings separated by a semicolon: both passwords masked."""
         from app.core.security.desensitize import mask_untrusted_text
         line = (
-            f'postgres://u1:password1@host1/db;'
-            f'mysql://u2:password2@host2/db'
+            'postgres://u1:password1@host1/db;'
+            'mysql://u2:password2@host2/db'
         )
         result = mask_untrusted_text(line)
         assert "password1" not in result
@@ -2063,8 +2060,8 @@ class TestMultipleConnectionStringsOneLine:
         """Two connection strings separated by whitespace: both passwords masked."""
         from app.core.security.desensitize import mask_untrusted_text
         line = (
-            f'postgres://u1:password1@host1/db '
-            f'mysql://u2:password2@host2/db'
+            'postgres://u1:password1@host1/db '
+            'mysql://u2:password2@host2/db'
         )
         result = mask_untrusted_text(line)
         assert "password1" not in result
@@ -2111,8 +2108,8 @@ class TestMultipleConnectionStringsOneLine:
         from app.scanner.rules import ConnectionStringRule
         rule = ConnectionStringRule()
         line = (
-            f'DB_URL = "postgres://u1:password1@host1/db,'
-            f'mysql://u2:password2@host2/db"'
+            'DB_URL = "postgres://u1:password1@host1/db,'
+            'mysql://u2:password2@host2/db"'
         )
         findings = rule.scan_content("config.py", [line])
         assert len(findings) == 2
@@ -2143,7 +2140,7 @@ class TestTokenAmplificationBound:
 
     def test_snippet_computed_once_per_line(self):
         """mask_snippet is called at most ONCE per line, not per Finding."""
-        from app.scanner.rules import GitHubTokenRule, _make_masked_snippet
+        from app.scanner.rules import GitHubTokenRule
         import app.scanner.rules as rules_mod
 
         call_count = 0
@@ -2201,7 +2198,7 @@ class TestTokenAmplificationBound:
 
     def test_snippet_cache_with_multiple_lines(self):
         """Snippet cache works across multiple lines — one call per line."""
-        from app.scanner.rules import GitHubTokenRule, _make_masked_snippet
+        from app.scanner.rules import GitHubTokenRule
         import app.scanner.rules as rules_mod
 
         call_count = 0

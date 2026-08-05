@@ -12,19 +12,16 @@
 """
 
 import json
-from unittest.mock import patch, MagicMock
 
 import pytest
 
 from app.db import database
-from app.services import llm_service
 from app.services.llm_fallback_templates import (
     get_fallback_template,
     GENERIC_FALLBACK,
     FALLBACK_TEMPLATES,
 )
 from app.services.llm_service import (
-    SCHEMA_VERSION,
     _build_llm_prompt,
     _call_llm_api,
     _extract_non_blocking_findings,

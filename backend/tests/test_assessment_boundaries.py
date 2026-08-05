@@ -14,10 +14,8 @@ I. Finding sort rejects unknown objects (no default=str)
 All test strings are SYNTHETIC — format-correct but NOT real credentials.
 """
 
-import copy
 import json
 import sqlite3
-import time
 from unittest.mock import patch
 
 import pytest
@@ -32,7 +30,6 @@ from app.services.assessment_service import (
     save_assessment_result,
     serialize_assessment_result,
     get_assessment_result,
-    run_assessment,
     AssessmentInternalError,
     AssessmentPersistError,
     AssessmentSerializationError,

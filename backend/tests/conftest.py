@@ -6,7 +6,6 @@ No real credentials are used in any test.
 """
 
 import io
-import os
 import tarfile
 import tempfile
 from pathlib import Path

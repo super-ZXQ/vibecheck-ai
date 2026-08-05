@@ -9,12 +9,12 @@ line-length = 100
 
 [lint]
 # Rules that conflict with project hard constraints or framework conventions:
-# - BLE001: Intentional broad exception catches → mapped to fixed error_code
-# - S110:   Intentional try-except-pass for DB rollback/cleanup
-# - B008:   FastAPI requires File/Header/Form in argument defaults
-# - ASYNC230: File I/O in async functions (upload/github) — acceptable for low concurrency
-# - SIM115:  tarfile.open without context manager — safe in controlled scope
-# - UP017:  datetime.UTC not available in all runtime environments
+# - BLE001:   Intentional broad exception catches, mapped to fixed error_code
+# - S110:     Intentional try-except-pass for DB rollback/cleanup
+# - B008:     FastAPI requires File/Header/Form in argument defaults
+# - ASYNC230: File I/O in async functions (upload/github), low concurrency
+# - SIM115:   tarfile.open without context manager, safe in controlled scope
+# - UP017:    datetime.UTC not available in all runtime environments
 ignore = [
     "BLE001",
     "S110",
@@ -23,3 +23,11 @@ ignore = [
     "SIM115",
     "UP017",
 ]
+
+[lint.per-file-ignores]
+# These test modules intentionally star-import the repair policy module
+# under test to exercise its public surface; F403/F405 are expected here
+# and acceptable for test fixtures.
+"tests/test_repair_adversarial.py" = ["F403", "F405"]
+"tests/test_repair_boundaries.py" = ["F403", "F405"]
+"tests/test_repair_engine.py" = ["F403", "F405"]

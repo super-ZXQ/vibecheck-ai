@@ -6,9 +6,8 @@ No real credentials are used.
 Test count: 28
 """
 
-import pytest
 
-from app.scanner.base import Finding, FindingType, ScanNotice, Severity, Confidence
+from app.scanner.base import Finding, FindingType, Severity, Confidence
 from app.scanner.rules import (
     AWSAccessKeyRule,
     AWSSecretKeyRule,
@@ -1195,7 +1194,7 @@ class TestPrivateKeyLinearComplexity:
         n = 500
         lines = ["-----BEGIN RSA PRIVATE KEY-----"] * n
         # Wrap each line to count contains calls
-        wrapped = [CountingStr(l) for l in lines]
+        wrapped = [CountingStr(line) for line in lines]
         findings = rule.scan_content("test_keys", wrapped)
 
         # Should produce at most 1 incomplete finding (not n)

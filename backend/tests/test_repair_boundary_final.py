@@ -14,11 +14,10 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
-from app.core.config import settings
 from app.core.error_codes import REPAIR_PLAN_INTERNAL_ERROR
 from app.db import database
 from app.db.database import _get_connection
-from app.services import background_runner, task_manager
+from app.services import background_runner
 from app.services.repair_policy import (
     POLICY_VERSION,
     REPAIR_SCHEMA_VERSION,
@@ -30,16 +29,13 @@ from app.services.repair_policy import (
     ACTION_REVOKE_OR_ROTATE_SECRET,
 )
 from app.services.repair_service import (
-    generate_repair_plan,
     serialize_repair_plan,
-    save_repair_result,
     get_repair_result,
     RepairPlanInternalError,
     RepairPlanTooLargeError,
     RepairPlanSerializationError,
     _generate_agent_prompt,
     _validate_repair_snapshot_semantics,
-    _validate_repair_snapshot_identity,
     _validate_persisted_repair_plan,
     _sanitize_file_path,
 )

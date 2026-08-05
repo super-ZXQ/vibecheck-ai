@@ -29,15 +29,14 @@ import time
 import pytest
 
 from app.db import database
-from app.db.database import _get_connection, init_db, reset_db, now_iso
+from app.db.database import _get_connection
 from app.services.repair_policy import (
     POLICY_VERSION, REPAIR_SCHEMA_VERSION, REPAIR_SCOPE,
     AGENT_PROMPT_REQUIREMENTS, PARTIAL_DECLARATION,
 )
 from app.services.repair_service import (
     save_repair_result, get_repair_result, get_repair_plan_available,
-    serialize_repair_plan, generate_repair_plan,
-    RepairPlanInternalError, RepairPlanPersistError, RepairPlanTooLargeError,
+    serialize_repair_plan, RepairPlanInternalError, RepairPlanPersistError, RepairPlanTooLargeError,
     RepairPlanSerializationError,
 )
 from app.services.task_manager import create_task, mark_completed

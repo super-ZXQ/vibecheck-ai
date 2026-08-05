@@ -19,9 +19,8 @@ D. Failure tests:
    - Cleanup still executes
 """
 
-import asyncio
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
 
@@ -30,14 +29,13 @@ from app.core.error_codes import (
     SCAN_RESULT_PERSIST_FAILED,
     get_error_message,
 )
-from app.core.github import DownloadResult, GitHubDownloadError, parse_repo_url
+from app.core.github import DownloadResult, parse_repo_url
 from app.core.safe_extract import ExtractionResult
 from app.db import database
 from app.scanner.base import (
     BASIC_SECURITY_DIMENSION,
     DEPLOYABILITY_PRODUCTION_DIMENSION,
     SENSITIVE_DATA_DIMENSION,
-    ScanResult,
 )
 from app.services import background_runner, task_manager
 from tests.conftest import SYNTHETIC_GITHUB_TOKEN

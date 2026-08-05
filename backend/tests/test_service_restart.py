@@ -9,7 +9,6 @@ Test coverage:
 10. Service startup marks pending tasks as failed
 """
 
-import uuid
 
 import pytest
 from fastapi.testclient import TestClient

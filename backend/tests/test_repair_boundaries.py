@@ -55,17 +55,14 @@ import pytest
 
 from app.core.config import settings
 from app.db import database
-from app.db.database import _get_connection, now_iso
 from app.services.repair_policy import *
 from app.services.repair_service import (
     generate_repair_plan, serialize_repair_plan,
-    RepairPlanInternalError, RepairPlanSerializationError,
-    RepairPlanTooLargeError,
+    RepairPlanInternalError, RepairPlanTooLargeError,
 )
 from app.services.repair_policy import (
-    ACTION_CODES, _COMMAND_ALLOWLIST, get_allowed_commands,
-    is_command_allowed, AGENT_PROMPT_FORBIDDEN_FIELDS,
-    AGENT_PROMPT_FORBIDDEN_PATTERNS,
+    _COMMAND_ALLOWLIST, get_allowed_commands,
+    is_command_allowed,
 )
 
 

@@ -18,7 +18,6 @@ import asyncio
 import json
 import sqlite3
 import threading
-import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -29,9 +28,6 @@ from pydantic import ValidationError
 from app.core.config import Settings
 from app.core.error_codes import (
     INTERNAL_ERROR,
-    SCAN_RESULT_MISSING,
-    SCAN_RESULT_NOT_READY,
-    get_error_message,
 )
 from app.core.github import DownloadResult, parse_repo_url
 from app.core.safe_extract import ExtractionResult

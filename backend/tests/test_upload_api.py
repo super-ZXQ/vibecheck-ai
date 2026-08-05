@@ -20,11 +20,9 @@ Coverage:
 14. Staged upload content is removed after processing
 """
 
-import asyncio
 import io
 import stat
 import zipfile
-from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient

@@ -5,7 +5,6 @@ No real credentials or network resources are involved.
 """
 
 import pytest
-from pathlib import Path
 
 from app.core.safe_extract import (
     ExtractionError,
@@ -24,7 +23,6 @@ from tests.conftest import (
     make_oversized_tarball,
     make_many_files_tarball,
     make_absolute_path_tarball,
-    make_null_byte_tarball,
 )
 
 
@@ -51,7 +49,7 @@ class TestNormalExtraction:
     def test_file_contents_are_correct(self, tmp_dest_dir):
         """Extracted file contents should match the tarball."""
         tarball = make_normal_tarball()
-        result = safe_extract(tarball, tmp_dest_dir)
+        safe_extract(tarball, tmp_dest_dir)
 
         readme = (tmp_dest_dir / "test-repo" / "README.md").read_text()
         assert "# Test Repo" in readme

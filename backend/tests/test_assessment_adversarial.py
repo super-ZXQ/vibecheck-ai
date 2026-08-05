@@ -43,7 +43,6 @@ import json
 import time
 from dataclasses import FrozenInstanceError
 from types import MappingProxyType
-from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -58,7 +57,6 @@ from app.services.assessment_policy import (
     CONFIDENCE_PERCENT,
     RULE_CAP_BY_SEVERITY,
     CAP_BLOCKING,
-    ScoreCap,
 )
 from app.services.assessment_service import (
     assess_scan_result,
@@ -66,15 +64,10 @@ from app.services.assessment_service import (
     serialize_assessment_result,
     get_assessment_result,
     run_assessment,
-    AssessmentResultTooLargeError,
 )
 from app.services.scan_result_service import save_scan_result
 from app.scanner.base import (
     Finding, ScanResult, Severity, Confidence, FindingType,
-)
-from tests.conftest import (
-    SYNTHETIC_GITHUB_TOKEN,
-    SYNTHETIC_AWS_KEY,
 )
 
 

@@ -1736,7 +1736,7 @@ def test_pnpm_filter_separator_order_independent(tmp_path):
     })
     result_b = "C003_START_COMMAND_MISMATCH" in _rule_ids(tmp_path)
 
-    assert result_a == result_b == True
+    assert result_a is True and result_b is True
 
 
 # ---- Round 7 Issue 2: npm --if-present handling ----

@@ -15,9 +15,8 @@ Test scenarios (9 groups):
 9. Download failure → temp file cleaned up
 """
 
-import asyncio
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 

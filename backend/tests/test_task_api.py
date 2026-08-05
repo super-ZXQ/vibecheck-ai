@@ -41,7 +41,6 @@ from app.core.safe_extract import (
 from app.core.error_codes import SCAN_RESULT_NOT_READY
 from app.db import database
 from app.services import background_runner, task_manager
-from app.services.scan_result_service import get_scan_result
 from tests.conftest import SYNTHETIC_GITHUB_TOKEN
 
 
@@ -927,7 +926,6 @@ class TestResultEndpoint:
                 await background_runner._process_task(task.id)
 
         response = client.get(f"/api/check/{task.id}/result")
-        data = response.json()
         # The raw token should NOT appear anywhere in the response
         assert SYNTHETIC_GITHUB_TOKEN not in response.text
 
