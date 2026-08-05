@@ -29,6 +29,11 @@ from app.scanner.incomplete_rules import (
 
 _REPOSITORY_PATH = "<repository>"
 _ENV_TEMPLATE_NAMES = frozenset({".env.example", ".env.sample", ".env.template"})
+_CONFIG_TEMPLATE_DIR_NAMES = frozenset({
+    "config.example", "config.sample", "config.template",
+    "settings.example", "settings.sample",
+    "env.example", "env.sample", "env.template",
+})
 _COMPOSE_NAMES = frozenset({
     "compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml",
 })
@@ -65,13 +70,19 @@ _DEPLOY_COMMAND_RE = re.compile(
     r"npm\s+(?:run\s+)?start|pnpm\s+(?:run\s+)?start|yarn\s+start|"
     r"docker\s+compose\s+up|docker-compose\s+up|gunicorn|uvicorn|hypercorn|"
     r"waitress|go\s+(?:run|build)|cargo\s+(?:run|build)|java\s+-jar|"
-    r"dotnet\s+(?:run|publish)|bundle\s+exec|php\s+(?:artisan|bin/console)",
+    r"dotnet\s+(?:run|publish)|bundle\s+exec|php\s+(?:artisan|bin/console)|"
+    r"(?:上传|upload).{0,12}(?:部署|deploy)|云端安装依赖|"
+    r"serverless\s+deploy|sls\s+deploy|firebase\s+deploy|vercel\s+deploy|"
+    r"wrangler\s+(?:deploy|publish)|gcloud\s+functions\s+deploy|"
+    r"云函数.*部署|云开发.*部署",
     re.IGNORECASE,
 )
 _PREREQUISITE_DOC_RE = re.compile(
     r"prerequisites?|requirements?|before\s+you\s+begin|"
     r"install(?:ation)?|requires?\s+(?:node|python|java|go|rust|ruby|php|\.net)|"
-    r"\u524d\u7f6e\u6761\u4ef6|\u5b89\u88c5\u8981\u6c42|\u73af\u5883\u8981\u6c42",
+    r"\u524d\u7f6e\u6761\u4ef6|\u5b89\u88c5\u8981\u6c42|\u73af\u5883\u8981\u6c42|"
+    r"\u5feb\u901f\u5f00\u59cb|\u5feb\u901f\u4e0a\u624b|quick\s+start|"
+    r"\u8fd0\u884c\u73af\u5883|\u73af\u5883\u8981\u6c42",
     re.IGNORECASE,
 )
 _ENV_USAGE_PATTERNS = (
@@ -103,6 +114,7 @@ class _DependencyState:
     manifests: set[str] = field(default_factory=set)
     has_dependencies: bool = False
     locked: bool = False
+    manifest_deps: dict[str, bool] = field(default_factory=dict)
 
 
 @dataclass
@@ -293,6 +305,7 @@ class DeployabilityProbe(RepositoryProbe):
         self.compose_root_user = False
         self.dockerfiles: dict[str, _DockerState] = {}
         self.invalid_configs: set[str] = set()
+        self.lock_dirs: set[str] = set()
         self.dependencies: dict[str, _DependencyState] = {
             key: _DependencyState()
             for key in (
@@ -338,6 +351,11 @@ class DeployabilityProbe(RepositoryProbe):
         if name in _ENV_TEMPLATE_NAMES and any(
             _ENV_ASSIGNMENT_RE.match(line) for line in lines
         ):
+            self.has_env_docs = True
+        elif any(
+            segment in _CONFIG_TEMPLATE_DIR_NAMES for segment in path.parts
+        ) and any(line.strip() for line in lines):
+            # config.example/ 等样板目录中的非空配置即视为环境文档（无需 KEY= 赋值行）。
             self.has_env_docs = True
 
         if _is_compose_file(name):
@@ -414,9 +432,12 @@ class DeployabilityProbe(RepositoryProbe):
     ) -> None:
         if name in {"package-lock.json", "npm-shrinkwrap.json"}:
             valid = self._parse_json(file_path, text) is not None
-            self.dependencies["node"].locked = self.dependencies["node"].locked or valid
+            if valid:
+                self.dependencies["node"].locked = True
+                self.lock_dirs.add(str(PurePosixPath(file_path).parent))
         elif name in _NODE_LOCKS:
             self.dependencies["node"].locked = True
+            self.lock_dirs.add(str(PurePosixPath(file_path).parent))
         if name == "pipfile.lock":
             valid = self._parse_json(file_path, text) is not None
             self.dependencies["python"].locked = self.dependencies["python"].locked or valid
@@ -454,10 +475,12 @@ class DeployabilityProbe(RepositoryProbe):
             state.manifests.add(file_path)
             data = self._parse_json(file_path, text)
             if data is not None:
-                state.has_dependencies = state.has_dependencies or any(
+                has_deps = any(
                     _has_mapping_entries(data.get(key))
                     for key in ("dependencies", "devDependencies", "peerDependencies")
                 )
+                state.manifest_deps[file_path] = has_deps
+                state.has_dependencies = state.has_dependencies or has_deps
                 scripts = data.get("scripts")
                 start = scripts.get("start") if isinstance(scripts, dict) else None
                 if isinstance(start, str) and start.strip() and not _DEV_START_RE.search(start):
@@ -641,7 +664,18 @@ class DeployabilityProbe(RepositoryProbe):
         docker_start = self.compose_has_start or any(
             state.final_has_start for state in self.dockerfiles.values()
         )
-        if not (self.production_start or docker_start):
+        deployment_documented = (
+            self.readme_paths
+            and self.readme_has_deploy_text
+            and self.readme_has_deploy_command
+            and self.readme_has_prerequisites
+        )
+        # A fully documented deployment procedure IS the reproducible
+        # production start for platform-managed projects (serverless,
+        # WeChat cloud functions, etc.), where there is no process to
+        # launch. Only require an explicit start entrypoint when no
+        # deployment documentation exists.
+        if not (self.production_start or docker_start or deployment_documented):
             findings.append(_finding("D001_PRODUCTION_START", _REPOSITORY_PATH))
         if self.env_usage_paths and not self.has_env_docs:
             findings.append(_finding(
@@ -666,6 +700,18 @@ class DeployabilityProbe(RepositoryProbe):
         )
         for key in sorted(self.dependencies):
             dep_state = self.dependencies[key]
+            if key == "node":
+                # Per-manifest nearest-lock detection: multi-manifest
+                # repos (monorepos, cloud function directories) need a
+                # lock next to EACH manifest, so report every unlocked
+                # manifest instead of a single min() sample.
+                for manifest, has_deps in sorted(dep_state.manifest_deps.items()):
+                    if not has_deps:
+                        continue
+                    if str(PurePosixPath(manifest).parent) in self.lock_dirs:
+                        continue
+                    findings.append(_finding("D003_DEPENDENCY_LOCK", manifest))
+                continue
             if dep_state.has_dependencies and not dep_state.locked:
                 findings.append(_finding("D003_DEPENDENCY_LOCK", min(dep_state.manifests)))
 

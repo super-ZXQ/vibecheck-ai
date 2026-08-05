@@ -78,6 +78,49 @@ def test_environment_strings_comments_and_tests_are_not_usage(tmp_path):
     assert "D002_ENVIRONMENT_DOCUMENTATION" not in _rule_ids(tmp_path)
 
 
+def test_config_example_template_directory_satisfies_environment_docs(tmp_path):
+    _write_repo(tmp_path, {
+        "src/app.ts": "const value = process.env.APP_SECRET;\n",
+        "config.example/app-config.json": "{\"key\": \"在此填入\"}\n",
+    })
+    assert "D002_ENVIRONMENT_DOCUMENTATION" not in _rule_ids(tmp_path)
+
+
+def test_multiple_node_manifests_each_require_their_own_lock(tmp_path):
+    _write_repo(tmp_path, {
+        "services/a/package.json": '{"dependencies":{"express":"^5.0.0"}}',
+        "services/b/package.json": '{"dependencies":{"lodash":"^4.0.0"}}',
+        "services/c/package.json": '{"name":"empty"}',
+    })
+    d003 = [
+        finding.file_path for finding in _findings(tmp_path)
+        if finding.rule_id == "D003_DEPENDENCY_LOCK"
+    ]
+    assert d003 == ["services/a/package.json", "services/b/package.json"]
+
+    _write_repo(tmp_path, {"services/a/package-lock.json": "{}"})
+    d003 = [
+        finding.file_path for finding in _findings(tmp_path)
+        if finding.rule_id == "D003_DEPENDENCY_LOCK"
+    ]
+    assert d003 == ["services/b/package.json"]
+
+
+def test_serverless_deployment_readme_counts_as_production_start(tmp_path):
+    _write_repo(tmp_path, {
+        "README.md": (
+            "# 项目\n## 运行环境\nNode.js 12+。\n"
+            "## 环境变量\n见 config.example 目录。\n"
+            "## 快速开始\n云函数目录右键「上传并部署：云端安装依赖」。\n"
+        ),
+        "cloudfunctions/api/index.js": "const port = process.env.PORT;\n",
+    })
+    ids = _rule_ids(tmp_path)
+    assert "D001_PRODUCTION_START" not in ids
+    assert "D004_DEPLOYMENT_DOCUMENTATION" not in ids
+    assert "D002_ENVIRONMENT_DOCUMENTATION" not in ids
+
+
 @pytest.mark.parametrize(
     "content",
     (
