@@ -25,20 +25,24 @@ import uuid
 import pytest
 from fastapi.testclient import TestClient
 
+from app.core.error_codes import (
+    REPAIR_PLAN_INTERNAL_ERROR,
+    REPAIR_PLAN_NOT_AVAILABLE,
+    REPAIR_PLAN_NOT_READY,
+)
 from app.db import database
 from app.services import background_runner, task_manager
 from app.services.repair_policy import (
-    POLICY_VERSION, REPAIR_SCHEMA_VERSION, REPAIR_SCOPE,
-    AGENT_PROMPT_REQUIREMENTS, PARTIAL_DECLARATION,
     ACTION_REVOKE_OR_ROTATE_SECRET,
+    AGENT_PROMPT_REQUIREMENTS,
+    PARTIAL_DECLARATION,
+    POLICY_VERSION,
+    REPAIR_SCHEMA_VERSION,
+    REPAIR_SCOPE,
 )
 from app.services.repair_service import (
     serialize_repair_plan,
 )
-from app.core.error_codes import (
-    REPAIR_PLAN_NOT_READY, REPAIR_PLAN_NOT_AVAILABLE, REPAIR_PLAN_INTERNAL_ERROR,
-)
-
 
 # ---------------------------------------------------------------------------
 # --- Fixtures ---

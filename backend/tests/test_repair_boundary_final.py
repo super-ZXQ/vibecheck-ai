@@ -19,28 +19,27 @@ from app.db import database
 from app.db.database import _get_connection
 from app.services import background_runner
 from app.services.repair_policy import (
-    POLICY_VERSION,
-    REPAIR_SCHEMA_VERSION,
-    REPAIR_SCOPE,
-    AGENT_PROMPT_REQUIREMENTS,
-    PARTIAL_DECLARATION,
     ACTION_MANUAL_REVIEW_REQUIRED,
     ACTION_RERUN_SECURITY_SCAN,
     ACTION_REVOKE_OR_ROTATE_SECRET,
+    AGENT_PROMPT_REQUIREMENTS,
+    PARTIAL_DECLARATION,
+    POLICY_VERSION,
+    REPAIR_SCHEMA_VERSION,
+    REPAIR_SCOPE,
 )
 from app.services.repair_service import (
-    serialize_repair_plan,
-    get_repair_result,
     RepairPlanInternalError,
-    RepairPlanTooLargeError,
     RepairPlanSerializationError,
+    RepairPlanTooLargeError,
     _generate_agent_prompt,
-    _validate_repair_snapshot_semantics,
-    _validate_persisted_repair_plan,
     _sanitize_file_path,
+    _validate_persisted_repair_plan,
+    _validate_repair_snapshot_semantics,
+    get_repair_result,
+    serialize_repair_plan,
 )
 from app.services.task_manager import create_task, mark_completed
-
 
 # ---------------------------------------------------------------------------
 # --- Fixtures ---

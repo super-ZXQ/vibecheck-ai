@@ -40,7 +40,6 @@ from app.scanner.base import (
 from app.services import background_runner, task_manager
 from tests.conftest import SYNTHETIC_GITHUB_TOKEN
 
-
 # --- Fixtures ---
 
 @pytest.fixture
@@ -131,12 +130,11 @@ class TestPipelineIntegration:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         # Task should be completed
         result = task_manager.get_task(task.id)
@@ -171,12 +169,11 @@ class TestPipelineIntegration:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         result = task_manager.get_task(task.id)
         assert result.status == "completed"
@@ -203,12 +200,11 @@ class TestPipelineIntegration:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         result = task_manager.get_task(task.id)
         resp = result.to_response()
@@ -229,12 +225,11 @@ class TestPipelineIntegration:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         # Download temp file should be deleted
         assert not download_result.temp_file.exists()
@@ -264,16 +259,14 @@ class TestPipelineIntegration:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.mark_running",
+            side_effect=tracking_mark_running,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.mark_running",
-                    side_effect=tracking_mark_running,
-                ):
-                    await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         # Should have passed through scanning stage
         stages = [s for s, _ in stage_updates]
@@ -305,16 +298,14 @@ class TestScanFailure:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            side_effect=RuntimeError("Unexpected internal error"),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    side_effect=RuntimeError("Unexpected internal error"),
-                ):
-                    await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         result = task_manager.get_task(task.id)
         assert result.status == "failed"
@@ -336,16 +327,14 @@ class TestScanFailure:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            side_effect=RuntimeError(exc_msg),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    side_effect=RuntimeError(exc_msg),
-                ):
-                    await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         result = task_manager.get_task(task.id)
         assert exc_msg not in (result.error_message or "")
@@ -366,16 +355,14 @@ class TestScanFailure:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            side_effect=RuntimeError("scan error"),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    side_effect=RuntimeError("scan error"),
-                ):
-                    await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         # Download temp file should be deleted
         assert not download_result.temp_file.exists()
@@ -397,16 +384,14 @@ class TestScanFailure:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            side_effect=RuntimeError("scan error"),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    side_effect=RuntimeError("scan error"),
-                ):
-                    await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         from app.services.scan_result_service import get_scan_result
         assert get_scan_result(task.id) is None
@@ -430,16 +415,14 @@ class TestPersistenceFailure:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.save_scan_result",
+            side_effect=Exception("DB connection lost"),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.save_scan_result",
-                    side_effect=Exception("DB connection lost"),
-                ):
-                    await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         result = task_manager.get_task(task.id)
         assert result.status == "failed"
@@ -461,16 +444,14 @@ class TestPersistenceFailure:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.save_scan_result",
+            side_effect=Exception(exc_msg),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.save_scan_result",
-                    side_effect=Exception(exc_msg),
-                ):
-                    await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         result = task_manager.get_task(task.id)
         assert exc_msg not in (result.error_message or "")
@@ -491,16 +472,14 @@ class TestPersistenceFailure:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.save_scan_result",
+            side_effect=Exception("persist error"),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.save_scan_result",
-                    side_effect=Exception("persist error"),
-                ):
-                    await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         result = task_manager.get_task(task.id)
         assert result.status != "completed"
@@ -521,16 +500,14 @@ class TestPersistenceFailure:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.save_scan_result",
+            side_effect=Exception("persist error"),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.save_scan_result",
-                    side_effect=Exception("persist error"),
-                ):
-                    await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         # Download temp file should be deleted
         assert not download_result.temp_file.exists()

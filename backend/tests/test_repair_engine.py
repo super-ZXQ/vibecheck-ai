@@ -33,11 +33,10 @@ from types import MappingProxyType
 
 import pytest
 
-from app.services.repair_policy import *
-from app.services import repair_policy as _rp
-from app.services.repair_service import generate_repair_plan, RepairPlanInternalError
 from app.db import database
-
+from app.services import repair_policy as _rp
+from app.services.repair_policy import *
+from app.services.repair_service import RepairPlanInternalError, generate_repair_plan
 
 # ---------------------------------------------------------------------------
 # --- Fixtures ---

@@ -17,36 +17,35 @@
 
 import asyncio
 import uuid
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
+from app.core.error_codes import (
+    INTERNAL_ERROR,
+    REPAIR_PLAN_INTERNAL_ERROR,
+    REPAIR_PLAN_NOT_AVAILABLE,
+    REPAIR_PLAN_PERSIST_FAILED,
+    REPAIR_PLAN_TOO_LARGE,
+)
 from app.db import database
+from app.scanner.base import Confidence, Finding, FindingType, ScanResult, Severity
 from app.services import background_runner, task_manager
+from app.services.assessment_service import (
+    get_assessment_result,
+    get_scan_result_with_timestamp,
+    run_assessment,
+)
 from app.services.repair_service import (
-    generate_and_save_repair_plan,
-    get_repair_result,
     RepairPlanInternalError,
     RepairPlanPersistError,
     RepairPlanTooLargeError,
+    generate_and_save_repair_plan,
+    get_repair_result,
 )
 from app.services.scan_result_service import save_scan_result
-from app.services.assessment_service import (
-    run_assessment,
-    get_assessment_result,
-    get_scan_result_with_timestamp,
-)
-from app.scanner.base import ScanResult, Finding, Severity, Confidence, FindingType
-from app.core.error_codes import (
-    REPAIR_PLAN_INTERNAL_ERROR,
-    REPAIR_PLAN_PERSIST_FAILED,
-    REPAIR_PLAN_TOO_LARGE,
-    REPAIR_PLAN_NOT_AVAILABLE,
-    INTERNAL_ERROR,
-)
 from tests.conftest import make_normal_tarball
-
 
 # ---------------------------------------------------------------------------
 # --- Fixtures ---
@@ -275,16 +274,14 @@ class TestRepairPipeline:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            return_value=scan_result,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    return_value=scan_result,
-                ):
-                    _run_pipeline(task.id)
+            _run_pipeline(task.id)
 
         # 任务应已完成
         result = task_manager.get_task(task.id)
@@ -320,20 +317,17 @@ class TestRepairPipeline:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            return_value=scan_result,
+        ), patch(
+            "app.services.background_runner.generate_and_save_repair_plan",
+            side_effect=RepairPlanInternalError("test"),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    return_value=scan_result,
-                ):
-                    with patch(
-                        "app.services.background_runner.generate_and_save_repair_plan",
-                        side_effect=RepairPlanInternalError("test"),
-                    ):
-                        await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         result = task_manager.get_task(task.id)
         assert result.status == "failed"
@@ -359,20 +353,17 @@ class TestRepairPipeline:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            return_value=scan_result,
+        ), patch(
+            "app.services.background_runner.generate_and_save_repair_plan",
+            side_effect=RepairPlanPersistError("test"),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    return_value=scan_result,
-                ):
-                    with patch(
-                        "app.services.background_runner.generate_and_save_repair_plan",
-                        side_effect=RepairPlanPersistError("test"),
-                    ):
-                        await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         result = task_manager.get_task(task.id)
         assert result.status == "failed"
@@ -395,20 +386,17 @@ class TestRepairPipeline:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            return_value=scan_result,
+        ), patch(
+            "app.services.background_runner.generate_and_save_repair_plan",
+            side_effect=RepairPlanTooLargeError("test"),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    return_value=scan_result,
-                ):
-                    with patch(
-                        "app.services.background_runner.generate_and_save_repair_plan",
-                        side_effect=RepairPlanTooLargeError("test"),
-                    ):
-                        await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         result = task_manager.get_task(task.id)
         assert result.status == "failed"
@@ -436,20 +424,17 @@ class TestRepairPipeline:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            return_value=scan_result,
+        ), patch(
+            "app.services.background_runner.mark_completed",
+            side_effect=RuntimeError("DB error during mark_completed"),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    return_value=scan_result,
-                ):
-                    with patch(
-                        "app.services.background_runner.mark_completed",
-                        side_effect=RuntimeError("DB error during mark_completed"),
-                    ):
-                        _run_pipeline(task.id)
+            _run_pipeline(task.id)
 
         # 任务应被标记为 failed（由外层 except 捕获 mark_completed 异常）
         result = task_manager.get_task(task.id)
@@ -499,24 +484,20 @@ class TestRepairPipeline:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download1,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract1,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            return_value=scan1,
+        ), patch(
+            "app.services.background_runner.cleanup_download",
+            side_effect=cleanup_dl_1,
+        ), patch(
+            "app.services.background_runner.cleanup_temp_dir",
+            side_effect=cleanup_tmp_1,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract1,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    return_value=scan1,
-                ):
-                    with patch(
-                        "app.services.background_runner.cleanup_download",
-                        side_effect=cleanup_dl_1,
-                    ):
-                        with patch(
-                            "app.services.background_runner.cleanup_temp_dir",
-                            side_effect=cleanup_tmp_1,
-                        ):
-                            _run_pipeline(task1.id)
+            _run_pipeline(task1.id)
 
         cleanup_dl_1.assert_called_once()
         cleanup_tmp_1.assert_called_once()
@@ -536,28 +517,23 @@ class TestRepairPipeline:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download2,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract2,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            return_value=scan2,
+        ), patch(
+            "app.services.background_runner.generate_and_save_repair_plan",
+            side_effect=RepairPlanInternalError("test"),
+        ), patch(
+            "app.services.background_runner.cleanup_download",
+            side_effect=cleanup_dl_2,
+        ), patch(
+            "app.services.background_runner.cleanup_temp_dir",
+            side_effect=cleanup_tmp_2,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract2,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    return_value=scan2,
-                ):
-                    with patch(
-                        "app.services.background_runner.generate_and_save_repair_plan",
-                        side_effect=RepairPlanInternalError("test"),
-                    ):
-                        with patch(
-                            "app.services.background_runner.cleanup_download",
-                            side_effect=cleanup_dl_2,
-                        ):
-                            with patch(
-                                "app.services.background_runner.cleanup_temp_dir",
-                                side_effect=cleanup_tmp_2,
-                            ):
-                                _run_pipeline(task2.id)
+            _run_pipeline(task2.id)
 
         cleanup_dl_2.assert_called_once()
         cleanup_tmp_2.assert_called_once()
@@ -577,28 +553,23 @@ class TestRepairPipeline:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download3,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract3,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            return_value=scan3,
+        ), patch(
+            "app.services.background_runner.mark_completed",
+            side_effect=RuntimeError("mark_completed failed"),
+        ), patch(
+            "app.services.background_runner.cleanup_download",
+            side_effect=cleanup_dl_3,
+        ), patch(
+            "app.services.background_runner.cleanup_temp_dir",
+            side_effect=cleanup_tmp_3,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract3,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    return_value=scan3,
-                ):
-                    with patch(
-                        "app.services.background_runner.mark_completed",
-                        side_effect=RuntimeError("mark_completed failed"),
-                    ):
-                        with patch(
-                            "app.services.background_runner.cleanup_download",
-                            side_effect=cleanup_dl_3,
-                        ):
-                            with patch(
-                                "app.services.background_runner.cleanup_temp_dir",
-                                side_effect=cleanup_tmp_3,
-                            ):
-                                _run_pipeline(task3.id)
+            _run_pipeline(task3.id)
 
         cleanup_dl_3.assert_called_once()
         cleanup_tmp_3.assert_called_once()
@@ -635,19 +606,17 @@ class TestRepairPipeline:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            return_value=scan_result,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    return_value=scan_result,
-                ):
-                    results = await asyncio.gather(
-                        background_runner._process_task(task.id),
-                        health_check(),
-                    )
+            results = await asyncio.gather(
+                background_runner._process_task(task.id),
+                health_check(),
+            )
 
         # 健康检查应已完成
         assert len(health_results) == 1
@@ -685,20 +654,17 @@ class TestRepairPipeline:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            return_value=scan_result,
+        ), patch(
+            "app.services.background_runner.generate_and_save_repair_plan",
+            side_effect=capture_stage,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    return_value=scan_result,
-                ):
-                    with patch(
-                        "app.services.background_runner.generate_and_save_repair_plan",
-                        side_effect=capture_stage,
-                    ):
-                        _run_pipeline(task.id)
+            _run_pipeline(task.id)
 
         # 在修复计划生成期间，任务阶段应为 repairing
         assert captured.get("stage") == "repairing"
@@ -730,20 +696,17 @@ class TestRepairPipeline:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            return_value=scan_result,
+        ), patch(
+            "app.services.background_runner.generate_and_save_repair_plan",
+            side_effect=RepairPlanInternalError("test"),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    return_value=scan_result,
-                ):
-                    with patch(
-                        "app.services.background_runner.generate_and_save_repair_plan",
-                        side_effect=RepairPlanInternalError("test"),
-                    ):
-                        _run_pipeline(task.id)
+            _run_pipeline(task.id)
 
         # 任务应为 failed
         result = task_manager.get_task(task.id)

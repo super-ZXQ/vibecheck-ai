@@ -32,7 +32,6 @@ from app.services import background_runner, task_manager
 from app.services.upload_service import upload_source_dir
 from tests.conftest import make_normal_tarball
 
-
 # --- Fixtures (mirror test_task_api) ---
 
 @pytest.fixture

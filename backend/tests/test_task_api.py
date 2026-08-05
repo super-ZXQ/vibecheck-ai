@@ -29,6 +29,7 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
+from app.core.error_codes import SCAN_RESULT_NOT_READY
 from app.core.github import (
     DownloadResult,
     GitHubDownloadError,
@@ -38,11 +39,9 @@ from app.core.safe_extract import (
     ExtractionError,
     ExtractionResult,
 )
-from app.core.error_codes import SCAN_RESULT_NOT_READY
 from app.db import database
 from app.services import background_runner, task_manager
 from tests.conftest import SYNTHETIC_GITHUB_TOKEN
-
 
 # --- Fixtures ---
 
@@ -235,12 +234,11 @@ class TestTaskLifecycle:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=make_mock_download_result(tmp_path),
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            side_effect=mock_extract,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                side_effect=mock_extract,
-            ):
-                await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         result = task_manager.get_task(task.id)
         assert result.status == "completed"
@@ -331,12 +329,11 @@ class TestTaskLifecycle:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            side_effect=ExtractionError("Rejected path traversal: '../../etc/passwd'"),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                side_effect=ExtractionError("Rejected path traversal: '../../etc/passwd'"),
-            ):
-                await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         result = task_manager.get_task(task.id)
         assert result.status == "failed"
@@ -360,14 +357,13 @@ class TestTaskLifecycle:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            side_effect=ExtractionError(
+                "Total extracted size exceeds limit: 99999 bytes"
+            ),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                side_effect=ExtractionError(
-                    "Total extracted size exceeds limit: 99999 bytes"
-                ),
-            ):
-                await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         result = task_manager.get_task(task.id)
         assert result.status == "failed"
@@ -411,12 +407,11 @@ class TestConcurrency:
         with patch(
             "app.services.background_runner.download_tarball",
             side_effect=slow_download,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            side_effect=mock_extract,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                side_effect=mock_extract,
-            ):
-                await background_runner.trigger_queue_processing()
+            await background_runner.trigger_queue_processing()
 
         # All tasks should be completed
         for t in tasks:
@@ -506,12 +501,11 @@ class TestCompletedAt:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=make_mock_download_result(tmp_path),
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=make_mock_extract_result(tmp_path),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=make_mock_extract_result(tmp_path),
-            ):
-                await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         result = task_manager.get_task(task.id)
         assert result.status == "completed"
@@ -572,12 +566,11 @@ class TestTempFileCleanup:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         # Task should be completed
         result = task_manager.get_task(task.id)
@@ -627,12 +620,11 @@ class TestTempFileCleanup:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            side_effect=ExtractionError("Rejected symlink entry: 'evil_link'"),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                side_effect=ExtractionError("Rejected symlink entry: 'evil_link'"),
-            ):
-                await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         result = task_manager.get_task(task.id)
         assert result.status == "failed"
@@ -661,12 +653,11 @@ class TestSQLitePersistence:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=make_mock_download_result(tmp_path),
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=make_mock_extract_result(tmp_path),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=make_mock_extract_result(tmp_path),
-            ):
-                await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         # Verify task is completed
         result = task_manager.get_task(task.id)
@@ -706,12 +697,11 @@ class TestScanSummaryInPolling:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=make_mock_download_result(tmp_path),
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=make_mock_extract_result(tmp_path),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=make_mock_extract_result(tmp_path),
-            ):
-                await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         response = client.get(f"/api/check/{task.id}")
         assert response.status_code == 200
@@ -734,12 +724,11 @@ class TestScanSummaryInPolling:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=make_mock_download_result(tmp_path),
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=make_mock_extract_result(tmp_path),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=make_mock_extract_result(tmp_path),
-            ):
-                await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         response = client.get(f"/api/check/{task.id}")
         data = response.json()
@@ -757,12 +746,11 @@ class TestScanSummaryInPolling:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=make_mock_download_result(tmp_path),
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=make_mock_extract_result(tmp_path),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=make_mock_extract_result(tmp_path),
-            ):
-                await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         response = client.get(f"/api/check/{task.id}")
         data = response.json()
@@ -804,12 +792,11 @@ class TestResultEndpoint:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=make_mock_download_result(tmp_path),
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=make_mock_extract_result(tmp_path),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=make_mock_extract_result(tmp_path),
-            ):
-                await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         response = client.get(f"/api/check/{task.id}/result")
         assert response.status_code == 200
@@ -833,12 +820,11 @@ class TestResultEndpoint:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=make_mock_download_result(tmp_path),
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=make_mock_extract_result(tmp_path),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=make_mock_extract_result(tmp_path),
-            ):
-                await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         poll_response = client.get(f"/api/check/{task.id}")
         result_response = client.get(f"/api/check/{task.id}/result")
@@ -918,12 +904,11 @@ class TestResultEndpoint:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         response = client.get(f"/api/check/{task.id}/result")
         # The raw token should NOT appear anywhere in the response
@@ -941,12 +926,11 @@ class TestResultEndpoint:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=make_mock_download_result(tmp_path),
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=make_mock_extract_result(tmp_path),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=make_mock_extract_result(tmp_path),
-            ):
-                await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         response = client.get(f"/api/check/{task.id}/result")
         # The temp directory path should NOT appear in the response

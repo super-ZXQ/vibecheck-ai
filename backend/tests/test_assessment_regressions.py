@@ -1,4 +1,4 @@
-"""P0-6 安全评估引擎回归测试。
+r"""P0-6 安全评估引擎回归测试。
 
 覆盖以下边界情况和安全回归测试：
 
@@ -18,9 +18,8 @@ import json
 
 import pytest
 
-from app.services.assessment_service import assess_scan_result
 from app.db import database
-
+from app.services.assessment_service import assess_scan_result
 
 # ---------------------------------------------------------------------------
 # --- Fixtures ---
@@ -305,7 +304,7 @@ class TestNoSecretLeakage:
 # ============================================================
 
 class TestNoTempPathLeakage:
-    """assessment_json 不包含临时路径（/tmp/, C:\）。"""
+    r"""assessment_json 不包含临时路径（/tmp/, C:\）。"""
 
     def test_no_temp_path_in_clean_assessment(self):
         """干净输入的评估结果不包含临时路径。"""

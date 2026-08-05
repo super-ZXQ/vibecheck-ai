@@ -14,24 +14,11 @@
 
 import asyncio
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app
-from app.db import database
-from app.services import task_manager
-from app.services.background_runner import _process_task, reset_runner_state
-from app.services.assessment_service import (
-    get_assessment_result,
-    get_assessment_score_verdict,
-    AssessmentInternalError,
-    AssessmentPersistError,
-    AssessmentResultTooLargeError,
-)
-from app.services.scan_result_service import get_scan_result
-from app.scanner.base import ScanResult, Finding, Severity, Confidence, FindingType
 from app.core.error_codes import (
     ASSESSMENT_INTERNAL_ERROR,
     ASSESSMENT_PERSIST_FAILED,
@@ -39,7 +26,19 @@ from app.core.error_codes import (
 )
 from app.core.github import DownloadResult, parse_repo_url
 from app.core.safe_extract import ExtractionResult
-
+from app.db import database
+from app.main import app
+from app.scanner.base import Confidence, Finding, FindingType, ScanResult, Severity
+from app.services import task_manager
+from app.services.assessment_service import (
+    AssessmentInternalError,
+    AssessmentPersistError,
+    AssessmentResultTooLargeError,
+    get_assessment_result,
+    get_assessment_score_verdict,
+)
+from app.services.background_runner import _process_task, reset_runner_state
+from app.services.scan_result_service import get_scan_result
 
 # ---------------------------------------------------------------------------
 # --- Fixtures ---
@@ -172,16 +171,14 @@ class TestAssessmentPipeline:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            return_value=scan_result,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    return_value=scan_result,
-                ):
-                    _run_pipeline(task.id)
+            _run_pipeline(task.id)
 
         # 验证任务已完成
         result = task_manager.get_task(task.id)
@@ -218,16 +215,14 @@ class TestAssessmentPipeline:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            return_value=scan_result,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    return_value=scan_result,
-                ):
-                    _run_pipeline(task.id)
+            _run_pipeline(task.id)
 
         # 验证临时文件已被清理
         assert not download_result.temp_file.exists()
@@ -271,24 +266,20 @@ class TestAssessmentPipeline:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            return_value=scan_result,
+        ), patch(
+            "app.services.background_runner.run_assessment",
+            side_effect=Exception("Assessment computation failed"),
+        ), patch(
+            "app.services.background_runner.mark_completed",
+            side_effect=tracking_mark_completed,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    return_value=scan_result,
-                ):
-                    with patch(
-                        "app.services.background_runner.run_assessment",
-                        side_effect=Exception("Assessment computation failed"),
-                    ):
-                        with patch(
-                            "app.services.background_runner.mark_completed",
-                            side_effect=tracking_mark_completed,
-                        ):
-                            _run_pipeline(task.id)
+            _run_pipeline(task.id)
 
         # mark_completed 不应被调用
         assert mark_completed_called is False
@@ -311,20 +302,17 @@ class TestAssessmentPipeline:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            return_value=scan_result,
+        ), patch(
+            "app.services.background_runner.run_assessment",
+            side_effect=AssessmentInternalError("Computation failed"),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    return_value=scan_result,
-                ):
-                    with patch(
-                        "app.services.background_runner.run_assessment",
-                        side_effect=AssessmentInternalError("Computation failed"),
-                    ):
-                        _run_pipeline(task.id)
+            _run_pipeline(task.id)
 
         result = task_manager.get_task(task.id)
         assert result.status == "failed"
@@ -343,20 +331,17 @@ class TestAssessmentPipeline:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            return_value=scan_result,
+        ), patch(
+            "app.services.background_runner.run_assessment",
+            side_effect=AssessmentPersistError("DB write failed"),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    return_value=scan_result,
-                ):
-                    with patch(
-                        "app.services.background_runner.run_assessment",
-                        side_effect=AssessmentPersistError("DB write failed"),
-                    ):
-                        _run_pipeline(task.id)
+            _run_pipeline(task.id)
 
         result = task_manager.get_task(task.id)
         assert result.status == "failed"
@@ -375,20 +360,17 @@ class TestAssessmentPipeline:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            return_value=scan_result,
+        ), patch(
+            "app.services.background_runner.run_assessment",
+            side_effect=AssessmentResultTooLargeError("Too large"),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    return_value=scan_result,
-                ):
-                    with patch(
-                        "app.services.background_runner.run_assessment",
-                        side_effect=AssessmentResultTooLargeError("Too large"),
-                    ):
-                        _run_pipeline(task.id)
+            _run_pipeline(task.id)
 
         result = task_manager.get_task(task.id)
         assert result.status == "failed"
@@ -414,20 +396,17 @@ class TestAssessmentPipeline:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            return_value=scan_result,
+        ), patch(
+            "app.services.background_runner.mark_completed",
+            side_effect=RuntimeError("DB error during mark_completed"),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    return_value=scan_result,
-                ):
-                    with patch(
-                        "app.services.background_runner.mark_completed",
-                        side_effect=RuntimeError("DB error during mark_completed"),
-                    ):
-                        _run_pipeline(task.id)
+            _run_pipeline(task.id)
 
         # 任务应被标记为 failed（由外层 except 捕获 mark_completed 异常）
         result = task_manager.get_task(task.id)
@@ -469,24 +448,20 @@ class TestAssessmentPipeline:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download1,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract1,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            return_value=scan1,
+        ), patch(
+            "app.services.background_runner.cleanup_download",
+            side_effect=cleanup_download_called_1,
+        ), patch(
+            "app.services.background_runner.cleanup_temp_dir",
+            side_effect=cleanup_temp_called_1,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract1,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    return_value=scan1,
-                ):
-                    with patch(
-                        "app.services.background_runner.cleanup_download",
-                        side_effect=cleanup_download_called_1,
-                    ):
-                        with patch(
-                            "app.services.background_runner.cleanup_temp_dir",
-                            side_effect=cleanup_temp_called_1,
-                        ):
-                            _run_pipeline(task1.id)
+            _run_pipeline(task1.id)
 
         cleanup_download_called_1.assert_called_once()
         cleanup_temp_called_1.assert_called_once()
@@ -504,24 +479,20 @@ class TestAssessmentPipeline:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download2,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract2,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            side_effect=RuntimeError("Scan error"),
+        ), patch(
+            "app.services.background_runner.cleanup_download",
+            side_effect=cleanup_download_called_2,
+        ), patch(
+            "app.services.background_runner.cleanup_temp_dir",
+            side_effect=cleanup_temp_called_2,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract2,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    side_effect=RuntimeError("Scan error"),
-                ):
-                    with patch(
-                        "app.services.background_runner.cleanup_download",
-                        side_effect=cleanup_download_called_2,
-                    ):
-                        with patch(
-                            "app.services.background_runner.cleanup_temp_dir",
-                            side_effect=cleanup_temp_called_2,
-                        ):
-                            _run_pipeline(task2.id)
+            _run_pipeline(task2.id)
 
         cleanup_download_called_2.assert_called_once()
         cleanup_temp_called_2.assert_called_once()
@@ -540,28 +511,23 @@ class TestAssessmentPipeline:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download3,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract3,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            return_value=scan3,
+        ), patch(
+            "app.services.background_runner.run_assessment",
+            side_effect=Exception("Assessment failed"),
+        ), patch(
+            "app.services.background_runner.cleanup_download",
+            side_effect=cleanup_download_called_3,
+        ), patch(
+            "app.services.background_runner.cleanup_temp_dir",
+            side_effect=cleanup_temp_called_3,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract3,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    return_value=scan3,
-                ):
-                    with patch(
-                        "app.services.background_runner.run_assessment",
-                        side_effect=Exception("Assessment failed"),
-                    ):
-                        with patch(
-                            "app.services.background_runner.cleanup_download",
-                            side_effect=cleanup_download_called_3,
-                        ):
-                            with patch(
-                                "app.services.background_runner.cleanup_temp_dir",
-                                side_effect=cleanup_temp_called_3,
-                            ):
-                                _run_pipeline(task3.id)
+            _run_pipeline(task3.id)
 
         cleanup_download_called_3.assert_called_once()
         cleanup_temp_called_3.assert_called_once()
@@ -591,17 +557,15 @@ class TestAssessmentPipeline:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            return_value=scan_result,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    return_value=scan_result,
-                ):
-                    # 如果管道阻塞，asyncio.run 会超时抛出 TimeoutError
-                    asyncio.run(_run_with_timeout())
+            # 如果管道阻塞，asyncio.run 会超时抛出 TimeoutError
+            asyncio.run(_run_with_timeout())
 
         # 管道成功完成，事件循环未阻塞
         result = task_manager.get_task(task.id)

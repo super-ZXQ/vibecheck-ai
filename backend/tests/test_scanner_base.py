@@ -6,6 +6,7 @@ Test count: 5
 """
 
 import dataclasses
+
 import pytest
 
 from app.scanner.base import (
@@ -15,7 +16,6 @@ from app.scanner.base import (
     ScanResult,
     Severity,
 )
-
 
 # ============================================================================
 # --- Immutability tests (3 tests) ---

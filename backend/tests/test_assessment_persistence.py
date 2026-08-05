@@ -23,26 +23,29 @@ import pytest
 
 from app.db import database
 from app.db.database import _get_connection
+from app.scanner.base import (
+    Confidence,
+    Finding,
+    FindingType,
+    ScanResult,
+    Severity,
+)
 from app.services import task_manager
 from app.services.assessment_service import (
+    AssessmentInternalError,
+    AssessmentResultTooLargeError,
     assess_scan_result,
-    save_assessment_result,
     get_assessment_result,
     get_assessment_score_verdict,
     get_scan_result_with_timestamp,
     run_assessment,
-    AssessmentInternalError,
-    AssessmentResultTooLargeError,
+    save_assessment_result,
 )
 from app.services.scan_result_service import save_scan_result
-from app.scanner.base import (
-    Finding, ScanResult, Severity, Confidence, FindingType,
-)
 from tests.conftest import (
-    SYNTHETIC_GITHUB_TOKEN,
     SYNTHETIC_AWS_KEY,
+    SYNTHETIC_GITHUB_TOKEN,
 )
-
 
 # ---------------------------------------------------------------------------
 # --- Fixtures ---

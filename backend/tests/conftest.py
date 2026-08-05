@@ -12,7 +12,6 @@ from pathlib import Path
 
 import pytest
 
-
 # --- Synthetic test constants ---
 # These strings have the correct FORMAT but are NOT real, valid credentials.
 # Runtime-constructed mixed-character values to avoid low-entropy patterns.

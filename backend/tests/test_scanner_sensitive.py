@@ -28,7 +28,6 @@ from app.scanner.rules import (
 )
 from app.scanner.sensitive import scan_directory
 
-
 # --- Runtime-constructed mixed-character synthetic values (NOT real credentials) ---
 _MIXED = "aB1cD2eF3gH4iJ5kL6mN7oP8qR9sT0uV1wX2yZ3aB1cD2eF3gH4"
 SYNTH_GITHUB_TOKEN = "ghp_" + _MIXED[:36]
@@ -313,7 +312,7 @@ class TestBytesFirstBinaryDetection:
         """
         # Write a file with UTF-8 BOM + secret on first line
         bom = b'\xef\xbb\xbf'
-        content = bom + f'GITHUB_TOKEN = "{SYNTH_GITHUB_TOKEN}"\n'.encode("utf-8")
+        content = bom + f'GITHUB_TOKEN = "{SYNTH_GITHUB_TOKEN}"\n'.encode()
         (tmp_path / "config.py").write_bytes(content)
 
         result = scan_directory(tmp_path)

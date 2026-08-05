@@ -10,7 +10,6 @@ Test count: 28
 import pytest
 
 from app.core.security.desensitize import (
-    Assignment,
     AWS_ACCESS_KEY,
     AWS_SECRET_KEY,
     CATEGORY_AWS_SECRET,
@@ -22,6 +21,7 @@ from app.core.security.desensitize import (
     GOOGLE_API_KEY,
     PASSWORD,
     PRIVATE_KEY,
+    Assignment,
     classify_key,
     is_already_masked,
     is_env_reference,
@@ -31,7 +31,6 @@ from app.core.security.desensitize import (
     mask_snippet,
     parse_assignment_value,
 )
-
 
 # --- Runtime-constructed mixed-character synthetic values (NOT real credentials) ---
 # Built from character pools to avoid hardcoding valid-looking tokens and

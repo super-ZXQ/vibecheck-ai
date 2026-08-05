@@ -12,6 +12,12 @@ from unittest.mock import patch
 
 import pytest
 
+from app.core.error_codes import (
+    ASSESSMENT_TIMEOUT,
+    EXTRACT_TIMEOUT,
+    REPAIR_PLAN_TIMEOUT,
+    SCAN_TIMEOUT,
+)
 from app.db import database
 from app.services import background_runner, task_manager
 from app.services.cleanup_service import (
@@ -20,20 +26,13 @@ from app.services.cleanup_service import (
     reset_cleanup_counter,
 )
 from app.services.task_manager import (
-    STATUS_PENDING,
-    STATUS_RUNNING,
     STATUS_COMPLETED,
     STATUS_FAILED,
+    STATUS_PENDING,
+    STATUS_RUNNING,
     IllegalStateTransitionError,
     _validate_transition,
 )
-from app.core.error_codes import (
-    EXTRACT_TIMEOUT,
-    SCAN_TIMEOUT,
-    ASSESSMENT_TIMEOUT,
-    REPAIR_PLAN_TIMEOUT,
-)
-
 
 # ---------------------------------------------------------------------------
 # --- Fixtures ---
@@ -198,8 +197,9 @@ class TestCleanupExpiredTasks:
 
     def test_deletes_expired_tasks(self, test_db, monkeypatch):
         """删除过期的已完成任务。"""
-        from app.db.database import _get_connection
         from datetime import datetime, timedelta, timezone
+
+        from app.db.database import _get_connection
 
         # Create a task and mark it completed
         task = task_manager.create_task(
@@ -259,8 +259,9 @@ class TestCleanupExpiredTasks:
 
     def test_deletes_related_data(self, test_db, monkeypatch):
         """删除任务时同时删除关联数据。"""
-        from app.db.database import _get_connection, now_iso
         from datetime import datetime, timedelta, timezone
+
+        from app.db.database import _get_connection, now_iso
 
         monkeypatch.setattr(
             "app.core.config.settings.report_ttl_hours", 72

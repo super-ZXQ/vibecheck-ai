@@ -17,9 +17,9 @@ import pytest
 
 from app.db import database
 from app.services.llm_fallback_templates import (
-    get_fallback_template,
-    GENERIC_FALLBACK,
     FALLBACK_TEMPLATES,
+    GENERIC_FALLBACK,
+    get_fallback_template,
 )
 from app.services.llm_service import (
     _build_llm_prompt,
@@ -34,7 +34,6 @@ from app.services.llm_service import (
     get_llm_analysis_available,
     get_llm_analysis_summary,
 )
-
 
 # ---------------------------------------------------------------------------
 # --- Fixtures ---
@@ -537,8 +536,8 @@ class TestPersistence:
 
     def test_persist_and_retrieve(self, test_db):
         """持久化后能检索到结果。"""
-        from app.services.task_manager import create_task
         from app.db.database import _get_connection, now_iso
+        from app.services.task_manager import create_task
 
         task = create_task("https://github.com/test/repo", "test", "repo")
 
@@ -628,8 +627,8 @@ class TestPersistence:
 
     def test_empty_findings_persists_empty_result(self, test_db):
         """无非阻断 finding 时持久化空结果。"""
-        from app.services.task_manager import create_task
         from app.db.database import _get_connection, now_iso
+        from app.services.task_manager import create_task
 
         task = create_task("https://github.com/test/repo", "test", "repo")
         scan_result_json = json.dumps({
@@ -701,8 +700,8 @@ class TestNonBlockingContract:
 
     def test_persistence_failure_returns_empty(self, test_db, monkeypatch):
         """持久化失败时返回空 dict，不抛出异常。"""
-        from app.services.task_manager import create_task
         from app.db.database import _get_connection, now_iso
+        from app.services.task_manager import create_task
 
         task = create_task("https://github.com/test/repo", "test", "repo")
 

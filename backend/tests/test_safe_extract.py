@@ -8,23 +8,21 @@ import pytest
 
 from app.core.safe_extract import (
     ExtractionError,
-    safe_extract,
-    cleanup_temp_dir,
     _validate_member_name,
+    cleanup_temp_dir,
+    safe_extract,
 )
-
 from tests.conftest import (
-    make_normal_tarball,
-    make_traversal_tarball,
-    make_symlink_tarball,
-    make_hardlink_tarball,
+    make_absolute_path_tarball,
     make_device_tarball,
     make_fifo_tarball,
-    make_oversized_tarball,
+    make_hardlink_tarball,
     make_many_files_tarball,
-    make_absolute_path_tarball,
+    make_normal_tarball,
+    make_oversized_tarball,
+    make_symlink_tarball,
+    make_traversal_tarball,
 )
-
 
 # --- Normal extraction ---
 

@@ -19,7 +19,6 @@ from app.db.database import (
     validate_production_database_path,
 )
 
-
 # ---------------------------------------------------------------------------
 # Platform detection — symlink tests are skipped where unsupported.
 # ---------------------------------------------------------------------------

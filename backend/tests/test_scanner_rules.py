@@ -7,7 +7,7 @@ Test count: 28
 """
 
 
-from app.scanner.base import Finding, FindingType, Severity, Confidence
+from app.scanner.base import Confidence, Finding, FindingType, Severity
 from app.scanner.rules import (
     AWSAccessKeyRule,
     AWSSecretKeyRule,
@@ -20,7 +20,6 @@ from app.scanner.rules import (
     PrivateKeyRule,
     ProductionEnvWithSecretRule,
 )
-
 
 # --- Runtime-constructed mixed-character synthetic values (NOT real credentials) ---
 _MIXED = "aB1cD2eF3gH4iJ5kL6mN7oP8qR9sT0uV1wX2yZ3aB1cD2eF3gH4"

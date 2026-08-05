@@ -6,8 +6,7 @@ They test URL parsing, validation, and redirect host checking only.
 
 import pytest
 
-from app.core.github import GitHubDownloadError, parse_repo_url, is_allowed_redirect
-
+from app.core.github import GitHubDownloadError, is_allowed_redirect, parse_repo_url
 
 # --- Valid URL tests ---
 

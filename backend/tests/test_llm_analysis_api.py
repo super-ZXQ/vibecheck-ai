@@ -17,11 +17,10 @@ import uuid
 import pytest
 from fastapi.testclient import TestClient
 
+from app.core.error_codes import LLM_ANALYSIS_NOT_READY
 from app.db import database
 from app.services import background_runner, task_manager
 from app.services.llm_service import generate_and_save_llm_analysis
-from app.core.error_codes import LLM_ANALYSIS_NOT_READY
-
 
 # ---------------------------------------------------------------------------
 # --- Fixtures ---

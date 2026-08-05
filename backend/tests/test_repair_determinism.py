@@ -26,18 +26,17 @@ import json
 import pytest
 
 from app.db import database
-from app.services.repair_service import generate_repair_plan
 from app.services.repair_policy import (
+    ACTION_RERUN_SECURITY_SCAN,
+    ACTION_REVOKE_OR_ROTATE_SECRET,
+    ACTION_VERIFY_NO_SECRET_REMAINS,
+    CONFIDENCE_ORDER,
     POLICY_VERSION,
     REPAIR_SCHEMA_VERSION,
     REPAIR_SCOPE,
     SEVERITY_ORDER,
-    CONFIDENCE_ORDER,
-    ACTION_REVOKE_OR_ROTATE_SECRET,
-    ACTION_VERIFY_NO_SECRET_REMAINS,
-    ACTION_RERUN_SECURITY_SCAN,
 )
-
+from app.services.repair_service import generate_repair_plan
 
 # ---------------------------------------------------------------------------
 # --- Fixtures ---

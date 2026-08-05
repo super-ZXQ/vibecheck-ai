@@ -21,14 +21,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.db import database
-from app.services import background_runner
-from app.services import llm_user_config
+from app.services import background_runner, llm_user_config
 from app.services.llm_service import (
     _call_llm_api,
     _resolve_llm_config,
     generate_and_save_llm_analysis,
 )
-
 
 # --- Fixtures (mirror test_upload_api) ---
 

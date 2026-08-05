@@ -29,18 +29,17 @@ import pytest
 from app.core.config import settings
 from app.db import database
 from app.db.database import _get_connection
-from app.services.repair_policy import *  # noqa: F401, F403
+from app.services.repair_policy import *
 from app.services.repair_service import (
-    generate_repair_plan,
-    serialize_repair_plan,
-    save_repair_result,
-    get_repair_result,
     RepairPlanInternalError,
-    RepairPlanTooLargeError,
     RepairPlanSerializationError,
+    RepairPlanTooLargeError,
+    generate_repair_plan,
+    get_repair_result,
+    save_repair_result,
+    serialize_repair_plan,
 )
 from app.services.task_manager import create_task, mark_completed
-
 
 # ---------------------------------------------------------------------------
 # --- Fixtures ---

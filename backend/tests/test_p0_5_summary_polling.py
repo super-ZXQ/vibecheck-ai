@@ -47,7 +47,6 @@ from app.services.scan_result_service import (
     save_scan_result,
 )
 
-
 # ---------------------------------------------------------------------------
 # --- Synthetic token (runtime-constructed, format-correct) ---
 # ---------------------------------------------------------------------------
@@ -432,16 +431,14 @@ class TestFailedWithResidualResult:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.mark_completed",
+            side_effect=RuntimeError("simulated mark_completed failure"),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.mark_completed",
-                    side_effect=RuntimeError("simulated mark_completed failure"),
-                ):
-                    await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         # Task must be failed
         task_record = task_manager.get_task(task.id)

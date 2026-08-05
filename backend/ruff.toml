@@ -22,6 +22,13 @@ ignore = [
     "ASYNC230",
     "SIM115",
     "UP017",
+    # --- test-specific (acceptable in test code) ---
+    "SIM117",   # nested with → combined with (readability trade-off in mocks)
+    "C408",     # dict() → {} (readability trade-off in test fixtures)
+    "RUF059",   # unused unpacked variable (test assertions on specific fields)
+    "PERF402",  # manual list copy (minor perf in test helpers)
+    "SIM118",   # in dict.keys() (readability in test assertions)
+    "RUF012",   # mutable class default (test parametrize lists)
 ]
 
 [lint.per-file-ignores]

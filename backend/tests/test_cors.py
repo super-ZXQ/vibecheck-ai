@@ -18,7 +18,6 @@ from pydantic import ValidationError
 
 from app.core.config import Settings
 
-
 # ---------------------------------------------------------------------------
 # --- Fixtures ---
 # ---------------------------------------------------------------------------
@@ -33,7 +32,7 @@ def test_db(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "app.core.config.settings.tmp_dir", str(tmp_path / "tmp")
     )
-    import app.db.database as database
+    from app.db import database
     database._initialized = False
     database.init_db()
     yield db_path

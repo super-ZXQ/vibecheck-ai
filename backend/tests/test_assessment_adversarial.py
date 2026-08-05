@@ -47,29 +47,32 @@ from types import MappingProxyType
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app
 from app.db import database
 from app.db.database import _get_connection
+from app.main import app
+from app.scanner.base import (
+    Confidence,
+    Finding,
+    FindingType,
+    ScanResult,
+    Severity,
+)
 from app.services import task_manager
 from app.services.assessment_policy import (
-    POLICY_VERSION,
-    SEVERITY_BASE_POINTS,
-    CONFIDENCE_PERCENT,
-    RULE_CAP_BY_SEVERITY,
     CAP_BLOCKING,
+    CONFIDENCE_PERCENT,
+    POLICY_VERSION,
+    RULE_CAP_BY_SEVERITY,
+    SEVERITY_BASE_POINTS,
 )
 from app.services.assessment_service import (
     assess_scan_result,
-    save_assessment_result,
-    serialize_assessment_result,
     get_assessment_result,
     run_assessment,
+    save_assessment_result,
+    serialize_assessment_result,
 )
 from app.services.scan_result_service import save_scan_result
-from app.scanner.base import (
-    Finding, ScanResult, Severity, Confidence, FindingType,
-)
-
 
 # ---------------------------------------------------------------------------
 # --- Synthetic test constants ---

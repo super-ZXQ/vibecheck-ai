@@ -56,15 +56,17 @@ import pytest
 from app.core.config import settings
 from app.db import database
 from app.services.repair_policy import *
-from app.services.repair_service import (
-    generate_repair_plan, serialize_repair_plan,
-    RepairPlanInternalError, RepairPlanTooLargeError,
-)
 from app.services.repair_policy import (
-    _COMMAND_ALLOWLIST, get_allowed_commands,
+    _COMMAND_ALLOWLIST,
+    get_allowed_commands,
     is_command_allowed,
 )
-
+from app.services.repair_service import (
+    RepairPlanInternalError,
+    RepairPlanTooLargeError,
+    generate_repair_plan,
+    serialize_repair_plan,
+)
 
 # ---------------------------------------------------------------------------
 # --- Fixtures ---

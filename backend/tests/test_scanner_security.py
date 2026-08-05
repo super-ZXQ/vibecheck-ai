@@ -32,10 +32,9 @@ import sys
 
 import pytest
 
-from app.scanner.base import Confidence, SENSITIVE_DATA_DIMENSION, Severity
+from app.scanner.base import SENSITIVE_DATA_DIMENSION, Confidence, Severity
 from app.scanner.rules import PrivateKeyRule
 from app.scanner.sensitive import scan_directory
-
 
 # --- Runtime-constructed mixed-character synthetic values (NOT real credentials) ---
 _MIXED = "aB1cD2eF3gH4iJ5kL6mN7oP8qR9sT0uV1wX2yZ3aB1cD2eF3gH4"
@@ -1204,8 +1203,8 @@ class TestRuleSemantics:
 
     def test_r003_high_confidence_blocking(self):
         """R003 (AWS Secret Key) is high confidence and blocking after strict context match."""
-        from app.scanner.rules import AWSSecretKeyRule
         from app.scanner.base import Confidence
+        from app.scanner.rules import AWSSecretKeyRule
 
         rule = AWSSecretKeyRule()
         lines = [f"aws_secret_access_key={SYNTH_AWS_SECRET}"]
@@ -1234,12 +1233,12 @@ class TestRuleSemantics:
 
     def test_r006_r008_medium_confidence_non_blocking(self):
         """R006-R008 remain medium confidence and non-blocking."""
-        from app.scanner.rules import (
-            PasswordAssignmentRule,
-            GenericTokenAssignmentRule,
-            ConnectionStringRule,
-        )
         from app.scanner.base import Confidence
+        from app.scanner.rules import (
+            ConnectionStringRule,
+            GenericTokenAssignmentRule,
+            PasswordAssignmentRule,
+        )
 
         # R006
         r006 = PasswordAssignmentRule()
@@ -1806,7 +1805,7 @@ class TestResultModelFilePathSelfGuarantee:
 
     def test_finding_direct_construction_sanitizes_path(self):
         """Finding constructed directly sanitizes file_path."""
-        from app.scanner.base import Finding, FindingType, Severity, Confidence
+        from app.scanner.base import Confidence, Finding, FindingType, Severity
         f = Finding(
             rule_id="R001_GITHUB_TOKEN",
             rule_name="GitHub Token",
@@ -1886,8 +1885,8 @@ class TestResultModelFilePathSelfGuarantee:
 
     def test_direct_env_example_rule_call_sanitizes_path(self):
         """Directly calling EnvExampleFileRule.check_file sanitizes path."""
-        from app.scanner.rules import EnvExampleFileRule
         from app.scanner.base import ScanNotice
+        from app.scanner.rules import EnvExampleFileRule
         rule = EnvExampleFileRule()
         # Parent directory contains a token
         result = rule.check_file(f"dir/{SYNTH_GITHUB_TOKEN}/.env.example", 100)
@@ -1947,6 +1946,7 @@ class TestIncompletePrivateKeyCount:
     def test_10000_begins_linear_one_finding(self):
         """10000 consecutive BEGINs: O(n), at most 1 Finding, blocking."""
         import time
+
         from app.scanner.rules import PrivateKeyRule
         rule = PrivateKeyRule()
         n = 10000
@@ -2006,7 +2006,7 @@ class TestMultipleConnectionStringsOneLine:
 
     def test_two_conn_strings_comma_separated(self):
         """Two connection strings separated by a comma: both passwords masked."""
-        from app.core.security.desensitize import mask_untrusted_text, mask_snippet
+        from app.core.security.desensitize import mask_snippet, mask_untrusted_text
         line = (
             'postgres://u1:password1@host1/db,'
             'mysql://u2:password2@host2/db'
@@ -2033,7 +2033,7 @@ class TestMultipleConnectionStringsOneLine:
 
     def test_compact_json_object_two_conn_strings(self):
         """Compact JSON object with two connection strings: both passwords masked."""
-        from app.core.security.desensitize import mask_untrusted_text, mask_snippet
+        from app.core.security.desensitize import mask_snippet, mask_untrusted_text
         line = (
             '{"primary":"postgres://u1:password1@host1/db",'
             '"backup":"mysql://u2:password2@host2/db"}'
@@ -2069,7 +2069,7 @@ class TestMultipleConnectionStringsOneLine:
 
     def test_token_in_second_conn_string_fields(self):
         """Token embedded in the SECOND connection string's user/pass/host/path."""
-        from app.core.security.desensitize import mask_untrusted_text, mask_snippet
+        from app.core.security.desensitize import mask_snippet, mask_untrusted_text
         # Token in username of second conn string
         line = (
             f'postgres://u1:pw1@host1/db,'
@@ -2140,8 +2140,8 @@ class TestTokenAmplificationBound:
 
     def test_snippet_computed_once_per_line(self):
         """mask_snippet is called at most ONCE per line, not per Finding."""
-        from app.scanner.rules import GitHubTokenRule
         import app.scanner.rules as rules_mod
+        from app.scanner.rules import GitHubTokenRule
 
         call_count = 0
         original = rules_mod._make_masked_snippet
@@ -2198,8 +2198,8 @@ class TestTokenAmplificationBound:
 
     def test_snippet_cache_with_multiple_lines(self):
         """Snippet cache works across multiple lines — one call per line."""
-        from app.scanner.rules import GitHubTokenRule
         import app.scanner.rules as rules_mod
+        from app.scanner.rules import GitHubTokenRule
 
         call_count = 0
         original = rules_mod._make_masked_snippet

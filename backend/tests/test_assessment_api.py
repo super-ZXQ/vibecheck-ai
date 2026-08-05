@@ -1,4 +1,4 @@
-"""P0-6 安全评估 API 端点测试。
+r"""P0-6 安全评估 API 端点测试。
 
 覆盖 GET /api/check/{task_id}/assessment 端点的所有分支：
 1. Status 端点对有评估的已完成任务返回 security_score/verdict/url
@@ -23,27 +23,30 @@ import uuid
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.core.error_codes import (
+    ASSESSMENT_NOT_AVAILABLE,
+    ASSESSMENT_NOT_READY,
+)
 from app.db import database
+from app.main import app
+from app.scanner.base import (
+    Confidence,
+    Finding,
+    FindingType,
+    ScanResult,
+    Severity,
+)
 from app.services import task_manager
 from app.services.assessment_service import (
-    save_assessment_result,
     assess_scan_result,
     get_scan_result_with_timestamp,
+    save_assessment_result,
 )
 from app.services.scan_result_service import save_scan_result
-from app.scanner.base import (
-    Finding, ScanResult, Severity, Confidence, FindingType,
-)
-from app.core.error_codes import (
-    ASSESSMENT_NOT_READY,
-    ASSESSMENT_NOT_AVAILABLE,
-)
 from tests.conftest import (
-    SYNTHETIC_GITHUB_TOKEN,
     SYNTHETIC_AWS_KEY,
+    SYNTHETIC_GITHUB_TOKEN,
 )
-
 
 # ---------------------------------------------------------------------------
 # --- Fixtures ---
@@ -315,7 +318,7 @@ class TestAssessmentAPI:
         assert not raw_aws_pattern.search(json_str)
 
     def test_assessment_response_no_temp_paths(self, client):
-        """Assessment 响应不含临时路径（/tmp/、C:\）。"""
+        r"""Assessment 响应不含临时路径（/tmp/、C:\）。"""
         finding = _make_finding(is_blocking=False)
         task_id = _create_completed_task_with_assessment(client, findings=[finding])
 

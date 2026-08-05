@@ -10,14 +10,14 @@ from app.db import database
 from app.db.database import _get_connection, now_iso
 from app.scanner.base import (
     BASIC_SECURITY_DIMENSION,
-    Confidence,
     DEPLOYABILITY_PRODUCTION_DIMENSION,
     DOCUMENTATION_CONSISTENCY_DIMENSION,
+    INCOMPLETE_CONTENT_DIMENSION,
+    SENSITIVE_DATA_DIMENSION,
+    Confidence,
     Finding,
     FindingType,
-    INCOMPLETE_CONTENT_DIMENSION,
     ScanResult,
-    SENSITIVE_DATA_DIMENSION,
     Severity,
 )
 from app.services import task_manager

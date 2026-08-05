@@ -70,7 +70,6 @@ from app.services.scan_result_service import (
     serialize_scan_result,
 )
 
-
 # ---------------------------------------------------------------------------
 # --- Synthetic token (runtime-constructed, format-correct) ---
 # ---------------------------------------------------------------------------
@@ -387,12 +386,11 @@ class TestAdversarialSanitization:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                asyncio.run(background_runner._process_task(task.id))
+            asyncio.run(background_runner._process_task(task.id))
 
         response = client.get(f"/api/check/{task.id}/result")
         assert response.status_code == 200
@@ -444,38 +442,36 @@ class TestEventLoopResponsiveness:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            side_effect=blocking_scan,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    side_effect=blocking_scan,
-                ):
-                    # Start the task in the background
-                    task_task = asyncio.create_task(
-                        background_runner._process_task(task.id)
-                    )
+            # Start the task in the background
+            task_task = asyncio.create_task(
+                background_runner._process_task(task.id)
+            )
 
-                    # Wait for scan to start — poll non-blocking so the
-                    # event loop can run the task coroutine
-                    for _ in range(200):  # 200 * 0.01 = 2s max
-                        if scan_started.is_set():
-                            break
-                        await asyncio.sleep(0.01)
-                    assert scan_started.is_set(), "scan_directory did not start"
+            # Wait for scan to start — poll non-blocking so the
+            # event loop can run the task coroutine
+            for _ in range(200):  # 200 * 0.01 = 2s max
+                if scan_started.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert scan_started.is_set(), "scan_directory did not start"
 
-                    # While scan is blocked in its thread, run a concurrent
-                    # asyncio operation to prove the loop is responsive
-                    await check_responsiveness()
-                    assert loop_was_responsive, "Event loop was blocked during scan"
+            # While scan is blocked in its thread, run a concurrent
+            # asyncio operation to prove the loop is responsive
+            await check_responsiveness()
+            assert loop_was_responsive, "Event loop was blocked during scan"
 
-                    # Release the scan thread
-                    scan_event.set()
+            # Release the scan thread
+            scan_event.set()
 
-                    # Wait for the task to complete
-                    await task_task
+            # Wait for the task to complete
+            await task_task
 
         # Task should be completed
         result = task_manager.get_task(task.id)
@@ -506,39 +502,37 @@ class TestEventLoopResponsiveness:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            side_effect=blocking_scan,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    side_effect=blocking_scan,
-                ):
-                    task_task = asyncio.create_task(
-                        background_runner._process_task(task.id)
-                    )
+            task_task = asyncio.create_task(
+                background_runner._process_task(task.id)
+            )
 
-                    # Wait for scan to start — poll non-blocking
-                    for _ in range(200):
-                        if scan_started.is_set():
-                            break
-                        await asyncio.sleep(0.01)
-                    assert scan_started.is_set()
+            # Wait for scan to start — poll non-blocking
+            for _ in range(200):
+                if scan_started.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert scan_started.is_set()
 
-                    # While scan is blocked, extraction dir should still exist
-                    # (cleanup hasn't happened yet)
-                    assert Path(extract_result.dest_dir).exists(), \
+            # While scan is blocked, extraction dir should still exist
+            # (cleanup hasn't happened yet)
+            assert Path(extract_result.dest_dir).exists(), \
                         "Cleanup happened before scan thread completed"
 
-                    # Release the scan thread
-                    scan_event.set()
+            # Release the scan thread
+            scan_event.set()
 
-                    # Wait for completion
-                    await task_task
+            # Wait for completion
+            await task_task
 
-                    # Scan must have completed
-                    assert scan_completed.is_set(), "scan_directory did not complete"
+            # Scan must have completed
+            assert scan_completed.is_set(), "scan_directory did not complete"
 
         # After task completes, cleanup should have run
         assert not Path(extract_result.dest_dir).exists(), \
@@ -569,37 +563,35 @@ class TestEventLoopResponsiveness:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            side_effect=blocking_scan,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    side_effect=blocking_scan,
-                ):
-                    task_task = asyncio.create_task(
-                        background_runner._process_task(task.id)
-                    )
+            task_task = asyncio.create_task(
+                background_runner._process_task(task.id)
+            )
 
-                    # Wait for scan to start — poll non-blocking
-                    for _ in range(200):
-                        if scan_started.is_set():
-                            break
-                        await asyncio.sleep(0.01)
-                    assert scan_started.is_set()
+            # Wait for scan to start — poll non-blocking
+            for _ in range(200):
+                if scan_started.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert scan_started.is_set()
 
-                    # While scan is blocked, query task status
-                    # This goes through the DB, not the event loop,
-                    # but the asyncio loop must be free to handle it
-                    status = task_manager.get_task(task.id)
-                    assert status.status == "running"
-                    assert status.stage == "scanning"
-                    assert status.progress == 80
+            # While scan is blocked, query task status
+            # This goes through the DB, not the event loop,
+            # but the asyncio loop must be free to handle it
+            status = task_manager.get_task(task.id)
+            assert status.status == "running"
+            assert status.stage == "scanning"
+            assert status.progress == 80
 
-                    # Release
-                    scan_event.set()
-                    await task_task
+            # Release
+            scan_event.set()
+            await task_task
 
         result = task_manager.get_task(task.id)
         assert result.status == "completed"
@@ -1143,12 +1135,11 @@ class TestScanResultTooLarge:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         result = task_manager.get_task(task.id)
         assert result.status == "failed"
@@ -1170,12 +1161,11 @@ class TestScanResultTooLarge:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                await background_runner._process_task(task.id)
+            await background_runner._process_task(task.id)
 
         result = task_manager.get_task(task.id)
         msg = result.error_message or ""

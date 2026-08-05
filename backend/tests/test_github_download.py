@@ -23,10 +23,9 @@ import pytest
 from app.core.github import (
     DownloadResult,
     GitHubDownloadError,
-    download_tarball,
     cleanup_download,
+    download_tarball,
 )
-
 
 # --- Mock infrastructure ---
 

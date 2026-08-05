@@ -48,14 +48,13 @@ import random
 
 import pytest
 
-from app.services.assessment_service import assess_scan_result
+from app.db import database
 from app.services.assessment_policy import (
     MIN_SCORE,
     compute_single_deduction,
     get_repeat_percent,
 )
-from app.db import database
-
+from app.services.assessment_service import assess_scan_result
 
 # ---------------------------------------------------------------------------
 # --- Fixtures ---

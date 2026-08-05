@@ -31,16 +31,23 @@ import pytest
 from app.db import database
 from app.db.database import _get_connection
 from app.services.repair_policy import (
-    POLICY_VERSION, REPAIR_SCHEMA_VERSION, REPAIR_SCOPE,
-    AGENT_PROMPT_REQUIREMENTS, PARTIAL_DECLARATION,
+    AGENT_PROMPT_REQUIREMENTS,
+    PARTIAL_DECLARATION,
+    POLICY_VERSION,
+    REPAIR_SCHEMA_VERSION,
+    REPAIR_SCOPE,
 )
 from app.services.repair_service import (
-    save_repair_result, get_repair_result, get_repair_plan_available,
-    serialize_repair_plan, RepairPlanInternalError, RepairPlanPersistError, RepairPlanTooLargeError,
+    RepairPlanInternalError,
+    RepairPlanPersistError,
     RepairPlanSerializationError,
+    RepairPlanTooLargeError,
+    get_repair_plan_available,
+    get_repair_result,
+    save_repair_result,
+    serialize_repair_plan,
 )
 from app.services.task_manager import create_task, mark_completed
-
 
 # ---------------------------------------------------------------------------
 # --- Fixtures ---

@@ -21,40 +21,43 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.core.error_codes import (
+    ASSESSMENT_INTERNAL_ERROR,
+    ASSESSMENT_PERSIST_FAILED,
+)
 from app.db import database
 from app.db.database import _get_connection
-from app.services import task_manager
-from app.services.assessment_service import (
-    assess_scan_result,
-    save_assessment_result,
-    serialize_assessment_result,
-    get_assessment_result,
-    AssessmentInternalError,
-    AssessmentPersistError,
-    AssessmentSerializationError,
-    sanitize_assessment_file_path,
-    _clean_path_from_text,
-    _strict_int,
-    _strict_bool,
-    _normalize_sort_str,
-    _normalize_sort_int,
-    _normalize_sort_bool,
+from app.main import app
+from app.scanner.base import (
+    Confidence,
+    Finding,
+    FindingType,
+    ScanResult,
+    Severity,
 )
+from app.services import task_manager
 from app.services.assessment_policy import (
     ASSESSMENT_SCHEMA_VERSION,
     ASSESSMENT_SCOPE,
     POLICY_VERSION,
 )
+from app.services.assessment_service import (
+    AssessmentInternalError,
+    AssessmentPersistError,
+    AssessmentSerializationError,
+    _clean_path_from_text,
+    _normalize_sort_bool,
+    _normalize_sort_int,
+    _normalize_sort_str,
+    _strict_bool,
+    _strict_int,
+    assess_scan_result,
+    get_assessment_result,
+    sanitize_assessment_file_path,
+    save_assessment_result,
+    serialize_assessment_result,
+)
 from app.services.scan_result_service import save_scan_result
-from app.scanner.base import (
-    Finding, ScanResult, Severity, Confidence, FindingType,
-)
-from app.core.error_codes import (
-    ASSESSMENT_INTERNAL_ERROR,
-    ASSESSMENT_PERSIST_FAILED,
-)
-
 
 # ---------------------------------------------------------------------------
 # --- Synthetic test constants ---
@@ -851,9 +854,10 @@ class TestRunnerFallbackError:
     def test_runtime_error_maps_to_internal_error(self, test_db, tmp_path):
         """Mock run_assessment raising RuntimeError → ASSESSMENT_INTERNAL_ERROR."""
         import asyncio
+
+        from app.scanner.base import ScanResult
         from app.services.background_runner import _process_task, reset_runner_state
         from app.services.scan_result_service import save_scan_result
-        from app.scanner.base import ScanResult
 
         reset_runner_state()
 
@@ -868,9 +872,10 @@ class TestRunnerFallbackError:
         save_scan_result(task.id, scan_result)
 
         # Mock download, extract, scan to succeed
+        from pathlib import Path
+
         from app.core.github import DownloadResult, parse_repo_url
         from app.core.safe_extract import ExtractionResult
-        from pathlib import Path
 
         temp_file = Path(tmp_path) / "mock.tar.gz"
         temp_file.write_bytes(b"\x1f\x8b\x08\x00" + b"\x00" * 100)
@@ -894,20 +899,17 @@ class TestRunnerFallbackError:
         with patch(
             "app.services.background_runner.download_tarball",
             return_value=download_result,
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            return_value=extract_result,
+        ), patch(
+            "app.services.background_runner.scan_directory",
+            return_value=mock_scan,
+        ), patch(
+            "app.services.background_runner.run_assessment",
+            side_effect=RuntimeError("unexpected internal error"),
         ):
-            with patch(
-                "app.services.background_runner.safe_extract_to_temp",
-                return_value=extract_result,
-            ):
-                with patch(
-                    "app.services.background_runner.scan_directory",
-                    return_value=mock_scan,
-                ):
-                    with patch(
-                        "app.services.background_runner.run_assessment",
-                        side_effect=RuntimeError("unexpected internal error"),
-                    ):
-                        asyncio.run(_process_task(task.id))
+            asyncio.run(_process_task(task.id))
 
         result = task_manager.get_task(task.id)
         assert result.status == "failed"

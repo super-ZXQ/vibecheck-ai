@@ -17,7 +17,7 @@ def test_db(tmp_path, monkeypatch):
         "app.core.config.settings.database_url",
         f"sqlite:///{db_path}",
     )
-    import app.db.database as database
+    from app.db import database
 
     database._initialized = False
     database.init_db()
@@ -270,7 +270,7 @@ class TestReadiness:
         test_db,
         missing_table,
     ):
-        import app.db.database as database
+        from app.db import database
 
         conn = database._get_connection()
         try:

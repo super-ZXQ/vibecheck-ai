@@ -17,7 +17,6 @@ from app.core.error_codes import SERVICE_RESTARTED, get_error_message
 from app.db import database
 from app.services import task_manager
 
-
 # --- Fixtures ---
 
 @pytest.fixture

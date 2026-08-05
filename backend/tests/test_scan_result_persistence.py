@@ -20,8 +20,10 @@ B. Database tests:
 """
 
 import json
+
 import pytest
 
+from app.db import database
 from app.scanner.base import (
     Confidence,
     Finding,
@@ -32,20 +34,18 @@ from app.scanner.base import (
     Severity,
     SkippedFile,
 )
+from app.services import task_manager
 from app.services.scan_result_service import (
     SCHEMA_VERSION,
-    serialize_scan_result,
-    save_scan_result,
     get_scan_result,
     get_scan_summary,
+    save_scan_result,
+    serialize_scan_result,
 )
-from app.services import task_manager
-from app.db import database
 from tests.conftest import (
-    SYNTHETIC_GITHUB_TOKEN,
     SYNTHETIC_AWS_KEY,
+    SYNTHETIC_GITHUB_TOKEN,
 )
-
 
 # --- Fixtures ---
 
