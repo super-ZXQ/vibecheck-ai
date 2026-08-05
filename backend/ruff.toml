@@ -1,0 +1,25 @@
+# Ruff configuration for VibeCheck backend.
+#
+# Project hard constraints require broad exception handling that maps
+# all errors to fixed reason_code values (never leaking raw exceptions).
+# FastAPI's default-argument pattern (File, Header, Form) is also expected.
+
+target-version = "py312"
+line-length = 100
+
+[lint]
+# Rules that conflict with project hard constraints or framework conventions:
+# - BLE001: Intentional broad exception catches → mapped to fixed error_code
+# - S110:   Intentional try-except-pass for DB rollback/cleanup
+# - B008:   FastAPI requires File/Header/Form in argument defaults
+# - ASYNC230: File I/O in async functions (upload/github) — acceptable for low concurrency
+# - SIM115:  tarfile.open without context manager — safe in controlled scope
+# - UP017:  datetime.UTC not available in all runtime environments
+ignore = [
+    "BLE001",
+    "S110",
+    "B008",
+    "ASYNC230",
+    "SIM115",
+    "UP017",
+]

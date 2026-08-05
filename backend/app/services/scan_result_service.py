@@ -29,15 +29,17 @@ Schema version:
 from __future__ import annotations
 
 import json
-from typing import Any, Optional
+from typing import Any
 
 from app.core.security.desensitize import mask_snippet, mask_untrusted_text
 from app.db.database import _get_connection, init_db, now_iso
 from app.scanner.base import (
     BASIC_SECURITY_DIMENSION,
-    Confidence,
     DEPLOYABILITY_PRODUCTION_DIMENSION,
     DOCUMENTATION_CONSISTENCY_DIMENSION,
+    INCOMPLETE_CONTENT_DIMENSION,
+    SENSITIVE_DATA_DIMENSION,
+    Confidence,
     Finding,
     FindingType,
     ScanError,
@@ -45,8 +47,6 @@ from app.scanner.base import (
     ScanResult,
     Severity,
     SkippedFile,
-    INCOMPLETE_CONTENT_DIMENSION,
-    SENSITIVE_DATA_DIMENSION,
 )
 
 # --- Constants ---
@@ -137,7 +137,6 @@ class ScanResultTooLargeError(Exception):
     The caller (background_runner) catches this and maps it to the
     fixed error code SCAN_RESULT_TOO_LARGE.
     """
-    pass
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +153,7 @@ class ScanResultTooLargeError(Exception):
 # defense in depth. They are idempotent: already-masked values pass through
 # unchanged.
 
-def _safe_snippet(value: Optional[str]) -> Optional[str]:
+def _safe_snippet(value: str | None) -> str | None:
     """Re-apply mask_snippet to a snippet string.
 
     mask_snippet is the strongest masking — it handles assignment values,
@@ -166,7 +165,7 @@ def _safe_snippet(value: Optional[str]) -> Optional[str]:
     return mask_snippet(value)
 
 
-def _safe_text(value: Optional[str]) -> Optional[str]:
+def _safe_text(value: str | None) -> str | None:
     """Re-apply mask_untrusted_text to an arbitrary string field.
 
     Used for description, message, notice.message, skipped.reason,
@@ -178,7 +177,7 @@ def _safe_text(value: Optional[str]) -> Optional[str]:
     return mask_untrusted_text(value)
 
 
-def _safe_path(value: Optional[str]) -> Optional[str]:
+def _safe_path(value: str | None) -> str | None:
     """Re-apply mask_untrusted_text to a file_path string.
 
     Double defense: file_path is already sanitized in __post_init__,
@@ -626,7 +625,7 @@ def save_scan_result(task_id: str, scan_result: ScanResult) -> None:
         conn.close()
 
 
-def get_scan_result(task_id: str) -> Optional[dict]:
+def get_scan_result(task_id: str) -> dict | None:
     """Get the full persisted scan result for a task.
 
     Returns None if no result has been persisted for this task_id.
@@ -654,7 +653,7 @@ def get_scan_result(task_id: str) -> Optional[dict]:
         conn.close()
 
 
-def get_scan_summary(task_id: str) -> Optional[dict]:
+def get_scan_summary(task_id: str) -> dict | None:
     """Get only the summary portion of a persisted scan result.
 
     Returns None if no result has been persisted for this task_id.

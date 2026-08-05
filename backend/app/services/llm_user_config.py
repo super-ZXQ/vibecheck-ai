@@ -19,7 +19,6 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -57,20 +56,18 @@ def _valid_base_url(raw: str) -> bool:
     if len(raw) > _MAX_BASE_URL_CHARS:
         return False
     lowered = raw.lower()
-    if not (lowered.startswith("https://") or lowered.startswith("http://")):
+    if not (lowered.startswith(("https://", "http://"))):
         return False
     # Embedded credentials are forbidden (defense in depth: the key itself
     # is sent via the Authorization header, never in the URL).
-    if "@" in raw:
-        return False
-    return True
+    return "@" not in raw
 
 
 def store_user_config(
     task_id: str,
-    api_key: Optional[str],
-    base_url: Optional[str],
-    model: Optional[str],
+    api_key: str | None,
+    base_url: str | None,
+    model: str | None,
 ) -> None:
     """Bind a caller-supplied LLM config to a task.
 
@@ -104,7 +101,7 @@ def store_user_config(
         }
 
 
-def get_user_config(task_id: str) -> Optional[dict]:
+def get_user_config(task_id: str) -> dict | None:
     """Return the stored user config for a task, or None.
 
     Returns a copy with the private "_created" key removed. Never raises.
@@ -121,7 +118,7 @@ def get_user_config(task_id: str) -> Optional[dict]:
         }
 
 
-def pop_user_config(task_id: str) -> Optional[dict]:
+def pop_user_config(task_id: str) -> dict | None:
     """Remove and return the stored user config for a task.
 
     Called by the background runner when a task finishes (success or

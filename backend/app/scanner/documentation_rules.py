@@ -2,27 +2,27 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import re
 import shlex
 import sys
-import functools
 import tomllib
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Final
+
 from app.core.config import settings
 from app.core.security.desensitize import mask_untrusted_text
 from app.scanner.base import (
-    Confidence,
     DOCUMENTATION_CONSISTENCY_DIMENSION,
+    Confidence,
     Finding,
     FindingType,
     RepositoryProbe,
     Rule,
     Severity,
 )
-
 
 _REPOSITORY_PATH = "<repository>"
 _README_PRIORITY = {
@@ -474,9 +474,7 @@ def _is_go_import_path(token: str) -> bool:
         return True
     if token.startswith((".", "..")):
         return False
-    if token.endswith(".go"):
-        return False
-    return True
+    return not token.endswith(".go")
 
 
 # Glob metacharacters outside P0-13 frozen scope (literal paths, *, **, ! prefix).
@@ -604,7 +602,7 @@ def _npm_glob_to_regex(pattern: str) -> str | None:
 
 
 @functools.lru_cache(maxsize=256)
-def _npm_glob_compile(pattern: str) -> "re.Pattern[str] | None":
+def _npm_glob_compile(pattern: str) -> re.Pattern[str] | None:
     """Compile a (already normalized) npm workspace glob pattern to regex.
 
     Returns ``None`` if the pattern is unsupported or malformed.
@@ -725,12 +723,7 @@ def _parse_workspace_command(
                 selector_type = "npm_workspace"
                 index += 2
                 continue
-        elif manager == "npm" and token.startswith("--workspace="):
-            workspaces.append(token.split("=", 1)[1])
-            selector_type = "npm_workspace"
-            index += 1
-            continue
-        elif manager == "npm" and token.startswith("-w="):
+        elif manager == "npm" and token.startswith("--workspace=") or manager == "npm" and token.startswith("-w="):
             workspaces.append(token.split("=", 1)[1])
             selector_type = "npm_workspace"
             index += 1
@@ -782,12 +775,11 @@ def _parse_workspace_command(
             selector_type = "dir"
             index += 1
             continue
-        elif manager in {"yarn", "bun"} and token == "--cwd":
-            if index + 1 < len(tokens):
-                workspaces.append(tokens[index + 1])
-                selector_type = "dir"
-                index += 2
-                continue
+        elif manager in {"yarn", "bun"} and token == "--cwd" and index + 1 < len(tokens):
+            workspaces.append(tokens[index + 1])
+            selector_type = "dir"
+            index += 2
+            continue
 
         remainder.append(token)
         index += 1
@@ -1737,9 +1729,8 @@ class DocumentationConsistencyProbe(RepositoryProbe):
             rel_dir = directory
             if root_prefix and directory.startswith(root_prefix + "/"):
                 rel_dir = directory[len(root_prefix) + 1:]
-            if _npm_workspace_glob_match(rel_dir, patterns):
-                if directory in self.valid_node_manifest_dirs:
-                    matched.append(directory)
+            if _npm_workspace_glob_match(rel_dir, patterns) and directory in self.valid_node_manifest_dirs:
+                matched.append(directory)
         if len(matched) == 1:
             return matched[0]
         if len(matched) > 1:
@@ -1937,7 +1928,7 @@ class DocumentationConsistencyProbe(RepositoryProbe):
                     if joined("go.mod") not in self.paths:
                         return False
                     base_path = target.replace("/...", "").replace("...", "")
-                    if base_path and base_path != ".":
+                    if base_path and base_path != ".":  # noqa: SIM102
                         if not self._path_exists(rooted(base_path), directory=True):
                             return False
                 elif target in {reference.base_dir, "."}:

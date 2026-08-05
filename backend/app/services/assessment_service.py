@@ -45,16 +45,12 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Optional
+from typing import Any
 
 from app.core.config import settings
 from app.core.security.desensitize import mask_untrusted_text
 from app.db.database import _get_connection, init_db, now_iso
 from app.scanner.base import SENSITIVE_DATA_DIMENSION
-from app.services.scan_result_service import (
-    normalize_scan_result_dimensions,
-    scope_summary_to_sensitive_data,
-)
 from app.services.assessment_policy import (
     ASSESSMENT_SCHEMA_VERSION,
     ASSESSMENT_SCOPE,
@@ -71,6 +67,10 @@ from app.services.assessment_policy import (
     determine_verdict,
     get_repeat_percent,
     sort_caps,
+)
+from app.services.scan_result_service import (
+    normalize_scan_result_dimensions,
+    scope_summary_to_sensitive_data,
 )
 
 # Severity ordering for deterministic sort (lower = higher priority).
@@ -109,7 +109,6 @@ class AssessmentResultTooLargeError(Exception):
     The caller (background_runner) catches this and maps it to the
     fixed error code ASSESSMENT_RESULT_TOO_LARGE.
     """
-    pass
 
 
 class AssessmentInternalError(Exception):
@@ -119,7 +118,6 @@ class AssessmentInternalError(Exception):
     The caller (background_runner) catches this and maps it to the
     fixed error code ASSESSMENT_INTERNAL_ERROR.
     """
-    pass
 
 
 class AssessmentPersistError(Exception):
@@ -128,7 +126,6 @@ class AssessmentPersistError(Exception):
     The caller (background_runner) catches this and maps it to the
     fixed error code ASSESSMENT_PERSIST_FAILED.
     """
-    pass
 
 
 class AssessmentSerializationError(AssessmentInternalError):
@@ -144,7 +141,6 @@ class AssessmentSerializationError(AssessmentInternalError):
     - Database information
     - Temp absolute paths
     """
-    pass
 
 
 # ---------------------------------------------------------------------------
@@ -532,7 +528,7 @@ def _serialize_coverage(coverage: dict[str, Any]) -> dict[str, Any]:
 def serialize_assessment_result(
     task_id: str,
     assessment: dict[str, Any],
-    created_at: Optional[str],
+    created_at: str | None,
     updated_at: str,
 ) -> dict[str, Any]:
     """Explicit serialization boundary for AssessmentResult.
@@ -852,8 +848,8 @@ def _group_findings_by_rule(
             groups[rule_id] = []
         groups[rule_id].append(f)
 
-    for rule_id in groups:
-        groups[rule_id].sort(key=_finding_sort_key)
+    for rule_id, findings_list in groups.items():
+        findings_list.sort(key=_finding_sort_key)
 
     return groups
 
@@ -1214,7 +1210,7 @@ def assess_scan_result(task_id: str, scan_result: dict[str, Any]) -> dict[str, A
 
 def get_scan_result_with_timestamp(
     task_id: str,
-) -> Optional[tuple[dict[str, Any], str]]:
+) -> tuple[dict[str, Any], str] | None:
     """Read the persisted scan result and its updated_at timestamp.
 
     This is the bridge between P0-5 persistence and P0-6 assessment.
@@ -1437,7 +1433,7 @@ def _normalize_score_breakdown(breakdown: list[dict[str, Any]]) -> None:
             entry["rule_name"] = _RULE_DISPLAY_NAMES.get(rid, rid)
 
 
-def get_assessment_result(task_id: str) -> Optional[dict[str, Any]]:
+def get_assessment_result(task_id: str) -> dict[str, Any] | None:
     """Read the full persisted assessment result for a task.
 
     Returns None if no assessment has been persisted for this task_id.
@@ -1555,7 +1551,7 @@ def get_assessment_result(task_id: str) -> Optional[dict[str, Any]]:
 
 def get_assessment_score_verdict(
     task_id: str,
-) -> Optional[tuple[int, str]]:
+) -> tuple[int, str] | None:
     """Lightweight read for status polling — returns (score, verdict).
 
     Reads ONLY the redundant score and verdict columns, avoiding

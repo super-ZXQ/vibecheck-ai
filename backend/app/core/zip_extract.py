@@ -19,8 +19,9 @@ import io
 import stat
 import threading
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
-from typing import IO, Callable
+from typing import IO
 
 from app.core.config import settings
 from app.core.safe_extract import (

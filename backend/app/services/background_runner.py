@@ -78,18 +78,17 @@ from app.core.error_codes import (
 from app.core.github import (
     DownloadResult,
     GitHubDownloadError,
-    download_tarball,
     cleanup_download,
+    download_tarball,
 )
 from app.core.safe_extract import (
     ExtractionError,
     ExtractionResult,
+    cleanup_temp_dir,
     consume_extract,
     reserve_extract,
     safe_extract_to_temp,
-    cleanup_temp_dir,
 )
-from app.services.upload_service import LOCAL_UPLOAD_PREFIX, upload_source_dir
 from app.scanner.sensitive import scan_directory
 from app.services.assessment_service import (
     AssessmentInternalError,
@@ -97,15 +96,15 @@ from app.services.assessment_service import (
     AssessmentResultTooLargeError,
     run_assessment,
 )
+from app.services.llm_service import generate_and_save_llm_analysis
+from app.services.llm_user_config import get_user_config, pop_user_config
 from app.services.repair_service import (
     RepairPlanInternalError,
     RepairPlanPersistError,
     RepairPlanTooLargeError,
     generate_and_save_repair_plan,
 )
-from app.services.scan_result_service import save_scan_result, ScanResultTooLargeError
-from app.services.llm_service import generate_and_save_llm_analysis
-from app.services.llm_user_config import get_user_config, pop_user_config
+from app.services.scan_result_service import ScanResultTooLargeError, save_scan_result
 from app.services.task_manager import (
     STAGE_ANALYZING,
     STAGE_ASSESSING,
@@ -113,12 +112,13 @@ from app.services.task_manager import (
     STAGE_EXTRACTING,
     STAGE_REPAIRING,
     STAGE_SCANNING,
-    mark_running,
-    mark_completed,
-    mark_failed,
     get_oldest_pending,
     get_task,
+    mark_completed,
+    mark_failed,
+    mark_running,
 )
+from app.services.upload_service import LOCAL_UPLOAD_PREFIX, upload_source_dir
 
 logger = logging.getLogger(__name__)
 
@@ -249,7 +249,7 @@ async def _download_and_extract(
         )
         extract_dest = extract_result.dest_dir
         return download_result, extract_dest, extract_result
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.error("Extraction timed out for task %s", task_id)
         # Signal the orphaned extraction thread to abort promptly, then
         # give it a short window to release file handles before the
@@ -352,7 +352,7 @@ async def _process_task(task_id: str) -> None:
                 ),
                 timeout=settings.scan_timeout,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error("Scan timed out for task %s", task_id)
             mark_failed(
                 task_id, SCAN_TIMEOUT,
@@ -426,7 +426,7 @@ async def _process_task(task_id: str) -> None:
                 ),
                 timeout=settings.assess_timeout,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error("Assessment timed out for task %s", task_id)
             mark_failed(
                 task_id, ASSESSMENT_TIMEOUT,
@@ -508,7 +508,7 @@ async def _process_task(task_id: str) -> None:
                 ),
                 timeout=settings.repair_plan_timeout,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error("Repair plan timed out for task %s", task_id)
             mark_failed(
                 task_id, REPAIR_PLAN_TIMEOUT,
@@ -589,7 +589,7 @@ async def _process_task(task_id: str) -> None:
                 ),
                 timeout=settings.llm_analysis_timeout,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # Non-blocking —LLM analysis timeout doesn't fail the task.
             logger.warning(
                 "LLM analysis timed out for task %s (non-blocking, "

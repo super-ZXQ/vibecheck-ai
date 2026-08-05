@@ -58,7 +58,6 @@ from app.scanner.default_rules import (
     RULE_PRIORITY_MAP,
 )
 
-
 # ---------------------------------------------------------------------------
 # --- Fixed reason codes (never expose exception text or paths) ---
 # ---------------------------------------------------------------------------

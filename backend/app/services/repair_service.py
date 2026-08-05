@@ -38,28 +38,28 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
-from typing import Any, Optional
+from typing import Any
 
 from app.core.config import settings
 from app.core.security.desensitize import mask_untrusted_text
 from app.db.database import _get_connection, init_db, now_iso
 from app.scanner.base import SENSITIVE_DATA_DIMENSION
-from app.services.scan_result_service import (
-    normalize_scan_result_dimensions,
-    normalize_scan_summary_dimensions,
-    scope_summary_to_sensitive_data,
-)
 from app.services.repair_policy import (
+    ACTION_MANUAL_REVIEW_REQUIRED,
+    ACTION_RERUN_SECURITY_SCAN,
+    ACTION_RESOLVE_SCAN_ERROR,
+    ACTION_REVIEW_SCAN_COVERAGE,
+    ACTION_VERIFY_NO_SECRET_REMAINS,
     AGENT_PROMPT_FORBIDDEN_FIELDS,
     AGENT_PROMPT_FORBIDDEN_PATTERNS,
     AGENT_PROMPT_REQUIREMENTS,
     BLOCKING_ACTION_SEQUENCE,
+    CONFIDENCE_ORDER,
     GLOBAL_SINGLETON_ACTIONS,
     PARTIAL_DECLARATION,
     POLICY_VERSION,
     REPAIR_SCHEMA_VERSION,
     REPAIR_SCOPE,
-    CONFIDENCE_ORDER,
     SEVERITY_ORDER,
     compute_aggregation_key,
     compute_group_sort_key,
@@ -71,13 +71,12 @@ from app.services.repair_policy import (
     is_known_template_key,
     is_supported_assessment_policy,
     is_valid_action_code,
-    ACTION_MANUAL_REVIEW_REQUIRED,
-    ACTION_RERUN_SECURITY_SCAN,
-    ACTION_RESOLVE_SCAN_ERROR,
-    ACTION_REVIEW_SCAN_COVERAGE,
-    ACTION_VERIFY_NO_SECRET_REMAINS,
 )
-
+from app.services.scan_result_service import (
+    normalize_scan_result_dimensions,
+    normalize_scan_summary_dimensions,
+    scope_summary_to_sensitive_data,
+)
 
 # ---------------------------------------------------------------------------
 # --- Exception classes ---
@@ -90,7 +89,6 @@ class RepairPlanInternalError(Exception):
     The caller (background_runner) catches this and maps it to the
     fixed error code REPAIR_PLAN_INTERNAL_ERROR.
     """
-    pass
 
 
 class RepairPlanPersistError(Exception):
@@ -99,7 +97,6 @@ class RepairPlanPersistError(Exception):
     The caller (background_runner) catches this and maps it to the
     fixed error code REPAIR_PLAN_PERSIST_FAILED.
     """
-    pass
 
 
 class RepairPlanTooLargeError(Exception):
@@ -108,7 +105,6 @@ class RepairPlanTooLargeError(Exception):
     The caller (background_runner) catches this and maps it to the
     fixed error code REPAIR_PLAN_TOO_LARGE.
     """
-    pass
 
 
 class RepairPlanSerializationError(RepairPlanInternalError):
@@ -117,7 +113,6 @@ class RepairPlanSerializationError(RepairPlanInternalError):
     Subclass of RepairPlanInternalError so callers catching
     RepairPlanInternalError will also catch this.
     """
-    pass
 
 
 # ---------------------------------------------------------------------------
@@ -1300,8 +1295,7 @@ def _generate_agent_prompt(
 
     fixed_lines.append("## 安全要求")
     fixed_lines.append("")
-    for req in AGENT_PROMPT_REQUIREMENTS:
-        fixed_lines.append(req)
+    fixed_lines.extend(AGENT_PROMPT_REQUIREMENTS)
 
     fixed_content = "\n".join(fixed_lines)
 
@@ -1721,9 +1715,9 @@ def _serialize_repair_group(group: dict) -> dict:
         # Rebuilt from frozen policy:
         "title": action.title,
         "description": _safe_masked_desc(action.description),
-        "related_rule_ids": sorted(set(
+        "related_rule_ids": sorted({
             _validate_rule_id_for_output(r) for r in _related_rule_ids
-        )),
+        }),
         "related_files": _normalized,
         "total_related_files": total_related,
         "returned_related_files": returned_related,
@@ -2839,7 +2833,7 @@ def _validate_persisted_repair_plan(
     return result
 
 
-def get_repair_result(task_id: str) -> Optional[dict]:
+def get_repair_result(task_id: str) -> dict | None:
     """Read the full persisted repair plan for a task.
 
     Returns None if no repair plan has been persisted.

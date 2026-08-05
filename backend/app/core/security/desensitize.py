@@ -35,9 +35,8 @@ Security guarantees:
 """
 
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Iterator
-
 
 # ---------------------------------------------------------------------------
 # --- Secret type constants ---
@@ -92,13 +91,13 @@ class Assignment:
     _operator: str
 
     __slots__ = (
-        "_key_raw",
-        "_key_normalized",
-        "_value_start",
-        "_value_end",
-        "_value",
         "_is_quoted",
+        "_key_normalized",
+        "_key_raw",
         "_operator",
+        "_value",
+        "_value_end",
+        "_value_start",
     )
 
     def __init__(
@@ -197,9 +196,7 @@ def is_already_masked(value: str) -> bool:
         return True
     if value and all(c == "*" for c in value):
         return True
-    if _MASKED_FORMAT_PATTERN.fullmatch(value):
-        return True
-    return False
+    return bool(_MASKED_FORMAT_PATTERN.fullmatch(value))
 
 
 # ---------------------------------------------------------------------------

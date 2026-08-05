@@ -12,6 +12,7 @@ Security guarantees:
 """
 
 import io
+import logging
 import os
 import shutil
 import stat
@@ -21,6 +22,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class ExtractionError(Exception):
@@ -186,16 +189,14 @@ def _safe_remove_tree(path: Path) -> bool:
         shutil.rmtree(path, onerror=_remove_readonly)
         if path.exists():
             # Persistent failure — log without sensitive content
-            import logging
-            logging.error(
+            logger.error(
                 "Failed to fully clean up temp directory: %s "
                 "(some files may remain)", path
             )
             return False
         return True
     except Exception as e:
-        import logging
-        logging.error(
+        logger.error(
             "Failed to clean up temp directory: %s (error: %s, no sensitive content)",
             path, type(e).__name__
         )
@@ -327,18 +328,17 @@ def safe_extract(
                         raise ExtractionError(
                             f"Cannot extract file: {member.name!r}"
                         )
-                    with src:
-                        with open(target_path, "wb") as dst:
-                            # Read in chunks to handle large files safely
-                            while True:
-                                if _cancelled():
-                                    raise ExtractionError(
-                                        "Extraction cancelled"
-                                    )
-                                chunk = src.read(65536)
-                                if not chunk:
-                                    break
-                                dst.write(chunk)
+                    with src, open(target_path, "wb") as dst:
+                        # Read in chunks to handle large files safely
+                        while True:
+                            if _cancelled():
+                                raise ExtractionError(
+                                    "Extraction cancelled"
+                                )
+                            chunk = src.read(65536)
+                            if not chunk:
+                                break
+                            dst.write(chunk)
 
                     result.file_count += 1
                     result.total_size += member.size

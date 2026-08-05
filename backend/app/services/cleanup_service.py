@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+from datetime import timezone
 from pathlib import Path
 
 from app.core.config import settings
@@ -105,7 +106,7 @@ def cleanup_expired_tasks() -> int:
         # Cleanup disabled.
         return 0
 
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
     init_db()
     conn = _get_connection()
@@ -132,7 +133,7 @@ def cleanup_expired_tasks() -> int:
                 # Handle both "Z" suffix and "+00:00" formats.
                 if completed_str.endswith("Z"):
                     completed = datetime.fromisoformat(
-                        completed_str.replace("Z", "+00:00")
+                        completed_str
                     )
                 else:
                     completed = datetime.fromisoformat(completed_str)

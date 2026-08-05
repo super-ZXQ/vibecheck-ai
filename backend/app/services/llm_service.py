@@ -29,7 +29,6 @@ import logging
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
 
 from app.core.config import settings
 from app.core.security.desensitize import mask_untrusted_text
@@ -61,12 +60,10 @@ _MAX_SNIPPET_CHARS = 500
 
 class LLMAnalysisPersistError(Exception):
     """SQLite persistence failure for LLM analysis."""
-    pass
 
 
 class LLMAnalysisTooLargeError(Exception):
     """LLM analysis result exceeds size limit."""
-    pass
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +189,7 @@ def _build_llm_prompt(finding: dict) -> str:
 # --- LLM API call ---
 # ---------------------------------------------------------------------------
 
-def _resolve_llm_config(user_config: Optional[dict]) -> tuple[bool, str, str, str]:
+def _resolve_llm_config(user_config: dict | None) -> tuple[bool, str, str, str]:
     """Resolve which LLM configuration to use.
 
     A COMPLETE user config (api_key + base_url + model all non-empty)
@@ -232,8 +229,8 @@ def _normalize_llm_endpoint(raw: str) -> str:
 
 def _call_llm_api(
     prompt: str,
-    user_config: Optional[dict] = None,
-) -> Optional[str]:
+    user_config: dict | None = None,
+) -> str | None:
     """Call the LLM API and return the response text.
 
     Returns None on any failure (network error, timeout, auth error).
@@ -327,7 +324,7 @@ def _call_llm_api(
 # --- LLM response parsing ---
 # ---------------------------------------------------------------------------
 
-def _parse_llm_response(content: str) -> Optional[dict]:
+def _parse_llm_response(content: str) -> dict | None:
     """Parse the LLM response text into a dict with explanation and instruction.
 
     Returns None if parsing fails or the response is invalid.
@@ -390,7 +387,7 @@ def _parse_llm_response(content: str) -> Optional[dict]:
 def _generate_analysis_item(
     finding: dict,
     use_llm: bool,
-    user_config: Optional[dict] = None,
+    user_config: dict | None = None,
 ) -> dict:
     """Generate a single analysis item for a finding.
 
@@ -440,7 +437,7 @@ def _generate_analysis_item(
 def _generate_analysis_items(
     findings: list[dict],
     use_llm: bool,
-    user_config: Optional[dict] = None,
+    user_config: dict | None = None,
 ) -> tuple[list[dict], int, int]:
     """Generate analysis items for all findings, concurrently.
 
@@ -547,7 +544,7 @@ def _save_llm_analysis(
 
 def generate_and_save_llm_analysis(
     task_id: str,
-    user_config: Optional[dict] = None,
+    user_config: dict | None = None,
 ) -> dict:
     """Generate LLM analysis for a task and persist it.
 
@@ -674,7 +671,7 @@ def _generate_fallback_only(
 # --- Public: retrieve persisted result ---
 # ---------------------------------------------------------------------------
 
-def get_llm_analysis(task_id: str) -> Optional[dict]:
+def get_llm_analysis(task_id: str) -> dict | None:
     """Retrieve the persisted LLM analysis result for a task.
 
     Returns None if no result has been persisted.
@@ -722,7 +719,7 @@ def get_llm_analysis(task_id: str) -> Optional[dict]:
         conn.close()
 
 
-def get_llm_analysis_summary(task_id: str) -> Optional[dict]:
+def get_llm_analysis_summary(task_id: str) -> dict | None:
     """Lightweight summary for status polling — reads only redundant columns.
 
     Returns None if no result has been persisted.

@@ -12,11 +12,10 @@ Security:
 import logging
 import uuid
 from dataclasses import dataclass
-from typing import Optional
 
 from app.core.config import settings
 from app.core.error_codes import get_error_message
-from app.db.database import _get_connection, now_iso, init_db
+from app.db.database import _get_connection, init_db, now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +52,6 @@ class IllegalStateTransitionError(Exception):
     This is an internal error — callers should catch and log it,
     never expose it to the API.
     """
-    pass
 
 
 def _validate_transition(
@@ -89,14 +87,14 @@ class TaskRecord:
     status: str
     stage: str
     progress: int
-    error_code: Optional[str]
-    error_message: Optional[str]
-    file_count: Optional[int]
-    total_size: Optional[int]
-    top_level_dir: Optional[str]
+    error_code: str | None
+    error_message: str | None
+    file_count: int | None
+    total_size: int | None
+    top_level_dir: str | None
     created_at: str
     updated_at: str
-    completed_at: Optional[str]
+    completed_at: str | None
 
     @classmethod
     def from_row(cls, row) -> "TaskRecord":
@@ -246,7 +244,7 @@ def create_task(repo_url: str, owner: str, repo_name: str) -> TaskRecord:
 
 # --- Read ---
 
-def get_task(task_id: str) -> Optional[TaskRecord]:
+def get_task(task_id: str) -> TaskRecord | None:
     """Get a task by ID. Returns None if not found."""
     init_db()
     conn = _get_connection()
@@ -275,7 +273,7 @@ def get_pending_count() -> int:
         conn.close()
 
 
-def get_oldest_pending() -> Optional[TaskRecord]:
+def get_oldest_pending() -> TaskRecord | None:
     """Get the oldest pending task, if any."""
     init_db()
     conn = _get_connection()
@@ -296,8 +294,8 @@ def get_oldest_pending() -> Optional[TaskRecord]:
 def update_task_status(
     task_id: str,
     status: str,
-    stage: Optional[str] = None,
-    progress: Optional[int] = None,
+    stage: str | None = None,
+    progress: int | None = None,
 ) -> None:
     """Update a task's status, stage, and/or progress."""
     init_db()
@@ -385,7 +383,7 @@ def mark_completed(
         conn.close()
 
 
-def mark_failed(task_id: str, error_code: str, error_message: Optional[str] = None) -> None:
+def mark_failed(task_id: str, error_code: str, error_message: str | None = None) -> None:
     """Mark a task as failed with an error code and desensitized message.
 
     The error_message is always sanitized via get_error_message() to ensure

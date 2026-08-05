@@ -36,8 +36,8 @@ from app.services.assessment_policy import (
     POLICY_VERSION,
 )
 from app.services.assessment_service import (
-    get_assessment_result,
     AssessmentInternalError,
+    get_assessment_result,
 )
 from app.services.task_manager import (
     STATUS_COMPLETED,

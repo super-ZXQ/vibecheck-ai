@@ -9,6 +9,16 @@ Import structure (no circular imports):
 - imported by:  sensitive
 """
 
+from app.scanner.basic_security_rules import BasicSecurityRule
+from app.scanner.deployability_rules import DeployabilityRule
+from app.scanner.documentation_rules import DocumentationConsistencyRule
+from app.scanner.incomplete_rules import (
+    DebugBreakpointRule,
+    ExcessiveDebugOutputRule,
+    PlaceholderReturnRule,
+    TodoCommentRule,
+    UnimplementedCodeRule,
+)
 from app.scanner.rules import (
     AWSAccessKeyRule,
     AWSSecretKeyRule,
@@ -22,16 +32,6 @@ from app.scanner.rules import (
     PrivateKeyRule,
     ProductionEnvWithSecretRule,
 )
-from app.scanner.incomplete_rules import (
-    DebugBreakpointRule,
-    ExcessiveDebugOutputRule,
-    PlaceholderReturnRule,
-    TodoCommentRule,
-    UnimplementedCodeRule,
-)
-from app.scanner.deployability_rules import DeployabilityRule
-from app.scanner.basic_security_rules import BasicSecurityRule
-from app.scanner.documentation_rules import DocumentationConsistencyRule
 
 # Ordered list of default rules.
 # Order matters only for readability; actual priority is determined by RULE_PRIORITY_MAP.

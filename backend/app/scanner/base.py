@@ -32,10 +32,8 @@ from __future__ import annotations
 from abc import ABC
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
 
 from app.core.security.desensitize import mask_untrusted_text
-
 
 SENSITIVE_DATA_DIMENSION = "sensitive_data_security"
 INCOMPLETE_CONTENT_DIMENSION = "incomplete_content"
@@ -106,10 +104,10 @@ class Finding:
     severity: Severity
     confidence: Confidence
     file_path: str
-    line_start: Optional[int]
-    line_end: Optional[int]
-    column_start: Optional[int]
-    column_end: Optional[int]
+    line_start: int | None
+    line_end: int | None
+    column_start: int | None
+    column_end: int | None
     snippet_masked: str
     is_blocking: bool
     finding_type: FindingType
@@ -140,7 +138,7 @@ class ScanNotice:
     """
     rule_id: str
     message: str
-    file_path: Optional[str] = None
+    file_path: str | None = None
 
     def __post_init__(self) -> None:
         """Sanitize file_path via mask_untrusted_text (self-guarantee).

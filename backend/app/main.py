@@ -1,8 +1,8 @@
 """FastAPI application entry point."""
 
 import logging
-from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,8 +33,8 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         )
     # P2-3: Clean up residual temp files from crashed processes.
     from app.services.cleanup_service import (
-        cleanup_residual_temp_files,
         cleanup_expired_tasks,
+        cleanup_residual_temp_files,
     )
     cleanup_residual_temp_files()
     # P2-3: Delete expired reports on startup.

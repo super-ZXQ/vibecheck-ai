@@ -11,6 +11,7 @@ Security guarantees:
 - Never executes any code from the downloaded repository.
 """
 
+import logging
 import os
 import re
 import shutil
@@ -23,6 +24,8 @@ from urllib.parse import urlparse
 import httpx
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class GitHubDownloadError(Exception):
@@ -170,21 +173,19 @@ def _safe_remove_tree(path: Path) -> bool:
     On persistent failure, logs an error message without sensitive content
     (file paths in temp dirs are not considered sensitive).
     """
-    import logging
-
     if not path.exists():
         return True
     try:
         shutil.rmtree(path, onerror=_remove_readonly)
         if path.exists():
-            logging.error(
+            logger.error(
                 "Failed to fully clean up temp directory: %s "
                 "(some files may remain)", path
             )
             return False
         return True
     except Exception as e:
-        logging.error(
+        logger.error(
             "Failed to clean up temp directory: %s (error: %s, no sensitive content)",
             path, type(e).__name__
         )
@@ -196,8 +197,6 @@ def _safe_remove_file(path: Path) -> bool:
 
     On failure, logs an error message without sensitive content.
     """
-    import logging
-
     if not path.exists():
         return True
     try:
@@ -205,7 +204,7 @@ def _safe_remove_file(path: Path) -> bool:
         os.remove(str(path))
         return True
     except Exception as e:
-        logging.error(
+        logger.error(
             "Failed to clean up temp file: %s (error: %s, no sensitive content)",
             path, type(e).__name__
         )

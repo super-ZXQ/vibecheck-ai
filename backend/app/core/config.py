@@ -236,7 +236,7 @@ class Settings(BaseSettings):
 
             parsed = urlsplit(origin)
             try:
-                parsed.port
+                _ = parsed.port  # triggers ValueError if port is invalid
             except ValueError as exc:
                 raise ValueError("CORS origin has an invalid port") from exc
 

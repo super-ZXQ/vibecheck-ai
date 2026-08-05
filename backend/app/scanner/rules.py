@@ -27,6 +27,7 @@ Import structure (no circular imports):
 from __future__ import annotations
 
 import re
+from typing import ClassVar
 
 from app.core.config import settings
 from app.core.security.desensitize import (
@@ -49,7 +50,6 @@ from app.scanner.base import (
     ScanNotice,
     Severity,
 )
-
 
 # ---------------------------------------------------------------------------
 # --- Helper functions ---
@@ -199,9 +199,7 @@ def _is_likely_non_secret(value: str) -> bool:
     if lower in _COMMON_CONFIG_VALUES:
         return True
     # Dotted identifiers like api.internal, db.production (hostnames)
-    if re.match(r"^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$", lower) and "@" not in value:
-        return True
-    return False
+    return bool(re.match(r"^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$", lower) and "@" not in value)
 
 
 def _make_masked_snippet(line_text: str, max_length: int = 200) -> str:
@@ -230,7 +228,7 @@ class _LineSnippetCache:
             snippet = cache.get(i, line)   # computed once, then cached
     """
 
-    __slots__ = ("_lines", "_cache")
+    __slots__ = ("_cache", "_lines")
 
     def __init__(self, lines: list[str]) -> None:
         self._lines = lines
@@ -315,7 +313,7 @@ class BoundedFindingCollector:
         findings = collector.finalize()
     """
 
-    __slots__ = ("_limit", "_findings", "_min_key", "_min_index")
+    __slots__ = ("_findings", "_limit", "_min_index", "_min_key")
 
     def __init__(self, limit: int) -> None:
         # Guard against misconfiguration (limit <= 0). At least 1 so
@@ -696,7 +694,7 @@ class PrivateKeyRule(Rule):
     finding_type = FindingType.CONTENT
 
     # Explicit BEGIN/END pairing table
-    _KEY_PAIRS: dict[str, str] = {
+    _KEY_PAIRS: ClassVar[dict[str, str]] = {
         "-----BEGIN RSA PRIVATE KEY-----": "-----END RSA PRIVATE KEY-----",
         "-----BEGIN EC PRIVATE KEY-----": "-----END EC PRIVATE KEY-----",
         "-----BEGIN OPENSSH PRIVATE KEY-----": "-----END OPENSSH PRIVATE KEY-----",
@@ -894,10 +892,7 @@ class PasswordAssignmentRule(Rule):
                 # fixtures (fake passwords) — downgrade to low severity
                 # instead of scoring as high.
                 is_test_file = (
-                    file_path.startswith("tests/")
-                    or "/tests/" in file_path
-                    or file_path.startswith("test/")
-                    or "/test/" in file_path
+                    file_path.startswith(("tests/", "test/")) or "/tests/" in file_path or "/test/" in file_path
                 )
 
                 # Determine severity/confidence based on placeholder check
@@ -1030,10 +1025,7 @@ class GenericTokenAssignmentRule(Rule):
                 # fixtures (fake keys/tokens) — downgrade to low severity
                 # instead of scoring as high.
                 is_test_file = (
-                    file_path.startswith("tests/")
-                    or "/tests/" in file_path
-                    or file_path.startswith("test/")
-                    or "/test/" in file_path
+                    file_path.startswith(("tests/", "test/")) or "/tests/" in file_path or "/test/" in file_path
                 )
 
                 if is_placeholder or is_test_file:

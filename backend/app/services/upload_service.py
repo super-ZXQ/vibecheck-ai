@@ -110,7 +110,7 @@ async def store_archive_upload(
             f"Extension {filename!r} does not match ZIP content",
         )
     if sniffed == "tar.gz" and not (
-        lowered.endswith(".tar.gz") or lowered.endswith(".tgz")
+        lowered.endswith((".tar.gz", ".tgz"))
     ):
         raise UploadError(
             INVALID_UPLOAD,
@@ -165,14 +165,13 @@ async def store_folder_upload(
         raise UploadError(INVALID_UPLOAD, "Folder upload contains no files")
 
     dest_root.mkdir(parents=True, exist_ok=True)
-    file_count = 0
     total_size = 0
 
     def _reject(code: str, message: str) -> None:
         cleanup_temp_dir(dest_root)
         raise UploadError(code, message)
 
-    for upload_file in files:
+    for file_count, upload_file in enumerate(files, start=1):
         rel_path = (upload_file.filename or "").strip()
         if not rel_path:
             _reject(INVALID_UPLOAD, "Folder upload contains a file without a path")
@@ -189,7 +188,6 @@ async def store_folder_upload(
         except (OSError, ValueError):
             _reject(INVALID_UPLOAD, f"Path escapes destination: {rel_path!r}")
 
-        file_count += 1
         if file_count > settings.max_file_count:
             _reject(
                 UPLOAD_TOO_LARGE,

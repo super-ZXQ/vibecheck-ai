@@ -11,8 +11,8 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from app.scanner.base import (
-    Confidence,
     DEPLOYABILITY_PRODUCTION_DIMENSION,
+    Confidence,
     Finding,
     FindingType,
     RepositoryProbe,
@@ -26,7 +26,6 @@ from app.scanner.incomplete_rules import (
     _code_without_strings,
     is_incomplete_source_file,
 )
-
 
 _REPOSITORY_PATH = "<repository>"
 _ENV_TEMPLATE_NAMES = frozenset({".env.example", ".env.sample", ".env.template"})
@@ -267,10 +266,7 @@ def _is_compose_file(name: str) -> bool:
 
 def _is_container_file(name: str) -> bool:
     return (
-        name == "dockerfile"
-        or name.startswith("dockerfile.")
-        or name == "containerfile"
-        or name.startswith("containerfile.")
+        name == "dockerfile" or name.startswith(("dockerfile.", "containerfile.")) or name == "containerfile"
     )
 
 
@@ -596,11 +592,7 @@ class DeployabilityProbe(RepositoryProbe):
         if name == "config.ru" or lowered.endswith("/bin/rails"):
             self.production_start = True
         if (
-            name == "artisan"
-            or lowered == "public/index.php"
-            or lowered.endswith("/public/index.php")
-            or lowered == "bin/console"
-            or lowered.endswith("/bin/console")
+            name == "artisan" or lowered == "public/index.php" or lowered.endswith(("/public/index.php", "/bin/console")) or lowered == "bin/console"
         ):
             self.production_start = True
         if name.lower() == "program.cs":

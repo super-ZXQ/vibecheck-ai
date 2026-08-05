@@ -50,7 +50,6 @@ GET /api/check/{task_id}/llm-analysis (P1-4):
 import asyncio
 import logging
 import uuid
-from typing import Optional
 
 from fastapi import APIRouter, File, Form, Header, HTTPException, UploadFile, status
 from pydantic import BaseModel
@@ -167,9 +166,9 @@ _SAFE_EMPTY_RESULT: dict = {
 @router.post("/api/check", response_model=CheckResponse, status_code=status.HTTP_202_ACCEPTED)
 async def create_check(
     request: CheckRequest,
-    x_llm_api_key: Optional[str] = Header(default=None, alias="X-LLM-API-KEY"),
-    x_llm_base_url: Optional[str] = Header(default=None, alias="X-LLM-BASE-URL"),
-    x_llm_model: Optional[str] = Header(default=None, alias="X-LLM-MODEL"),
+    x_llm_api_key: str | None = Header(default=None, alias="X-LLM-API-KEY"),
+    x_llm_base_url: str | None = Header(default=None, alias="X-LLM-BASE-URL"),
+    x_llm_model: str | None = Header(default=None, alias="X-LLM-MODEL"),
 ):
     """Create a new project check task.
 
@@ -238,9 +237,9 @@ def _upload_error_http_status(code: str) -> int:
 async def create_upload_check(
     mode: str = Form(default="archive"),
     file: list[UploadFile] = File(...),
-    x_llm_api_key: Optional[str] = Header(default=None, alias="X-LLM-API-KEY"),
-    x_llm_base_url: Optional[str] = Header(default=None, alias="X-LLM-BASE-URL"),
-    x_llm_model: Optional[str] = Header(default=None, alias="X-LLM-MODEL"),
+    x_llm_api_key: str | None = Header(default=None, alias="X-LLM-API-KEY"),
+    x_llm_base_url: str | None = Header(default=None, alias="X-LLM-BASE-URL"),
+    x_llm_model: str | None = Header(default=None, alias="X-LLM-MODEL"),
 ):
     """Create a new project check task from a local upload.
 

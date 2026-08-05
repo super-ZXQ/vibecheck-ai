@@ -24,7 +24,6 @@ from app.scanner.incomplete_rules import (
     is_incomplete_source_file,
 )
 
-
 _REPOSITORY_SNIPPET = "<repository-basic-security-check>"
 _HEALTH_ROUTE_RE = re.compile(
     r"(?:/|['\"])(?:health|ready|readiness|liveness|metrics|docs|openapi)(?:/|['\"]|$)",

@@ -14,15 +14,14 @@ from pathlib import PurePosixPath
 from app.core.config import settings
 from app.core.security.desensitize import mask_snippet
 from app.scanner.base import (
+    INCOMPLETE_CONTENT_DIMENSION,
     Confidence,
     Finding,
     FindingType,
-    INCOMPLETE_CONTENT_DIMENSION,
     Rule,
     Severity,
 )
 from app.scanner.rules import BoundedFindingCollector
-
 
 SOURCE_EXTENSIONS = frozenset({
     ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
@@ -103,12 +102,7 @@ def is_incomplete_source_file(file_path: str) -> bool:
         return False
     stem = path.stem.lower()
     if (
-        name in {"conftest.py", "fixtures.py", "mocks.py"}
-        or stem.startswith("test_")
-        or stem.endswith("_test")
-        or stem.endswith("_spec")
-        or ".test" in stem
-        or ".spec" in stem
+        name in {"conftest.py", "fixtures.py", "mocks.py"} or stem.startswith("test_") or stem.endswith(("_test", "_spec")) or ".test" in stem or ".spec" in stem
     ):
         return False
     return path.suffix.lower() in SOURCE_EXTENSIONS
