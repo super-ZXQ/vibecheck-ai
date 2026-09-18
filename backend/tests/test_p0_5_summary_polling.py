@@ -25,7 +25,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from app.core.config import Settings
+from app.core.config import Settings, settings
 from app.core.error_codes import (
     INTERNAL_ERROR,
 )
@@ -143,7 +143,7 @@ def make_mock_download_result(tmp_path, repo_url="https://github.com/testuser/te
 
 
 def make_mock_extract_clean(tmp_path):
-    dest = Path(tmp_path) / "mock-extract-clean"
+    dest = Path(settings.tmp_dir) / "task-mock-extract-clean"
     dest.mkdir(parents=True, exist_ok=True)
     (dest / "README.md").write_text("# Clean Repo\n\nNo secrets here.\n")
     return ExtractionResult(

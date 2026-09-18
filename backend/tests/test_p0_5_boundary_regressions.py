@@ -41,6 +41,7 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
+from app.core.config import settings
 from app.core.error_codes import (
     SCAN_RESULT_MISSING,
     SCAN_RESULT_NOT_READY,
@@ -209,7 +210,7 @@ def make_mock_download_result(tmp_path, repo_url="https://github.com/testuser/te
 
 def make_mock_extract_clean(tmp_path):
     """Create a mock ExtractionResult with no secrets."""
-    dest = Path(tmp_path) / "mock-extract-clean"
+    dest = Path(settings.tmp_dir) / "task-mock-extract-clean"
     dest.mkdir(parents=True, exist_ok=True)
     (dest / "README.md").write_text("# Clean Repo\n\nNo secrets here.\n")
     return ExtractionResult(

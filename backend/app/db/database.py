@@ -243,6 +243,58 @@ def _get_connection() -> sqlite3.Connection:
     return conn
 
 
+def _migrate_tasks_table(conn: sqlite3.Connection) -> None:
+    """Add production-like task columns to existing SQLite databases.
+
+    Backward compatible: uses ALTER TABLE ADD COLUMN only. Never drops or
+    recreates the table. New columns have safe defaults for historical rows.
+    """
+    columns = conn.execute("PRAGMA table_info(tasks)").fetchall()
+    existing = {col["name"] for col in columns}
+    # (column_name, ddl fragment)
+    migrations: list[tuple[str, str]] = [
+        ("attempt_count", "attempt_count INTEGER NOT NULL DEFAULT 0"),
+        ("max_attempts", "max_attempts INTEGER NOT NULL DEFAULT 3"),
+        ("worker_id", "worker_id TEXT"),
+        ("lease_expires_at", "lease_expires_at TEXT"),
+        ("last_heartbeat_at", "last_heartbeat_at TEXT"),
+        ("next_attempt_at", "next_attempt_at TEXT"),
+        ("failure_category", "failure_category TEXT"),
+        ("resolved_commit_sha", "resolved_commit_sha TEXT"),
+        ("scanner_version", "scanner_version TEXT"),
+        ("deduplication_key", "deduplication_key TEXT"),
+        ("reused_from_task_id", "reused_from_task_id TEXT"),
+        ("cancelled_at", "cancelled_at TEXT"),
+    ]
+    for name, ddl in migrations:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE tasks ADD COLUMN {ddl}")
+
+
+def begin_immediate(conn: sqlite3.Connection) -> None:
+    """Start an IMMEDIATE transaction — exclusive write lock for claim/recover.
+
+    Python's sqlite3 default isolation opens deferred transactions; IMMEDIATE
+    is required so two concurrent claimers cannot both read the same pending
+    row before either writes.
+    """
+    conn.isolation_level = None
+    conn.execute("BEGIN IMMEDIATE")
+
+
+def commit_txn(conn: sqlite3.Connection) -> None:
+    conn.execute("COMMIT")
+    conn.isolation_level = "DEFERRED"
+
+
+def rollback_txn(conn: sqlite3.Connection) -> None:
+    try:
+        conn.execute("ROLLBACK")
+    except sqlite3.Error:
+        pass
+    conn.isolation_level = "DEFERRED"
+
+
 def init_db() -> None:
     """Initialize the database — create tables if they don't exist.
 
@@ -270,14 +322,43 @@ def init_db() -> None:
                     top_level_dir TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    completed_at TEXT
+                    completed_at TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 3,
+                    worker_id TEXT,
+                    lease_expires_at TEXT,
+                    last_heartbeat_at TEXT,
+                    next_attempt_at TEXT,
+                    failure_category TEXT,
+                    resolved_commit_sha TEXT,
+                    scanner_version TEXT,
+                    deduplication_key TEXT,
+                    reused_from_task_id TEXT,
+                    cancelled_at TEXT
                 )
             """)
+            _migrate_tasks_table(conn)
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)
             """)
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_tasks_status_next_attempt
+                ON tasks(status, next_attempt_at)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_tasks_lease_expires
+                ON tasks(lease_expires_at)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_tasks_dedup_key
+                ON tasks(deduplication_key)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_tasks_dedup_status
+                ON tasks(deduplication_key, status)
             """)
             # --- scan_results: one persisted snapshot per task (P0-5) ---
             # result_json contains ONLY desensitized public models from P0-4.

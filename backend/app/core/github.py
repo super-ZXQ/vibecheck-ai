@@ -55,6 +55,8 @@ class DownloadResult:
     temp_file: Path
     repo_info: RepoInfo
     file_size: int
+    # Resolved commit SHA when discoverable from redirect/headers (dedup key).
+    commit_sha: str | None = None
 
 
 # --- URL validation ---
@@ -142,6 +144,22 @@ def _strip_auth_headers(headers: dict[str, str]) -> dict[str, str]:
         k: v for k, v in headers.items()
         if k.lower() not in _AUTH_HEADERS
     }
+
+
+def _extract_commit_sha(redirect_url: str, response_headers: dict | None = None) -> str | None:
+    """Extract a 40-char commit SHA from a codeload redirect or headers."""
+    import re as _re
+    sha_pattern = _re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{40})(?![0-9a-fA-F])")
+    match = sha_pattern.search(redirect_url or "")
+    if match:
+        return match.group(1).lower()
+    if response_headers:
+        for key in ("content-disposition", "x-github-sha", "etag", "ETag"):
+            raw = response_headers.get(key) or ""
+            match = sha_pattern.search(str(raw))
+            if match:
+                return match.group(1).lower()
+    return None
 
 
 def _build_initial_headers() -> dict[str, str]:
@@ -246,6 +264,7 @@ async def download_tarball(repo_url: str) -> DownloadResult:
 
     download_succeeded = False
     total_written = 0
+    resolved_sha: str | None = None
 
     try:
         # Download directly, ignoring ambient HTTP_PROXY/HTTPS_PROXY env vars
@@ -261,99 +280,106 @@ async def download_tarball(repo_url: str) -> DownloadResult:
             max_redirects = 5
 
             while True:
-                response = await client.get(
-                    current_url, headers=current_headers, follow_redirects=False
-                )
-
-                # Handle redirects
-                if response.is_redirect:
-                    redirect_count += 1
-                    if redirect_count > max_redirects:
-                        raise GitHubDownloadError(
-                            f"Too many redirects (max {max_redirects})"
-                        )
-
-                    redirect_url = response.headers.get("location", "")
-                    if not redirect_url:
-                        raise GitHubDownloadError(
-                            "Redirect response missing Location header"
-                        )
-
-                    if not is_allowed_redirect(redirect_url):
-                        parsed = urlparse(redirect_url)
-                        raise GitHubDownloadError(
-                            f"Redirect to disallowed host or scheme: "
-                            f"{parsed.scheme}://{parsed.hostname}"
-                        )
-
-                    # Strip auth headers when crossing host boundaries
-                    redirect_parsed = urlparse(redirect_url)
-                    original_parsed = urlparse(current_url)
-                    if redirect_parsed.hostname != original_parsed.hostname:
-                        current_headers = _strip_auth_headers(current_headers)
-
-                    current_url = redirect_url
-                    await response.aclose()
-                    continue
-
-                # Check HTTP status codes
-                if response.status_code == 404:
-                    raise GitHubDownloadError(
-                        "Repository not found, does not exist, or is private",
-                        code="REPOSITORY_NOT_FOUND",
-                    )
-                if response.status_code == 403:
-                    raise GitHubDownloadError(
-                        "GitHub API rate limit exceeded or access forbidden",
-                        code="GITHUB_RATE_LIMITED",
-                    )
-                if response.status_code == 429:
-                    raise GitHubDownloadError(
-                        "GitHub API rate limit exceeded, please try again later",
-                        code="GITHUB_RATE_LIMITED",
-                    )
-                if response.status_code != 200:
-                    raise GitHubDownloadError(
-                        f"Download failed: HTTP {response.status_code}",
-                        code="DOWNLOAD_FAILED",
-                    )
-
-                # Early rejection via Content-Length (advisory only)
-                content_length = response.headers.get("content-length")
-                if content_length:
-                    try:
-                        cl = int(content_length)
-                        if cl > settings.max_archive_size:
+                # True streaming download — do not buffer the full response.
+                async with client.stream(
+                    "GET",
+                    current_url,
+                    headers=current_headers,
+                    follow_redirects=False,
+                ) as response:
+                    # Handle redirects
+                    if response.is_redirect:
+                        redirect_count += 1
+                        if redirect_count > max_redirects:
                             raise GitHubDownloadError(
-                                f"Archive too large (Content-Length): {cl} bytes "
-                                f"(limit: {settings.max_archive_size} bytes)",
-                                code="DOWNLOAD_TOO_LARGE",
+                                f"Too many redirects (max {max_redirects})"
                             )
-                    except ValueError:
-                        pass  # Malformed Content-Length, rely on streaming check
 
-                # Streaming download with cumulative size enforcement
-                with open(temp_file, "wb") as f:
-                    async for chunk in response.aiter_bytes(chunk_size=65536):
-                        total_written += len(chunk)
-                        if total_written > settings.max_archive_size:
+                        redirect_url = response.headers.get("location", "")
+                        if not redirect_url:
                             raise GitHubDownloadError(
-                                f"Archive too large during streaming: "
-                                f"{total_written} bytes "
-                                f"(limit: {settings.max_archive_size} bytes)",
-                                code="DOWNLOAD_TOO_LARGE",
+                                "Redirect response missing Location header"
                             )
-                        f.write(chunk)
 
-                download_succeeded = True
-                break
+                        if not is_allowed_redirect(redirect_url):
+                            parsed = urlparse(redirect_url)
+                            raise GitHubDownloadError(
+                                f"Redirect to disallowed host or scheme: "
+                                f"{parsed.scheme}://{parsed.hostname}",
+                                code="INVALID_REPOSITORY",
+                            )
+                        resolved_sha = _extract_commit_sha(redirect_url) or resolved_sha
+
+                        # Strip auth headers when crossing host boundaries
+                        redirect_parsed = urlparse(redirect_url)
+                        original_parsed = urlparse(current_url)
+                        if redirect_parsed.hostname != original_parsed.hostname:
+                            current_headers = _strip_auth_headers(current_headers)
+
+                        current_url = redirect_url
+                        continue
+
+                    # Check HTTP status codes
+                    if response.status_code == 404:
+                        raise GitHubDownloadError(
+                            "Repository not found, does not exist, or is private",
+                            code="REPOSITORY_NOT_FOUND",
+                        )
+                    if response.status_code == 403:
+                        raise GitHubDownloadError(
+                            "GitHub API rate limit exceeded or access forbidden",
+                            code="GITHUB_RATE_LIMITED",
+                        )
+                    if response.status_code == 429:
+                        raise GitHubDownloadError(
+                            "GitHub API rate limit exceeded, please try again later",
+                            code="GITHUB_RATE_LIMITED",
+                        )
+                    if response.status_code != 200:
+                        raise GitHubDownloadError(
+                            f"Download failed: HTTP {response.status_code}",
+                            code="DOWNLOAD_FAILED",
+                        )
+                    resolved_sha = (
+                        _extract_commit_sha("", dict(response.headers)) or resolved_sha
+                    )
+
+                    # Early rejection via Content-Length (advisory only)
+                    content_length = response.headers.get("content-length")
+                    if content_length:
+                        try:
+                            cl = int(content_length)
+                            if cl > settings.max_archive_size:
+                                raise GitHubDownloadError(
+                                    f"Archive too large (Content-Length): {cl} bytes "
+                                    f"(limit: {settings.max_archive_size} bytes)",
+                                    code="DOWNLOAD_TOO_LARGE",
+                                )
+                        except ValueError:
+                            pass  # Malformed Content-Length, rely on streaming check
+
+                    # Streaming download with cumulative size enforcement
+                    with open(temp_file, "wb") as f:
+                        async for chunk in response.aiter_bytes(chunk_size=65536):
+                            total_written += len(chunk)
+                            if total_written > settings.max_archive_size:
+                                raise GitHubDownloadError(
+                                    f"Archive too large during streaming: "
+                                    f"{total_written} bytes "
+                                    f"(limit: {settings.max_archive_size} bytes)",
+                                    code="DOWNLOAD_TOO_LARGE",
+                                )
+                            f.write(chunk)
+
+                    download_succeeded = True
+                    break
 
     except GitHubDownloadError:
         raise
     except httpx.TimeoutException:
         raise GitHubDownloadError(
             f"Download timed out after {settings.download_timeout}s",
-            code="DOWNLOAD_FAILED",
+            code="DOWNLOAD_TIMEOUT",
         )
     except httpx.ConnectError:
         raise GitHubDownloadError(
@@ -376,6 +402,7 @@ async def download_tarball(repo_url: str) -> DownloadResult:
         temp_file=temp_file,
         repo_info=repo_info,
         file_size=total_written,
+        commit_sha=resolved_sha,
     )
 
 

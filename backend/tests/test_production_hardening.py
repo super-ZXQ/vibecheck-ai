@@ -238,7 +238,9 @@ class TestReadiness:
         production_app = create_app(make_production_settings())
         response = TestClient(production_app).get("/api/ready")
         assert response.status_code == 200
-        assert response.json() == {"status": "ready"}
+        body = response.json()
+        assert body["status"] == "ready"
+        assert body.get("dependencies", {}).get("database") == "ok"
 
     def test_not_ready_response_is_fixed_and_safe(self, monkeypatch):
         def fail_readiness() -> None:
@@ -253,7 +255,8 @@ class TestReadiness:
         response = TestClient(production_app).get("/api/ready")
 
         assert response.status_code == 503
-        assert response.json() == {"status": "not_ready"}
+        body = response.json()
+        assert body["status"] == "not_ready"
         assert "sensitive" not in response.text
 
     @pytest.mark.parametrize(
@@ -284,7 +287,8 @@ class TestReadiness:
         response = TestClient(production_app).get("/api/ready")
 
         assert response.status_code == 503
-        assert response.json() == {"status": "not_ready"}
+        body = response.json()
+        assert body["status"] == "not_ready"
         assert missing_table not in response.text
 
     def test_not_ready_when_database_connection_fails(self, monkeypatch):
@@ -300,7 +304,8 @@ class TestReadiness:
         response = TestClient(production_app).get("/api/ready")
 
         assert response.status_code == 503
-        assert response.json() == {"status": "not_ready"}
+        body = response.json()
+        assert body["status"] == "not_ready"
         assert "sensitive" not in response.text
 
     def test_not_ready_when_database_is_corrupt(self, test_db):
@@ -310,5 +315,6 @@ class TestReadiness:
         response = TestClient(production_app).get("/api/ready")
 
         assert response.status_code == 503
-        assert response.json() == {"status": "not_ready"}
+        body = response.json()
+        assert body["status"] == "not_ready"
         assert "sqlite" not in response.text.lower()

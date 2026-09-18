@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+from app.core.config import settings
 from app.core.error_codes import (
     ASSESSMENT_INTERNAL_ERROR,
     ASSESSMENT_PERSIST_FAILED,
@@ -124,7 +125,7 @@ def make_mock_download_result(tmp_path, repo_url="https://github.com/testuser/te
 
 def make_mock_extract_result(tmp_path):
     """创建一个 mock ExtractionResult，带有真实的解压目录。"""
-    dest = Path(tmp_path) / "mock-extract"
+    dest = Path(settings.tmp_dir) / "task-mock-extract"
     dest.mkdir(parents=True, exist_ok=True)
     (dest / "README.md").write_text("# Clean Repo\n\nNo secrets here.\n")
     return ExtractionResult(

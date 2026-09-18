@@ -1,0 +1,41 @@
+{
+  "report_version": 1,
+  "generated_at": null,
+  "honesty": {
+    "source": "local_synthetic_or_pytest",
+    "not_production_traffic": true,
+    "github_public_api_load": false
+  },
+  "config": {
+    "max_running_tasks": 2,
+    "max_pending_tasks": 5,
+    "max_task_attempts": 3,
+    "task_lease_seconds": 120
+  },
+  "scenarios": [
+    {"id": 1, "name": "concurrent_submissions_20_50", "status": "partial_pytest", "notes": "claim/concurrency covered in pytest; full Locust soak 未执行"},
+    {"id": 2, "name": "queue_full_429", "status": "executed_pytest"},
+    {"id": 3, "name": "dispatcher_claim_race", "status": "executed_pytest"},
+    {"id": 4, "name": "duplicate_repo_submit", "status": "executed_pytest"},
+    {"id": 5, "name": "github_429_mock", "status": "executed_pytest"},
+    {"id": 6, "name": "github_timeout_mock", "status": "executed_pytest"},
+    {"id": 7, "name": "corrupt_archive", "status": "executed_existing_tests"},
+    {"id": 8, "name": "path_traversal_symlink", "status": "executed_existing_tests"},
+    {"id": 9, "name": "extract_limits", "status": "executed_existing_tests"},
+    {"id": 10, "name": "scan_timeout", "status": "executed"},
+    {"id": 11, "name": "temp_storage_exhausted", "status": "executed_unit_mapping"},
+    {"id": 12, "name": "llm_faults", "status": "executed_existing_tests"},
+    {"id": 13, "name": "service_restart_recovery", "status": "executed_pytest"},
+    {"id": 14, "name": "lease_expiry_recovery", "status": "executed_pytest"},
+    {"id": 15, "name": "cancel_running", "status": "executed_pytest"},
+    {"id": 16, "name": "temp_cleanup", "status": "executed_pytest"},
+    {"id": 17, "name": "locust_soak_p50_p95_p99", "status": "not_executed"},
+    {"id": 18, "name": "multi_process_claim_race", "status": "not_executed", "notes": "single-instance design"}
+  ],
+  "metrics": {
+    "claim_uniqueness": "20/20 unique under 8 threads",
+    "max_concurrent_downloads": "<=2",
+    "queue_full_http_status": 429,
+    "backend_pytest": "see LOAD_TEST_REPORT.md at run time"
+  }
+}

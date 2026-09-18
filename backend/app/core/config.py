@@ -190,9 +190,28 @@ class Settings(BaseSettings):
     # --- Database ---
     database_url: str = "sqlite:///./vibecheck.db"
 
-    # --- Task queue ---
+    # --- Task queue / dispatcher (single-instance bounded concurrency) ---
     max_pending_tasks: int = 5  # max pending tasks in queue
-    max_running_tasks: int = 1  # only 1 task runs at a time (MVP)
+    max_running_tasks: int = Field(default=2, ge=1, le=32)  # bounded concurrency
+
+    # --- Task lease / retry ---
+    task_lease_seconds: int = Field(default=120, ge=10)
+    task_heartbeat_seconds: int = Field(default=20, ge=1)
+    # Runtime reaper interval; must be <= task_lease_seconds.
+    lease_reaper_seconds: int = Field(default=30, ge=1)
+    max_task_attempts: int = Field(default=3, ge=1, le=20)
+    retry_base_seconds: int = Field(default=2, ge=1)
+    retry_max_seconds: int = Field(default=60, ge=1)
+    dispatcher_poll_seconds: float = Field(default=0.05, ge=0.01, le=2.0)
+    shutdown_grace_seconds: float = Field(default=5.0, ge=0.0, le=120.0)
+
+    @field_validator("lease_reaper_seconds")
+    @classmethod
+    def _lease_reaper_bounds(cls, v: int, info) -> int:
+        lease = info.data.get("task_lease_seconds", 120)
+        if v > int(lease):
+            raise ValueError("lease_reaper_seconds must be <= task_lease_seconds")
+        return v
 
     # --- Report expiry (P2-3) ---
     # Completed/failed tasks older than this are eligible for cleanup.

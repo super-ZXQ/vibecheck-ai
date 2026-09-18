@@ -29,6 +29,7 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
+from app.core.config import settings
 from app.core.error_codes import SCAN_RESULT_NOT_READY
 from app.core.github import (
     DownloadResult,
@@ -93,7 +94,7 @@ def make_mock_download_result(tmp_path, repo_url="https://github.com/testuser/te
 
 def make_mock_extract_result(tmp_path):
     """Create a mock ExtractionResult with a real temp directory."""
-    dest = Path(tmp_path) / "mock-extract"
+    dest = Path(settings.tmp_dir) / "task-mock-extract"
     dest.mkdir(parents=True, exist_ok=True)
     (dest / "test-file.txt").write_text("test content")
     return ExtractionResult(

@@ -63,11 +63,23 @@ class MockResponse:
         self._closed = True
 
 
+class _StreamCM:
+    """Async context manager wrapping a MockResponse for client.stream()."""
+
+    def __init__(self, response: MockResponse):
+        self._response = response
+
+    async def __aenter__(self) -> MockResponse:
+        return self._response
+
+    async def __aexit__(self, *args) -> bool:
+        return False
+
+
 class MockClient:
-    """Simulates httpx.AsyncClient for testing."""
+    """Simulates httpx.AsyncClient for testing (stream-first API)."""
 
     def __init__(self, responses: list[MockResponse]):
-        """responses: list of MockResponse, returned in order for each .get() call."""
         self._responses = list(responses)
         self._call_index = 0
         self.request_log: list[dict] = []
@@ -78,21 +90,26 @@ class MockClient:
     async def __aexit__(self, *args):
         pass
 
-    async def get(self, url, headers=None, follow_redirects=False):
-        """Return the next queued response, logging the request."""
+    def _next(self, url, headers, follow_redirects):
         if self._call_index >= len(self._responses):
             raise RuntimeError("No more mock responses queued")
-
         response = self._responses[self._call_index]
         self._call_index += 1
-
         self.request_log.append({
             "url": url,
             "headers": dict(headers) if headers else {},
             "follow_redirects": follow_redirects,
         })
-
         return response
+
+    def stream(self, method, url, headers=None, follow_redirects=False):
+        """Return an async context manager for a streamed response."""
+        response = self._next(url, headers, follow_redirects)
+        return _StreamCM(response)
+
+    async def get(self, url, headers=None, follow_redirects=False):
+        """Legacy non-stream helper for older call sites."""
+        return self._next(url, headers, follow_redirects)
 
 
 def make_mock_client(responses: list[MockResponse]) -> MockClient:

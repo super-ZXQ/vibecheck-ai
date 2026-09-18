@@ -123,11 +123,14 @@ def make_mock_download_result(tmp_path):
 
 
 def make_mock_extract_result(tmp_path):
-    """Create a mock ExtractionResult with a real extraction directory."""
+    """Create a mock ExtractionResult under settings.tmp_dir (VibeCheck naming)."""
+    from pathlib import Path
+
+    from app.core.config import settings
     from app.core.safe_extract import ExtractionResult
-    extract_dir = tmp_path / f"extracted_{uuid.uuid4().hex[:8]}"
-    extract_dir.mkdir()
-    (extract_dir / "test-repo").mkdir()
+    extract_dir = Path(settings.tmp_dir) / f"task-extracted_{uuid.uuid4().hex[:8]}"
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    (extract_dir / "test-repo").mkdir(exist_ok=True)
     (extract_dir / "test-repo" / "README.md").write_text("# Test")
     return ExtractionResult(
         dest_dir=str(extract_dir),

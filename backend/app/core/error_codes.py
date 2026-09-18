@@ -68,6 +68,15 @@ LLM_ANALYSIS_TOO_LARGE = "LLM_ANALYSIS_TOO_LARGE"
 # --- Service lifecycle ---
 SERVICE_RESTARTED = "SERVICE_RESTARTED"
 
+# --- Task lifecycle (production-like execution) ---
+TASK_CANCELLED = "TASK_CANCELLED"
+DEAD_TASK = "DEAD_TASK"
+MAX_ATTEMPTS_EXCEEDED = "MAX_ATTEMPTS_EXCEEDED"
+DOWNLOAD_TIMEOUT = "DOWNLOAD_TIMEOUT"
+TEMP_STORAGE_EXHAUSTED = "TEMP_STORAGE_EXHAUSTED"
+INVALID_ARCHIVE = "INVALID_ARCHIVE"
+INVALID_REPOSITORY = "INVALID_REPOSITORY"
+
 # --- Catch-all ---
 INTERNAL_ERROR = "INTERNAL_ERROR"
 
@@ -111,6 +120,13 @@ _ERROR_MESSAGES = {
     LLM_ANALYSIS_PERSIST_FAILED: "LLM 分析结果保存失败，已使用回退模板。",
     LLM_ANALYSIS_TOO_LARGE: "LLM 分析结果数据量过大，已使用回退模板。",
     SERVICE_RESTARTED: "服务在任务执行期间重启，请重新提交检测。",
+    TASK_CANCELLED: "任务已取消。",
+    DEAD_TASK: "任务多次失败后已终止，不再自动重试。",
+    MAX_ATTEMPTS_EXCEEDED: "任务达到最大尝试次数，已终止。",
+    DOWNLOAD_TIMEOUT: "下载超时，请稍后重试。",
+    TEMP_STORAGE_EXHAUSTED: "临时存储空间不足，请稍后重试。",
+    INVALID_ARCHIVE: "压缩包格式无效，已拒绝处理。",
+    INVALID_REPOSITORY: "仓库地址无效或无法访问。",
     INTERNAL_ERROR: "内部错误，请稍后重试。",
 }
 

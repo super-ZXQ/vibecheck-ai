@@ -68,6 +68,7 @@ from app.core.error_codes import (
 )
 from app.core.github import GitHubDownloadError, parse_repo_url
 from app.core.safe_extract import cleanup_temp_dir, prepare_extract_dest
+from app.core.scanner_version import SCANNER_VERSION
 from app.services.background_runner import trigger_queue_processing
 from app.services.llm_service import get_llm_analysis
 from app.services.llm_user_config import store_user_config
@@ -80,9 +81,11 @@ from app.services.task_manager import (
     STATUS_FAILED,
     STATUS_PENDING,
     STATUS_RUNNING,
-    create_task,
+    QueueCapacityError,
+    admit_repo_task,
+    admit_upload_task,
     get_task,
-    is_queue_full,
+    request_cancel,
 )
 from app.services.upload_service import (
     LOCAL_UPLOAD_PREFIX,
@@ -173,15 +176,12 @@ async def create_check(
     """Create a new project check task.
 
     - Validates the repo URL.
-    - Checks if the queue is full (max 5 pending).
-    - Creates a pending task.
-    - Triggers background processing.
-    - Optional X-LLM-* headers bind a caller-supplied LLM config (API key,
-      base URL, model) to this task for the LLM analysis stage. Credentials
-      live in process memory only — validated, never persisted, never logged,
-      never returned, and removed when the task finishes.
+    - Checks if the queue is full (429 QUEUE_FULL).
+    - Running coalescing: same normalized repo + scanner_version that is
+      already running/pending returns the existing task_id (no second scan).
+    - Creates a pending task and starts/ensures the bounded dispatcher.
+    - Optional X-LLM-* headers bind in-memory credentials only.
     """
-    # Validate repo URL
     try:
         repo_info = parse_repo_url(request.repo_url)
     except GitHubDownloadError:
@@ -193,8 +193,15 @@ async def create_check(
             },
         )
 
-    # Check queue capacity
-    if is_queue_full():
+    try:
+        task, created = await asyncio.to_thread(
+            admit_repo_task,
+            repo_info.url,
+            repo_info.owner,
+            repo_info.repo,
+            scanner_version=SCANNER_VERSION,
+        )
+    except QueueCapacityError:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail={
@@ -203,16 +210,15 @@ async def create_check(
             },
         )
 
-    # Create pending task
-    task = create_task(
-        repo_url=repo_info.url,
-        owner=repo_info.owner,
-        repo_name=repo_info.repo,
-    )
+    if not created:
+        return CheckResponse(
+            task_id=task.id,
+            status=task.api_status,
+            check_url=f"/api/check/{task.id}",
+        )
 
-    # Trigger background processing (non-blocking)
     store_user_config(task.id, x_llm_api_key, x_llm_base_url, x_llm_model)
-    asyncio.create_task(trigger_queue_processing())
+    await trigger_queue_processing()
 
     return CheckResponse(
         task_id=task.id,
@@ -255,16 +261,7 @@ async def create_upload_check(
 
     Optional X-LLM-* headers work exactly as on POST /api/check.
     """
-    # Check queue capacity (shared with URL submissions).
-    if is_queue_full():
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail={
-                "error_code": QUEUE_FULL,
-                "error_message": get_error_message(QUEUE_FULL),
-            },
-        )
-
+    # Capacity is enforced atomically in admit_upload_task after staging.
     if not file:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -309,13 +306,22 @@ async def create_upload_check(
 
     # Only now create the task (rejected uploads never create tasks).
     try:
-        task = create_task(
+        task = admit_upload_task(
             repo_url=f"{LOCAL_UPLOAD_PREFIX}{uuid.uuid4().hex}",
             owner="local",
             repo_name="上传项目",
         )
         staged = upload_source_dir(task.id)
         dest_root.rename(staged)
+    except QueueCapacityError:
+        cleanup_temp_dir(dest_root)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "error_code": QUEUE_FULL,
+                "error_message": get_error_message(QUEUE_FULL),
+            },
+        )
     except Exception as e:
         cleanup_temp_dir(dest_root)
         logger.error("Failed to create upload task: %s", type(e).__name__)
@@ -328,12 +334,83 @@ async def create_upload_check(
         )
 
     store_user_config(task.id, x_llm_api_key, x_llm_base_url, x_llm_model)
-    asyncio.create_task(trigger_queue_processing())
+    await trigger_queue_processing()
 
     return CheckResponse(
         task_id=task.id,
         status=task.status,
         check_url=f"/api/check/{task.id}",
+    )
+
+
+class CancelResponse(BaseModel):
+    task_id: str
+    status: str
+    cancelled: bool
+    error_code: str | None = None
+
+
+@router.post(
+    "/api/check/{task_id}/cancel",
+    response_model=CancelResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def cancel_check(task_id: str):
+    """Cancel a queued or running task. Idempotent for terminal tasks.
+
+    - queued/pending → cancelled (immediate)
+    - running → cancel requested; worker stops between stages; terminal cancelled
+    - completed/failed/dead/cancelled → returns current status (idempotent)
+    - missing task → 404
+    """
+    try:
+        uuid.UUID(task_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "error_code": "INVALID_TASK_ID",
+                "error_message": "任务ID格式无效。",
+            },
+        )
+
+    task = get_task(task_id)
+    if task is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error_code": "TASK_NOT_FOUND",
+                "error_message": "任务不存在。",
+            },
+        )
+
+    # Signal in-process worker first, then persist cancel state.
+    try:
+        if task.status == STATUS_RUNNING:
+            from app.services.background_runner import _get_cancel_event
+            _get_cancel_event(task_id).set()
+    except Exception:
+        pass
+
+    resulting = await asyncio.to_thread(request_cancel, task_id)
+    final = get_task(task_id)
+    final_status = final.api_status if final else resulting
+    cancelled = bool(
+        final and final.status == "cancelled"
+    ) or resulting == "cancelled"
+    # Terminal non-cancel outcomes remain idempotent no-ops.
+    if final and final.status in (STATUS_COMPLETED, STATUS_FAILED):
+        cancelled = False
+
+    return CancelResponse(
+        task_id=task_id,
+        status=final_status if final else resulting,
+        cancelled=cancelled,
+        error_code=(
+            "TASK_CANCELLED"
+            if cancelled
+            else (final.error_code if final else None)
+        ),
     )
 
 

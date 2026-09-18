@@ -28,8 +28,43 @@
 | 前端测试 | Playwright (e2e) + Node 内置测试运行器 (单元) |
 | 后端 | FastAPI + Pydantic（SQLite 直连，无 ORM） |
 | 后端测试 | pytest |
-| 存储 | SQLite |
+| 存储 | SQLite（WAL + busy_timeout） |
+| 任务执行 | **single-instance bounded concurrency**（默认 `MAX_RUNNING_TASKS=2`） |
 | 运行 | Docker Compose（开发 / 生产双模式） |
+
+## 任务执行能力（诚实声明）
+
+本项目的工程主线是 **安全输入处理 + 可靠后台任务**，不是 LangGraph / RAG /
+Text-to-SQL / Kafka / Kubernetes。
+
+当前实现（可由代码与测试证明）：
+
+- **有界并发**：默认最多 2 个任务同时运行；Dispatcher 持续补满空闲槽位。
+- **原子领取**：`claim_next_pending()` 使用 SQLite `BEGIN IMMEDIATE`，同一任务不会被领取两次。
+- **Lease 与心跳**：运行任务定期续约；崩溃后 `recover_expired_tasks()` 按 lease 恢复，而不是把队列全部标失败。
+- **有界重试**：瞬时错误（GitHub 429、超时等）指数退避重试；非法仓库/恶意压缩包等永久错误不重试。
+- **去重**：`normalized_repo_url + resolved_commit_sha + scanner_version` 已完成结果可安全复用；同一仓库运行中提交会合并。
+- **取消**：`POST /api/check/{task_id}/cancel` 幂等；清理临时目录与内存 LLM 凭据。
+- **BYOK**：用户 LLM Key 仅存进程内存，不落库、不写日志、不进指标 label。
+- **可观测性**：`/metrics`（Prometheus 文本）与 `/api/ready`（数据库就绪；LLM 降级单独展示）。
+
+**边界：**
+
+- 这是 **single-instance bounded concurrency**，使用 **SQLite WAL**，**不是**大规模分布式队列。
+- 压测与故障注入使用 **本地合成仓库 / mock**，不是 GitHub 公共接口高频压测，也 **没有**真实线上业务流量（除非后续另有部署记录）。
+- 详见 `docs/TASK_EXECUTION.md`、`docs/RESILIENCE.md`、`docs/LOAD_TEST_REPORT.md`、`docs/PUBLIC_DEPLOYMENT.md`。
+
+### 任务执行相关配置
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `MAX_PENDING_TASKS` | 5 | 队列容量，满则 `429 QUEUE_FULL` |
+| `MAX_RUNNING_TASKS` | 2 | 有界并发 |
+| `TASK_LEASE_SECONDS` | 120 | 任务 lease |
+| `TASK_HEARTBEAT_SECONDS` | 20 | 心跳间隔 |
+| `MAX_TASK_ATTEMPTS` | 3 | 最大尝试次数 |
+| `RETRY_BASE_SECONDS` / `RETRY_MAX_SECONDS` | 2 / 60 | 退避 |
+| `LEASE_REAPER_SECONDS` | 30 | 运行期 lease 回收间隔（≤ lease） |
 
 ## 快速开始
 
@@ -154,12 +189,21 @@ HSTS；本机 HTTP 验收仅用于确认响应头存在，不能替代真实 TLS
 | `GET /api/check/{task_id}/repair-plan` | 修复计划（分组修复指令 + Agent Prompt） |
 | `GET /api/check/{task_id}/llm-analysis` | LLM 分析（非阻断，409 表示不可用并回退模板） |
 
-### 健康检查
+### 取消任务
+
+`POST /api/check/{task_id}/cancel`
+
+- `pending`/`running` 可取消；`completed`/`failed`/`cancelled`/`dead` 重复取消幂等。
+- API 层将 `cancelled`/`dead` 映射为 `failed`（前端兼容），并附带 `TASK_CANCELLED` 等 `error_code`。
+- 取消会清理任务临时目录与内存中的用户 LLM 凭据。
+
+### 健康检查与指标
 
 | 端点 | 用途 |
 | --- | --- |
 | `GET /api/health` | 存活探针 |
-| `GET /api/ready` | 就绪探针（生产 compose 健康检查使用） |
+| `GET /api/ready` | 就绪探针（检查数据库；LLM 不可用单独展示，不导致整体 not_ready） |
+| `GET /metrics` | Prometheus 文本指标（禁止高基数 label：repo/task/路径/密钥） |
 
 所有错误均返回脱敏后的 `error_code`（如 `GITHUB_RATE_LIMITED`、
 `DOWNLOAD_TOO_LARGE`、`SCAN_TIMEOUT`、`REPAIR_PLAN_NOT_READY`）与对应的

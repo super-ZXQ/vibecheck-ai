@@ -24,6 +24,7 @@ from unittest.mock import patch
 
 import pytest
 
+from app.core.config import settings
 from app.core.error_codes import (
     SCAN_INTERNAL_ERROR,
     SCAN_RESULT_PERSIST_FAILED,
@@ -82,7 +83,7 @@ def make_mock_download_result(tmp_path, repo_url="https://github.com/testuser/te
 
 def make_mock_extract_with_token(tmp_path):
     """Create a mock ExtractionResult with a synthetic token in a file."""
-    dest = Path(tmp_path) / "mock-extract-token"
+    dest = Path(settings.tmp_dir) / "task-mock-extract-token"
     dest.mkdir(parents=True, exist_ok=True)
     # Place a synthetic GitHub token in a file
     config_file = dest / "config.py"
@@ -97,7 +98,7 @@ def make_mock_extract_with_token(tmp_path):
 
 def make_mock_extract_clean(tmp_path):
     """Create a mock ExtractionResult with no secrets."""
-    dest = Path(tmp_path) / "mock-extract-clean"
+    dest = Path(settings.tmp_dir) / "task-mock-extract-clean"
     dest.mkdir(parents=True, exist_ok=True)
     (dest / "README.md").write_text("# Clean Repo\n\nNo secrets here.\n")
     return ExtractionResult(
@@ -252,9 +253,9 @@ class TestPipelineIntegration:
         stage_updates = []
         original_mark_running = task_manager.mark_running
 
-        def tracking_mark_running(task_id, stage, progress):
+        def tracking_mark_running(task_id, stage, progress, worker_id=None):
             stage_updates.append((stage, progress))
-            original_mark_running(task_id, stage, progress)
+            return original_mark_running(task_id, stage, progress, worker_id=worker_id)
 
         with patch(
             "app.services.background_runner.download_tarball",

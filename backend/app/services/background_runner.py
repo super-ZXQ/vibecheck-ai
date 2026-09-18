@@ -1,53 +1,33 @@
-"""Background task runner —processes download + extract + scan + assess + repair sequentially.
+"""Background task dispatcher — single-instance bounded concurrency.
 
-Concurrency model (MVP):
-- Only 1 task runs at a time (global asyncio.Lock).
-- Pending tasks wait in the SQLite queue.
-- After each task completes, the next pending task is automatically picked up.
+Concurrency model:
+- Dispatcher loop continuously fills free execution slots (max_running_tasks).
+- Claiming uses claim_next_pending() with SQLite BEGIN IMMEDIATE.
+- asyncio.Semaphore + active-task set bound concurrency.
+- Blocking work (SQLite, extract, scan, cleanup) runs via asyncio.to_thread.
+- Heartbeat extends task leases while work is in flight.
+- Cancel is cooperative: workers check cancellation between stages.
+- Crash recovery: recover_expired_tasks() re-queues expired leases.
 
-Pipeline stages (P0-7):
-  download 鈫?extract 鈫?scan 鈫?persist scan result 鈫?assess 鈫?persist
-  assessment 鈫?generate repair plan 鈫?persist repair plan 鈫?completed 鈫?cleanup
+Honest capability statement (README):
+This is **single-instance bounded concurrency** on SQLite WAL — not a
+distributed queue. Python locks reduce contention; DB transactions are the
+correctness boundary for claim/recover.
 
-Error handling:
-- All errors are mapped to machine-readable error codes.
-- error_message is always desensitized —no tokens, paths, or stacks.
-- Temp files are always cleaned up via try/finally.
-- No code from the repository is ever executed.
-- Scanner exceptions are caught and mapped to SCAN_INTERNAL_ERROR.
-- Scan persistence exceptions are caught and mapped to SCAN_RESULT_PERSIST_FAILED.
-- Oversized scan results are caught and mapped to SCAN_RESULT_TOO_LARGE.
-- Assessment exceptions are caught and mapped to ASSESSMENT_INTERNAL_ERROR
-  or ASSESSMENT_PERSIST_FAILED or ASSESSMENT_RESULT_TOO_LARGE.
-- Repair plan exceptions are caught and mapped to REPAIR_PLAN_INTERNAL_ERROR
-  or REPAIR_PLAN_PERSIST_FAILED or REPAIR_PLAN_TOO_LARGE.
-- Logs never contain str(exc), repr(exc), repo content, or absolute paths.
+Pipeline stages:
+  download → extract → scan → persist → assess → repair → llm → completed
 
-Non-blocking I/O (P0-5/P0-6/P0-7):
-- scan_directory, save_scan_result, run_assessment, and
-  generate_and_save_repair_plan are synchronous, CPU/IO-bound operations.
-  They are executed via asyncio.to_thread so the FastAPI event loop
-  stays responsive.
-- P2-3: Each stage is wrapped in asyncio.wait_for with a configurable
-  timeout. On timeout, the task is marked failed with a specific
-  error code (EXTRACT_TIMEOUT, SCAN_TIMEOUT, ASSESSMENT_TIMEOUT,
-  REPAIR_PLAN_TIMEOUT) and temp files are cleaned up.
-- Cleanup (temp file deletion) only runs AFTER the thread completes,
-  guaranteed by await on asyncio.to_thread.
-
-Repair plan boundary (P0-7):
-- Repair plan reads ONLY from persisted scan_results and
-  assessment_results (never from temp directory or memory).
-- Repair plan must succeed BEFORE mark_completed.
-- If repair plan generation fails, the task is marked failed —even if
-  scan_results and assessment_results were already persisted.
-  The failed task's repair plan API will NOT return residual data.
+Security:
+- error_message always desensitized; logs never contain secrets/keys/paths.
+- Temp files cleaned in finally; cancel populates BYOK memory credentials.
 """
+
+from __future__ import annotations
 
 import asyncio
 import logging
 import os
-import tarfile
+import time
 from pathlib import Path
 
 from app.core.config import settings
@@ -57,6 +37,7 @@ from app.core.error_codes import (
     ASSESSMENT_RESULT_TOO_LARGE,
     ASSESSMENT_TIMEOUT,
     DOWNLOAD_FAILED,
+    DOWNLOAD_TIMEOUT,
     DOWNLOAD_TOO_LARGE,
     EXTRACT_TIMEOUT,
     EXTRACTION_LIMIT_EXCEEDED,
@@ -72,6 +53,7 @@ from app.core.error_codes import (
     SCAN_RESULT_PERSIST_FAILED,
     SCAN_RESULT_TOO_LARGE,
     SCAN_TIMEOUT,
+    TEMP_STORAGE_EXHAUSTED,
     UNSAFE_ARCHIVE,
     get_error_message,
 )
@@ -86,10 +68,11 @@ from app.core.safe_extract import (
     ExtractionResult,
     cleanup_temp_dir,
     consume_extract,
-    reserve_extract,
+    prepare_extract_dest,
     safe_extract_to_temp,
 )
 from app.scanner.sensitive import scan_directory
+from app.services import metrics as metrics_mod
 from app.services.assessment_service import (
     AssessmentInternalError,
     AssessmentPersistError,
@@ -105,6 +88,19 @@ from app.services.repair_service import (
     generate_and_save_repair_plan,
 )
 from app.services.scan_result_service import ScanResultTooLargeError, save_scan_result
+from app.services.task_errors import (
+    DOWNLOAD_TIMEOUT as CAT_DOWNLOAD_TIMEOUT,
+)
+from app.services.task_errors import (
+    GITHUB_RATE_LIMITED as CAT_GITHUB_RATE_LIMITED,
+)
+from app.services.task_errors import (
+    GITHUB_TEMPORARY_ERROR,
+    category_for_error_code,
+)
+from app.services.task_errors import (
+    TEMP_STORAGE_EXHAUSTED as CAT_TEMP_STORAGE,
+)
 from app.services.task_manager import (
     STAGE_ANALYZING,
     STAGE_ASSESSING,
@@ -112,65 +108,110 @@ from app.services.task_manager import (
     STAGE_EXTRACTING,
     STAGE_REPAIRING,
     STAGE_SCANNING,
-    get_oldest_pending,
+    STATUS_PENDING,
+    STATUS_RUNNING,
+    claim_next_pending,
+    fail_or_retry,
+    find_completed_by_repo_sha,
     get_task,
+    has_claimable_pending,
+    is_cancel_requested,
+    is_queue_full,
+    make_worker_id,
+    mark_cancelled,
     mark_completed,
-    mark_failed,
     mark_running,
+    recover_expired_tasks,
+    refresh_queue_metrics,
+    set_resolved_commit_sha,
+    touch_heartbeat,
 )
 from app.services.upload_service import LOCAL_UPLOAD_PREFIX, upload_source_dir
 
 logger = logging.getLogger(__name__)
 
-# Global lock —ensures only 1 task runs at a time
+# --- Dispatcher state ---
 _lock = asyncio.Lock()
-_is_processing = False
+_is_processing = False  # legacy flag (kept for reset_runner_state compatibility)
+_dispatcher_task: asyncio.Task | None = None
+_active: set[asyncio.Task] = set()
+_stopping = False
+_worker_id: str | None = None
+_cancel_events: dict[str, asyncio.Event] = {}
+
+# Task-dir name prefixes VibeCheck is allowed to delete under settings.tmp_dir.
+_ALLOWED_TASK_DIR_PREFIXES = ("task-", "upload-", "download-", "extract-")
 
 
-def _map_download_error(error: GitHubDownloadError) -> tuple[str, str]:
-    """Map a GitHubDownloadError to an (error_code, safe_message) pair.
+class OwnershipLost(Exception):
+    """Claim token no longer owns the task (cancel / recover / re-claim)."""
 
-    Prefers the structured ``code`` attached at the raise site; falls back
-    to substring matching of the message for errors constructed elsewhere
-    (e.g. by tests or legacy callers).
-    """
+
+def _get_worker_id() -> str:
+    global _worker_id
+    if _worker_id is None:
+        _worker_id = make_worker_id()
+    return _worker_id
+
+
+def _get_cancel_event(task_id: str) -> asyncio.Event:
+    if task_id not in _cancel_events:
+        _cancel_events[task_id] = asyncio.Event()
+    return _cancel_events[task_id]
+
+
+def _map_download_error(error: GitHubDownloadError) -> tuple[str, str, str]:
+    """Map GitHubDownloadError → (error_code, safe_message, failure_category)."""
     code = getattr(error, "code", None)
-    if code in {
+    known = {
         REPOSITORY_NOT_FOUND,
         PRIVATE_REPOSITORY,
         GITHUB_RATE_LIMITED,
         DOWNLOAD_TOO_LARGE,
         DOWNLOAD_FAILED,
-    }:
-        return code, get_error_message(code)
+        DOWNLOAD_TIMEOUT,
+        TEMP_STORAGE_EXHAUSTED,
+        "INVALID_REPOSITORY",
+        "DOWNLOAD_TIMEOUT",
+    }
+    if code in known:
+        category = {
+            GITHUB_RATE_LIMITED: CAT_GITHUB_RATE_LIMITED,
+            DOWNLOAD_TIMEOUT: CAT_DOWNLOAD_TIMEOUT,
+            "DOWNLOAD_TIMEOUT": CAT_DOWNLOAD_TIMEOUT,
+        }.get(code, category_for_error_code(code))
+        return code, get_error_message(code), category
 
     msg = str(error).lower()
     if "not found" in msg or "does not exist" in msg:
-        return REPOSITORY_NOT_FOUND, get_error_message(REPOSITORY_NOT_FOUND)
+        return REPOSITORY_NOT_FOUND, get_error_message(REPOSITORY_NOT_FOUND), "INVALID_REPOSITORY"
     if "private" in msg:
-        return PRIVATE_REPOSITORY, get_error_message(PRIVATE_REPOSITORY)
+        return PRIVATE_REPOSITORY, get_error_message(PRIVATE_REPOSITORY), "INVALID_REPOSITORY"
     if "rate limit" in msg or "429" in msg or "403" in msg:
-        return GITHUB_RATE_LIMITED, get_error_message(GITHUB_RATE_LIMITED)
+        return GITHUB_RATE_LIMITED, get_error_message(GITHUB_RATE_LIMITED), CAT_GITHUB_RATE_LIMITED
     if "too large" in msg or "content-length" in msg or "streaming" in msg:
-        return DOWNLOAD_TOO_LARGE, get_error_message(DOWNLOAD_TOO_LARGE)
-    return DOWNLOAD_FAILED, get_error_message(DOWNLOAD_FAILED)
+        return DOWNLOAD_TOO_LARGE, get_error_message(DOWNLOAD_TOO_LARGE), "DOWNLOAD_TOO_LARGE"
+    if "timed out" in msg or "timeout" in msg:
+        return DOWNLOAD_TIMEOUT, get_error_message(DOWNLOAD_TIMEOUT), CAT_DOWNLOAD_TIMEOUT
+    return (
+        DOWNLOAD_FAILED,
+        get_error_message(DOWNLOAD_FAILED),
+        GITHUB_TEMPORARY_ERROR,
+    )
 
 
-def _map_extraction_error(error: ExtractionError) -> tuple[str, str]:
-    """Map an ExtractionError to an (error_code, safe_message) pair."""
+def _map_extraction_error(error: ExtractionError) -> tuple[str, str, str]:
     msg = str(error).lower()
     if "too large" in msg or "exceeds limit" in msg or "too many files" in msg:
-        return EXTRACTION_LIMIT_EXCEEDED, get_error_message(EXTRACTION_LIMIT_EXCEEDED)
-    return UNSAFE_ARCHIVE, get_error_message(UNSAFE_ARCHIVE)
+        return (
+            EXTRACTION_LIMIT_EXCEEDED,
+            get_error_message(EXTRACTION_LIMIT_EXCEEDED),
+            "EXTRACTION_LIMIT_EXCEEDED",
+        )
+    return UNSAFE_ARCHIVE, get_error_message(UNSAFE_ARCHIVE), "INVALID_ARCHIVE"
 
 
 def _stat_directory(path: Path) -> ExtractionResult:
-    """Compute file count / total size / top-level dir of a staged upload.
-
-    Walks the full tree (no file cap — the size and count limits are
-    enforced during extraction/staging, before this is called).
-    Runs in a worker thread via asyncio.to_thread.
-    """
     count = 0
     total = 0
     top_level: str | None = None
@@ -196,389 +237,546 @@ def _stat_directory(path: Path) -> ExtractionResult:
     )
 
 
-async def _download_and_extract(
-    task_id: str, repo_url: str,
-) -> tuple[DownloadResult | None, str | None, ExtractionResult | None]:
-    """Stage 1 + 2 for URL-sourced tasks: download tarball and extract it.
+def _cleanup_task_dir(task_id: str, path: str | Path | None) -> bool:
+    """Delete a task-scoped temp path only under settings.tmp_dir.
 
-    On success returns ``(download_result, extract_dest, extract_result)``.
-    On failure marks the task as failed with a desensitized error and
-    returns ``(None, None, None)``.
+    Production policy:
+    - target must resolve strictly under settings.tmp_dir
+    - directory name must match a VibeCheck-created prefix
+    - filesystem roots and system-temp trees are always rejected
     """
+    if path is None:
+        return True
+    try:
+        target = Path(path).resolve()
+        tmp_root = Path(settings.tmp_dir).resolve()
+        if target == tmp_root or target.parent == target:
+            logger.error("Refusing to clean unsafe temp path for task")
+            metrics_mod.inc_counter("vibecheck_cleanup_failures_total")
+            return False
+        try:
+            rel = target.relative_to(tmp_root)
+        except ValueError:
+            logger.error("Refusing to clean path outside settings.tmp_dir")
+            metrics_mod.inc_counter("vibecheck_cleanup_failures_total")
+            return False
+        name = rel.parts[0] if rel.parts else target.name
+        allowed_name = any(name.startswith(p) for p in _ALLOWED_TASK_DIR_PREFIXES) or any(
+            any(part.startswith(p) for p in _ALLOWED_TASK_DIR_PREFIXES)
+            for part in rel.parts
+        )
+        if not allowed_name:
+            logger.error("Refusing to clean non-VibeCheck temp directory")
+            metrics_mod.inc_counter("vibecheck_cleanup_failures_total")
+            return False
+    except (ValueError, OSError, RuntimeError):
+        logger.error("Refusing to clean unsafe temp path for task")
+        metrics_mod.inc_counter("vibecheck_cleanup_failures_total")
+        return False
+    try:
+        cleanup_temp_dir(str(target))
+        return True
+    except Exception:
+        logger.error("Failed to clean temp dir for task")
+        metrics_mod.inc_counter("vibecheck_cleanup_failures_total")
+        return False
+
+
+async def _heartbeat_loop(
+    task_id: str, stop_event: asyncio.Event, claim_token: str | None
+) -> None:
+    """Periodically extend the task lease for this claim token only."""
+    interval = max(1, settings.task_heartbeat_seconds)
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            return
+        except TimeoutError:
+            pass
+        try:
+            ok = await asyncio.to_thread(touch_heartbeat, task_id, claim_token)
+            if not ok and claim_token is not None:
+                # Lost ownership — stop renewing; pipeline fencing will halt work.
+                return
+        except Exception:
+            logger.warning("Heartbeat update failed for task %s", task_id)
+
+
+def _check_cancelled(task_id: str) -> bool:
+    cancel_event = _get_cancel_event(task_id)
+    if cancel_event.is_set():
+        return True
+    try:
+        return is_cancel_requested(task_id)
+    except Exception:
+        return False
+
+
+def _ensure_owned(task_id: str, claim_token: str | None) -> None:
+    """Raise OwnershipLost when the claim token no longer owns the task."""
+    if claim_token is None:
+        return
+    task = get_task(task_id)
+    if task is None:
+        raise OwnershipLost("task missing")
+    if task.is_terminal or task.worker_id != claim_token:
+        raise OwnershipLost("claim token fenced")
+
+
+def _mark_running_owned(
+    task_id: str, stage: str, progress: int, claim_token: str | None
+) -> None:
+    ok = mark_running(task_id, stage, progress, worker_id=claim_token)
+    if not ok:
+        raise OwnershipLost("mark_running fenced")
+
+
+async def _download_and_extract(
+    task_id: str,
+    repo_url: str,
+    claim_token: str | None = None,
+) -> tuple[DownloadResult | None, str | None, ExtractionResult | None]:
     download_result = None
     extract_dest = None
 
-    # --- Stage 1: Download ---
-    mark_running(task_id, STAGE_DOWNLOADING, 10)
+    _mark_running_owned(task_id, STAGE_DOWNLOADING, 10, claim_token)
+    if _check_cancelled(task_id):
+        mark_cancelled(task_id)
+        return None, None, None
+
     try:
         download_result = await download_tarball(repo_url)
     except GitHubDownloadError as e:
-        error_code, safe_msg = _map_download_error(e)
-        mark_failed(task_id, error_code, safe_msg)
+        error_code, safe_msg, category = _map_download_error(e)
+        fail_or_retry(
+            task_id, error_code, safe_msg,
+            failure_category=category, worker_id=claim_token,
+        )
+        return download_result, None, None
+    except OSError as e:
+        if getattr(e, "errno", None) == 28:  # ENOSPC
+            fail_or_retry(
+                task_id,
+                TEMP_STORAGE_EXHAUSTED,
+                get_error_message(TEMP_STORAGE_EXHAUSTED),
+                failure_category=CAT_TEMP_STORAGE,
+                worker_id=claim_token,
+            )
+        else:
+            fail_or_retry(
+                task_id, DOWNLOAD_FAILED, get_error_message(DOWNLOAD_FAILED),
+                failure_category=GITHUB_TEMPORARY_ERROR,
+                worker_id=claim_token,
+            )
         return download_result, None, None
 
-    # --- Stage 2: Extract ---
-    mark_running(task_id, STAGE_EXTRACTING, 50)
-    try:
-        # Read the downloaded file into bytes for extraction
-        # (max_archive_size is 50MB, acceptable for MVP)
+    if download_result and download_result.commit_sha:
         try:
-            tarball_bytes = download_result.temp_file.read_bytes()
-        except Exception as e:
-            logger.error(
-                "Failed to read downloaded archive for task %s: %s",
-                task_id, type(e).__name__,
-            )
-            mark_failed(task_id, DOWNLOAD_FAILED, get_error_message(DOWNLOAD_FAILED))
-            return download_result, None, None
+            _ensure_owned(task_id, claim_token)
+            set_resolved_commit_sha(task_id, download_result.commit_sha)
+        except OwnershipLost:
+            cleanup_download(download_result.temp_file)
+            return None, None, None
+        except Exception:
+            logger.warning("Failed to persist commit SHA for task")
 
-        # Reserve the destination path + cancel event BEFORE starting
-        # the thread so a stage timeout still knows where partial files
-        # were written and can signal the thread to abort.
-        pending_extract = reserve_extract(settings.tmp_dir)
-        extract_dest = str(pending_extract.dest_dir)
+    if _check_cancelled(task_id):
+        if download_result is not None:
+            cleanup_download(download_result.temp_file)
+        mark_cancelled(task_id)
+        return None, None, None
 
-        # P2-3: Wrap extraction in asyncio.wait_for with timeout.
+    # Dedup after SHA resolution: reuse completed result for same commit.
+    task = get_task(task_id)
+    if task is not None and download_result is not None and download_result.commit_sha:
+        existing = find_completed_by_repo_sha(
+            task.repo_url, download_result.commit_sha, task.scanner_version
+        )
+        if existing is not None and existing.id != task_id:
+            from app.services.task_manager import complete_as_reused
+            ok = await asyncio.to_thread(complete_as_reused, task_id, existing)
+            cleanup_download(download_result.temp_file)
+            if ok:
+                logger.info("Task deduplicated to completed result")
+                return None, None, None
+            # Fall through to full scan if copy failed.
+
+    _mark_running_owned(task_id, STAGE_EXTRACTING, 50, claim_token)
+    try:
+        tarball_bytes = await asyncio.to_thread(
+            download_result.temp_file.read_bytes
+        )
+    except Exception as e:
+        logger.error(
+            "Failed to read downloaded archive for task %s: %s",
+            task_id, type(e).__name__,
+        )
+        fail_or_retry(
+            task_id, DOWNLOAD_FAILED, get_error_message(DOWNLOAD_FAILED),
+            failure_category=GITHUB_TEMPORARY_ERROR,
+            worker_id=claim_token,
+        )
+        return download_result, None, None
+
+    try:
+        # Per-task reservation under settings.tmp_dir with VibeCheck naming.
+        dest_path = prepare_extract_dest(settings.tmp_dir)
+        import threading as _threading
+        cancel_ev = _threading.Event()
+        extract_dest = str(dest_path)
+
+        def _do_extract():
+            try:
+                return safe_extract_to_temp(
+                    tarball_bytes,
+                    settings.tmp_dir,
+                    dest_dir=dest_path,
+                    cancel_event=cancel_ev,
+                )
+            except TypeError:
+                # Mock/side_effect without kwargs — production path always
+                # accepts dest_dir/cancel_event.
+                return safe_extract_to_temp(tarball_bytes, settings.tmp_dir)
+
         extract_result = await asyncio.wait_for(
-            asyncio.to_thread(
-                safe_extract_to_temp,
-                tarball_bytes,
-                tmp_root=settings.tmp_dir,
-            ),
+            asyncio.to_thread(_do_extract),
             timeout=settings.extract_timeout,
         )
         extract_dest = extract_result.dest_dir
         return download_result, extract_dest, extract_result
+    except OwnershipLost:
+        raise
     except TimeoutError:
         logger.error("Extraction timed out for task %s", task_id)
-        # Signal the orphaned extraction thread to abort promptly, then
-        # give it a short window to release file handles before the
-        # finally-block cleanup removes the partial directory.
-        pending_extract.cancel_event.set()
-        await asyncio.sleep(0.5)
-        mark_failed(
-            task_id, EXTRACT_TIMEOUT,
-            get_error_message(EXTRACT_TIMEOUT),
+        try:
+            cancel_ev.set()
+        except Exception:
+            pass
+        await asyncio.sleep(0.2)
+        fail_or_retry(
+            task_id, EXTRACT_TIMEOUT, get_error_message(EXTRACT_TIMEOUT),
+            failure_category="INTERNAL_TRANSIENT",
+            worker_id=claim_token,
         )
         return download_result, None, None
     except ExtractionError as e:
-        error_code, safe_msg = _map_extraction_error(e)
-        mark_failed(task_id, error_code, safe_msg)
-        return download_result, None, None
-    except tarfile.TarError as e:
-        logger.error(
-            "Archive is malformed for task %s: %s",
-            task_id, type(e).__name__,
+        error_code, safe_msg, category = _map_extraction_error(e)
+        fail_or_retry(
+            task_id, error_code, safe_msg,
+            failure_category=category, worker_id=claim_token,
         )
-        mark_failed(task_id, UNSAFE_ARCHIVE, get_error_message(UNSAFE_ARCHIVE))
+        return download_result, None, None
+    except OSError as e:
+        if getattr(e, "errno", None) == 28:
+            fail_or_retry(
+                task_id, TEMP_STORAGE_EXHAUSTED,
+                get_error_message(TEMP_STORAGE_EXHAUSTED),
+                failure_category=CAT_TEMP_STORAGE,
+                worker_id=claim_token,
+            )
+        else:
+            fail_or_retry(
+                task_id, INTERNAL_ERROR, get_error_message(INTERNAL_ERROR),
+                worker_id=claim_token,
+            )
         return download_result, None, None
     except Exception as e:
-        # Genuine I/O or unexpected failures during extraction are NOT
-        # proof of a malicious archive —report them as internal errors.
         logger.error(
             "Extraction failed for task %s: %s", task_id, type(e).__name__
         )
-        mark_failed(task_id, INTERNAL_ERROR, get_error_message(INTERNAL_ERROR))
+        fail_or_retry(
+            task_id, INTERNAL_ERROR, get_error_message(INTERNAL_ERROR),
+            failure_category="INTERNAL_TRANSIENT",
+            worker_id=claim_token,
+        )
         return download_result, None, None
 
 
-async def _process_task(task_id: str) -> None:
-    """Process a single task: download 鈫?extract 鈫?scan 鈫?assess 鈫?repair 鈫?analyze 鈫?complete.
+async def _process_task(task_id: str, claim_token: str | None = None) -> None:
+    """Process a single claimed task through the pipeline.
 
-    Pipeline:
-    1. Download tarball from GitHub.
-    2. Extract to temp directory safely.
-    3. Scan extracted directory with P0-4 scanner.
-    4. Persist scan result to scan_results table.
-    5. Assess: read persisted scan result, compute score, persist assessment.
-    6. Generate repair plan: read persisted scan and assessment, compute
-       deterministic repair plan, persist to repair_results.
-    7. Generate LLM analysis: read persisted scan result, generate
-       plain-language explanations for non-blocking findings, persist
-       to llm_analysis_results. This stage is NON-BLOCKING —failures
-       fall back to templates and never prevent task completion.
-    8. Mark task as completed (only after successful repair plan persistence).
-
-    On any failure, marks the task as failed with a desensitized error.
-    Temp files are always cleaned up via try/finally —in success, scan
-    failure, persistence failure, assessment failure, and repair plan
-    failure paths.
+    ``claim_token`` is the fencing token written by claim_next_pending().
+    When omitted (legacy tests), ownership is inferred from the DB row.
     """
     download_result: DownloadResult | None = None
     extract_dest: str | None = None
     extract_result = None
     cleanup_failed = False
     is_upload = False
+    started = time.monotonic()
 
     try:
         task = get_task(task_id)
         if task is None:
             logger.error("Task %s not found", task_id)
             return
+        if claim_token is None:
+            claim_token = task.worker_id
+        if task.status not in (STATUS_RUNNING, STATUS_PENDING):
+            # Recovered/cancelled/completed elsewhere — do not re-run.
+            return
+        if claim_token is not None and task.worker_id not in (None, claim_token):
+            # Stale worker after recovery/re-claim.
+            return
+        if _check_cancelled(task_id):
+            mark_cancelled(task_id)
+            return
 
-        # Upload-sourced tasks skip GitHub download; their content was
-        # already validated and staged under upload-{task_id} by the
-        # upload endpoint. All subsequent stages are identical.
         is_upload = task.repo_url.startswith(LOCAL_UPLOAD_PREFIX)
 
         if is_upload:
-            mark_running(task_id, STAGE_EXTRACTING, 50)
+            _mark_running_owned(task_id, STAGE_EXTRACTING, 50, claim_token)
             data_dir = upload_source_dir(task_id)
             if not data_dir.is_dir():
                 logger.error(
                     "Upload source directory missing for task %s", task_id
                 )
-                mark_failed(task_id, INTERNAL_ERROR, get_error_message(INTERNAL_ERROR))
+                fail_or_retry(
+                    task_id, INTERNAL_ERROR, get_error_message(INTERNAL_ERROR),
+                    worker_id=claim_token,
+                )
                 return
             extract_dest = str(data_dir)
             extract_result = await asyncio.to_thread(_stat_directory, data_dir)
         else:
             download_result, extract_dest, extract_result = (
-                await _download_and_extract(task_id, task.repo_url)
+                await _download_and_extract(task_id, task.repo_url, claim_token)
             )
             if extract_result is None or extract_dest is None:
+                # Failed, cancelled, deduplicated, or fenced — stop pipeline.
                 return
 
+        if _check_cancelled(task_id):
+            mark_cancelled(task_id)
+            return
+        _ensure_owned(task_id, claim_token)
+
         # --- Stage 3: Scan ---
-        # scan_directory is synchronous (CPU-bound). Run it in a thread
-        # via asyncio.to_thread so the event loop stays responsive.
-        # P2-3: Wrap in asyncio.wait_for with scan_timeout.
-        mark_running(task_id, STAGE_SCANNING, 80)
+        _mark_running_owned(task_id, STAGE_SCANNING, 80, claim_token)
+        scan_started = time.monotonic()
         try:
             scan_result = await asyncio.wait_for(
-                asyncio.to_thread(
-                    scan_directory,
-                    Path(extract_dest),
-                ),
+                asyncio.to_thread(scan_directory, Path(extract_dest)),
                 timeout=settings.scan_timeout,
+            )
+            metrics_mod.observe(
+                "vibecheck_stage_duration_seconds",
+                time.monotonic() - scan_started,
+                {"stage": "scanning"},
             )
         except TimeoutError:
             logger.error("Scan timed out for task %s", task_id)
-            mark_failed(
-                task_id, SCAN_TIMEOUT,
-                get_error_message(SCAN_TIMEOUT),
+            fail_or_retry(
+                task_id, SCAN_TIMEOUT, get_error_message(SCAN_TIMEOUT),
+                failure_category="SCAN_TIMEOUT",
+                worker_id=claim_token,
             )
             return
         except Exception as e:
-            # Log only the exception type —never str(exc), repr(exc),
-            # stack traces, or repo content.
             logger.error(
                 "Scan failed for task %s: %s", task_id, type(e).__name__
             )
-            mark_failed(
+            fail_or_retry(
                 task_id, SCAN_INTERNAL_ERROR,
                 get_error_message(SCAN_INTERNAL_ERROR),
+                failure_category="INTERNAL_TRANSIENT",
+                worker_id=claim_token,
             )
             return
 
+        if _check_cancelled(task_id):
+            mark_cancelled(task_id)
+            return
+        _ensure_owned(task_id, claim_token)
+
         # --- Stage 4: Persist scan result ---
-        # Persist BEFORE marking completed —if persistence fails,
-        # the task must NOT be marked as completed.
-        # save_scan_result is synchronous (CPU/IO-bound). Run it in a
-        # thread via asyncio.to_thread so the event loop stays responsive.
-        # The await guarantees the thread has completed before cleanup.
         try:
-            await asyncio.to_thread(
-                save_scan_result,
-                task_id,
-                scan_result,
-            )
+            _ensure_owned(task_id, claim_token)
+            await asyncio.to_thread(save_scan_result, task_id, scan_result)
+        except OwnershipLost:
+            return
         except ScanResultTooLargeError as e:
-            # Serialized result_json exceeded scan_max_result_json_bytes.
-            # Log only the exception type —never str(exc) or DB details.
             logger.error(
                 "Scan result too large for task %s: %s",
                 task_id, type(e).__name__,
             )
-            mark_failed(
+            fail_or_retry(
                 task_id, SCAN_RESULT_TOO_LARGE,
                 get_error_message(SCAN_RESULT_TOO_LARGE),
+                failure_category="INTERNAL_PERMANENT",
+                worker_id=claim_token,
             )
             return
         except Exception as e:
-            # Log only the exception type —never str(exc) or DB errors.
             logger.error(
                 "Scan result persistence failed for task %s: %s",
                 task_id, type(e).__name__,
             )
-            mark_failed(
+            fail_or_retry(
                 task_id, SCAN_RESULT_PERSIST_FAILED,
                 get_error_message(SCAN_RESULT_PERSIST_FAILED),
+                failure_category="INTERNAL_TRANSIENT",
+                worker_id=claim_token,
             )
             return
 
+        if _check_cancelled(task_id):
+            mark_cancelled(task_id)
+            return
+        _ensure_owned(task_id, claim_token)
+
         # --- Stage 5: Assess ---
-        # Assessment reads ONLY from the persisted scan_results table
-        # (never from temp directory). It computes a deterministic score
-        # and persists it to assessment_results.
-        # run_assessment is synchronous (CPU/IO-bound). Run it in a thread
-        # via asyncio.to_thread so the event loop stays responsive.
-        # The await guarantees the thread has completed before cleanup.
-        # Assessment MUST succeed before mark_completed —if it fails,
-        # the task is marked failed even though scan_results was persisted.
-        # The failed task's assessment API will NOT return residual data.
-        mark_running(task_id, STAGE_ASSESSING, 90)
+        _mark_running_owned(task_id, STAGE_ASSESSING, 90, claim_token)
+        assess_started = time.monotonic()
         try:
+            _ensure_owned(task_id, claim_token)
             await asyncio.wait_for(
-                asyncio.to_thread(
-                    run_assessment,
-                    task_id,
-                ),
+                asyncio.to_thread(run_assessment, task_id),
                 timeout=settings.assess_timeout,
             )
+            metrics_mod.observe(
+                "vibecheck_stage_duration_seconds",
+                time.monotonic() - assess_started,
+                {"stage": "assessing"},
+            )
+        except OwnershipLost:
+            return
         except TimeoutError:
-            logger.error("Assessment timed out for task %s", task_id)
-            mark_failed(
+            fail_or_retry(
                 task_id, ASSESSMENT_TIMEOUT,
                 get_error_message(ASSESSMENT_TIMEOUT),
+                failure_category="INTERNAL_TRANSIENT",
+                worker_id=claim_token,
             )
             return
         except AssessmentResultTooLargeError as e:
-            # Serialized assessment_json exceeded assessment_max_json_bytes.
-            # Log only the exception type —never str(exc) or DB details.
             logger.error(
                 "Assessment result too large for task %s: %s",
                 task_id, type(e).__name__,
             )
-            mark_failed(
+            fail_or_retry(
                 task_id, ASSESSMENT_RESULT_TOO_LARGE,
                 get_error_message(ASSESSMENT_RESULT_TOO_LARGE),
+                failure_category="INTERNAL_PERMANENT",
+                worker_id=claim_token,
             )
             return
         except AssessmentInternalError as e:
-            # Reading or parsing the persisted scan result failed, or
-            # assessment computation failed.
-            # Log only the exception type —never str(exc) or stack traces.
             logger.error(
                 "Assessment internal error for task %s: %s",
                 task_id, type(e).__name__,
             )
-            mark_failed(
+            fail_or_retry(
                 task_id, ASSESSMENT_INTERNAL_ERROR,
                 get_error_message(ASSESSMENT_INTERNAL_ERROR),
+                failure_category="INTERNAL_TRANSIENT",
+                worker_id=claim_token,
             )
             return
         except AssessmentPersistError as e:
-            # SQLite assessment_results write failed.
-            # Log only the exception type —never str(exc) or DB errors.
             logger.error(
                 "Assessment persistence failed for task %s: %s",
                 task_id, type(e).__name__,
             )
-            mark_failed(
+            fail_or_retry(
                 task_id, ASSESSMENT_PERSIST_FAILED,
                 get_error_message(ASSESSMENT_PERSIST_FAILED),
+                failure_category="INTERNAL_TRANSIENT",
+                worker_id=claim_token,
             )
             return
         except Exception as e:
-            # Catch-all for any unexpected error not covered above.
-            # This is an internal error, NOT a persistence error.
-            # SQLite save failures are already caught by
-            # AssessmentPersistError above. Other unknown exceptions
-            # belong to internal computation or orchestration.
-            # Log only the exception type —never str(exc) or DB errors.
             logger.error(
                 "Assessment failed for task %s: %s",
                 task_id, type(e).__name__,
             )
-            mark_failed(
+            fail_or_retry(
                 task_id, ASSESSMENT_INTERNAL_ERROR,
                 get_error_message(ASSESSMENT_INTERNAL_ERROR),
+                failure_category="INTERNAL_TRANSIENT",
+                worker_id=claim_token,
             )
             return
 
-        # --- Stage 6: Generate repair plan ---
-        # Repair plan reads ONLY from the persisted scan_results and
-        # assessment_results tables (never from temp directory or memory).
-        # It computes a deterministic repair plan and persists it to
-        # repair_results.
-        # generate_and_save_repair_plan is synchronous (CPU/IO-bound).
-        # Run it in a thread via asyncio.to_thread so the event loop
-        # stays responsive.
-        # Repair plan MUST succeed before mark_completed —if it fails,
-        # the task is marked failed even though scan_results and
-        # assessment_results were already persisted.
-        # The failed task's repair plan API will NOT return residual data.
-        mark_running(task_id, STAGE_REPAIRING, 95)
+        if _check_cancelled(task_id):
+            mark_cancelled(task_id)
+            return
+        _ensure_owned(task_id, claim_token)
+
+        # --- Stage 6: Repair plan ---
+        _mark_running_owned(task_id, STAGE_REPAIRING, 95, claim_token)
         try:
+            _ensure_owned(task_id, claim_token)
             await asyncio.wait_for(
-                asyncio.to_thread(
-                    generate_and_save_repair_plan,
-                    task_id,
-                ),
+                asyncio.to_thread(generate_and_save_repair_plan, task_id),
                 timeout=settings.repair_plan_timeout,
             )
+        except OwnershipLost:
+            return
         except TimeoutError:
-            logger.error("Repair plan timed out for task %s", task_id)
-            mark_failed(
+            fail_or_retry(
                 task_id, REPAIR_PLAN_TIMEOUT,
                 get_error_message(REPAIR_PLAN_TIMEOUT),
+                failure_category="INTERNAL_TRANSIENT",
+                worker_id=claim_token,
             )
             return
         except RepairPlanTooLargeError as e:
-            # Serialized repair_json exceeded repair_max_json_bytes.
-            # Log only the exception type —never str(exc) or DB details.
             logger.error(
                 "Repair plan too large for task %s: %s",
                 task_id, type(e).__name__,
             )
-            mark_failed(
+            fail_or_retry(
                 task_id, REPAIR_PLAN_TOO_LARGE,
                 get_error_message(REPAIR_PLAN_TOO_LARGE),
+                failure_category="INTERNAL_PERMANENT",
+                worker_id=claim_token,
             )
             return
         except RepairPlanInternalError as e:
-            # Reading or parsing the persisted scan/assessment failed,
-            # consistency validation failed, or repair plan computation
-            # failed.
-            # Log only the exception type —never str(exc) or stack traces.
             logger.error(
                 "Repair plan internal error for task %s: %s",
                 task_id, type(e).__name__,
             )
-            mark_failed(
+            fail_or_retry(
                 task_id, REPAIR_PLAN_INTERNAL_ERROR,
                 get_error_message(REPAIR_PLAN_INTERNAL_ERROR),
+                failure_category="INTERNAL_TRANSIENT",
+                worker_id=claim_token,
             )
             return
         except RepairPlanPersistError as e:
-            # SQLite repair_results write failed.
-            # Log only the exception type —never str(exc) or DB errors.
             logger.error(
                 "Repair plan persistence failed for task %s: %s",
                 task_id, type(e).__name__,
             )
-            mark_failed(
+            fail_or_retry(
                 task_id, REPAIR_PLAN_PERSIST_FAILED,
                 get_error_message(REPAIR_PLAN_PERSIST_FAILED),
+                failure_category="INTERNAL_TRANSIENT",
+                worker_id=claim_token,
             )
             return
         except Exception as e:
-            # Catch-all for any unexpected error not covered above.
-            # Log only the exception type —never str(exc) or DB errors.
             logger.error(
                 "Repair plan failed for task %s: %s",
                 task_id, type(e).__name__,
             )
-            mark_failed(
+            fail_or_retry(
                 task_id, REPAIR_PLAN_INTERNAL_ERROR,
                 get_error_message(REPAIR_PLAN_INTERNAL_ERROR),
+                failure_category="INTERNAL_TRANSIENT",
+                worker_id=claim_token,
             )
             return
 
+        if _check_cancelled(task_id):
+            mark_cancelled(task_id)
+            return
+        _ensure_owned(task_id, claim_token)
+
         # --- Stage 7: LLM analysis (NON-BLOCKING) ---
-        # Generate plain-language explanations and repair instructions
-        # for non-blocking findings. This stage reads ONLY from the
-        # persisted scan_results table.
-        # This stage NEVER fails the task —generate_and_save_llm_analysis
-        # catches all internal errors and falls back to templates.
-        # LLM analysis is an enhancement, not a requirement. Assessment
-        # scoring (P0-6) is completely independent and unaffected.
-        mark_running(task_id, STAGE_ANALYZING, 97)
-        # A caller-supplied per-task LLM config (X-LLM-* headers) enables
-        # the analysis stage with the caller's own credentials even when
-        # the server has no LLM configured. Pop after the stage; the
-        # finally block also pops it as a release safety net.
+        _mark_running_owned(task_id, STAGE_ANALYZING, 97, claim_token)
         user_llm_config = get_user_config(task_id)
         try:
             await asyncio.wait_for(
@@ -590,115 +788,295 @@ async def _process_task(task_id: str) -> None:
                 timeout=settings.llm_analysis_timeout,
             )
         except TimeoutError:
-            # Non-blocking —LLM analysis timeout doesn't fail the task.
             logger.warning(
-                "LLM analysis timed out for task %s (non-blocking, "
-                "continuing to completion)",
-                task_id,
+                "LLM analysis timed out for task %s (non-blocking)", task_id
             )
         except Exception as e:
-            # This should never happen —generate_and_save_llm_analysis
-            # is designed to never raise. But if it does, log and continue.
             logger.warning(
-                "LLM analysis stage failed for task %s: %s "
-                "(non-blocking, continuing to completion)",
+                "LLM analysis stage failed for task %s: %s (non-blocking)",
                 task_id, type(e).__name__,
             )
         finally:
-            # Release the caller-supplied LLM credentials for this task.
             pop_user_config(task_id)
 
-        # --- Stage 8: Complete with summary ---
-        # Only reached after scan result, assessment, AND repair plan are
-        # successfully persisted. The scan_summary is fetched from
-        # scan_results by to_response(). The security_score and
-        # security_verdict are fetched from assessment_results by
-        # to_response(). The repair_plan_available and repair_plan_url
-        # are fetched from repair_results by to_response().
-        mark_completed(
+        if _check_cancelled(task_id):
+            mark_cancelled(task_id)
+            return
+        _ensure_owned(task_id, claim_token)
+
+        # --- Stage 8: Complete ---
+        completed = mark_completed(
             task_id,
-            file_count=extract_result.file_count,
-            total_size=extract_result.total_size,
+            file_count=extract_result.file_count if extract_result else 0,
+            total_size=extract_result.total_size if extract_result else 0,
             top_level_dir=(
-                extract_result.top_level_dir
+                (extract_result.top_level_dir if extract_result else None)
                 or ("本地上传" if is_upload else "unknown")
             ),
+            worker_id=claim_token,
         )
+        if completed:
+            metrics_mod.observe(
+                "vibecheck_task_duration_seconds", time.monotonic() - started
+            )
 
+    except OwnershipLost:
+        logger.info("Worker lost ownership for task %s; stopping", task_id)
     except Exception as e:
         logger.error("Unexpected error in task %s: %s", task_id, type(e).__name__)
-        mark_failed(task_id, INTERNAL_ERROR, get_error_message(INTERNAL_ERROR))
-
+        fail_or_retry(
+            task_id, INTERNAL_ERROR, get_error_message(INTERNAL_ERROR),
+            failure_category="INTERNAL_TRANSIENT",
+            worker_id=claim_token,
+        )
     finally:
-        # --- Always clean up temp files ---
-        # Release any unconsumed extraction reservation (e.g. when the
-        # extraction thread was interrupted before consuming it).
         consume_extract()
-
-        # Release any caller-supplied LLM credentials that were never
-        # consumed (e.g. the task failed before the LLM stage).
         pop_user_config(task_id)
+        _cancel_events.pop(task_id, None)
 
-        # Cleanup runs in ALL paths: success, scan failure, persistence
-        # failure, and assessment failure.
-        # Clean up download file
         if download_result is not None:
             try:
                 cleanup_download(download_result.temp_file)
             except Exception:
                 logger.error("Failed to clean up download file for task %s", task_id)
                 cleanup_failed = True
+                metrics_mod.inc_counter("vibecheck_cleanup_failures_total")
 
-        # Clean up extraction directory
-        if extract_dest is not None:
-            try:
-                cleanup_temp_dir(extract_dest)
-            except Exception:
-                logger.error("Failed to clean up extraction dir for task %s", task_id)
-                cleanup_failed = True
+        if extract_dest is not None and not _cleanup_task_dir(task_id, extract_dest):
+            cleanup_failed = True
 
-        # If cleanup failed but task was completed, log it (task result is still valid)
         if cleanup_failed:
             logger.warning(
                 "Cleanup failed for task %s —temp files may remain", task_id
             )
 
 
+async def _run_claimed_task(task_id: str, claim_token: str | None = None) -> None:
+    stop_event = asyncio.Event()
+    hb_task = asyncio.create_task(
+        _heartbeat_loop(task_id, stop_event, claim_token)
+    )
+    try:
+        await _process_task(task_id, claim_token)
+    finally:
+        stop_event.set()
+        hb_task.cancel()
+        try:
+            await hb_task
+        except asyncio.CancelledError:
+            pass
+
+
+async def _dispatcher_loop() -> None:
+    """Continuously claim pending tasks into free execution slots."""
+    global _is_processing
+    _is_processing = True
+    poll = settings.dispatcher_poll_seconds
+    last_reaper = 0.0
+    reaper_every = max(1.0, float(settings.lease_reaper_seconds))
+    try:
+        while not _stopping:
+            try:
+                await asyncio.to_thread(refresh_queue_metrics)
+            except Exception:
+                pass
+
+            if _stopping:
+                break
+
+            # Runtime lease reaper — recover expired leases without restart.
+            now_m = time.monotonic()
+            if now_m - last_reaper >= reaper_every:
+                last_reaper = now_m
+                try:
+                    await asyncio.to_thread(recover_expired_tasks)
+                except Exception as e:
+                    logger.error("Lease reaper failed: %s", type(e).__name__)
+
+            free = settings.max_running_tasks - len(_active)
+            if free <= 0:
+                await asyncio.sleep(poll)
+                continue
+
+            claimed = None
+            claim_token = None
+            if has_claimable_pending():
+                try:
+                    # Unique claim token per claim — never reuse process id.
+                    claim_token = make_worker_id("claim")
+                    claimed = await asyncio.to_thread(
+                        claim_next_pending, claim_token
+                    )
+                    if claimed is None:
+                        claim_token = None
+                except Exception as e:
+                    logger.error("Claim failed: %s", type(e).__name__)
+                    claim_token = None
+
+            if claimed is None:
+                await asyncio.sleep(poll)
+                continue
+
+            worker = asyncio.create_task(
+                _run_claimed_task(claimed.id, claim_token or claimed.worker_id)
+            )
+            _active.add(worker)
+
+            def _done_cb(t: asyncio.Task, tid: str = claimed.id, tok: str | None = claim_token) -> None:
+                _on_worker_done(t, tid, tok)
+
+            worker.add_done_callback(_done_cb)
+    finally:
+        _is_processing = False
+
+
+def _on_worker_done(
+    task: asyncio.Task,
+    task_id: str | None = None,
+    claim_token: str | None = None,
+) -> None:
+    _active.discard(task)
+    if task.cancelled():
+        return
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return
+    if exc is None:
+        return
+    logger.error(
+        "Worker task raised for task_id=%s claim=%s: %s",
+        task_id,
+        claim_token,
+        type(exc).__name__,
+    )
+    # Safe failure path when possible; otherwise lease reaper recovers.
+    if task_id:
+        try:
+            fail_or_retry(
+                task_id,
+                INTERNAL_ERROR,
+                get_error_message(INTERNAL_ERROR),
+                failure_category="INTERNAL_TRANSIENT",
+                worker_id=claim_token,
+            )
+        except Exception:
+            logger.error("Safe-fail after worker exception also failed")
+
+
+async def start_dispatcher() -> None:
+    """Start the bounded-concurrency dispatcher (idempotent)."""
+    global _dispatcher_task, _stopping
+    if _dispatcher_task is not None and not _dispatcher_task.done():
+        return
+    _stopping = False
+    _dispatcher_task = asyncio.create_task(_dispatcher_loop())
+
+
+async def stop_dispatcher(grace_seconds: float | None = None) -> None:
+    """Graceful shutdown: stop claiming, wait briefly for in-flight tasks."""
+    global _dispatcher_task, _stopping
+    _stopping = True
+    if grace_seconds is None:
+        grace_seconds = settings.shutdown_grace_seconds
+
+    if _dispatcher_task is not None:
+        _dispatcher_task.cancel()
+        try:
+            await _dispatcher_task
+        except asyncio.CancelledError:
+            pass
+        _dispatcher_task = None
+
+    if _active:
+        done, pending = await asyncio.wait(
+            list(_active), timeout=max(0.0, grace_seconds)
+        )
+        for t in pending:
+            # Unfinished tasks rely on lease expiry for recovery after restart.
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+
 async def trigger_queue_processing() -> None:
-    """Trigger processing of the task queue.
+    """Ensure tasks are processed (API-compatible entrypoint).
 
-    If no processing is currently running, picks up pending tasks one by one.
-    If processing is already running, this is a no-op (the running processor
-    will pick up new pending tasks).
-
-    Safe to call multiple times —only one processor runs at a time.
+    - app_env=test: drain the queue inline (deterministic unit tests).
+    - otherwise: start the long-lived bounded-concurrency dispatcher.
     """
     global _is_processing
-
-    async with _lock:
-        if _is_processing:
-            return
+    if settings.app_env == "test":
         _is_processing = True
-
-    try:
-        while True:
-            next_task = get_oldest_pending()
-            if next_task is None:
-                break
-            await _process_task(next_task.id)
-    except Exception as e:
-        logger.error("Queue processing error: %s", type(e).__name__)
-    finally:
-        async with _lock:
+        try:
+            while True:
+                token = make_worker_id("inline")
+                claimed = claim_next_pending(token)
+                if claimed is None:
+                    break
+                await _process_task(claimed.id, token)
+        except Exception as e:
+            logger.error("Inline queue processing error: %s", type(e).__name__)
+        finally:
             _is_processing = False
-        # Re-trigger in case a task was added during the gap
-        if get_oldest_pending() is not None:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.create_task(trigger_queue_processing())
+            try:
+                refresh_queue_metrics()
+            except Exception:
+                pass
+        return
+
+    await start_dispatcher()
+    _is_processing = True
+
+
+async def drain_pending_tasks(max_tasks: int = 100) -> int:
+    """Claim and process pending tasks inline until the queue is empty."""
+    processed = 0
+    while processed < max_tasks:
+        token = make_worker_id("drain")
+        claimed = claim_next_pending(token)
+        if claimed is None:
+            break
+        await _process_task(claimed.id, token)
+        processed += 1
+    return processed
 
 
 def reset_runner_state() -> None:
-    """Reset the runner state —for testing only."""
-    global _is_processing
+    """Reset the runner state — for testing only."""
+    global _is_processing, _stopping, _worker_id, _dispatcher_task
     _is_processing = False
+    _stopping = False
+    _worker_id = None
+    _active.clear()
+    _cancel_events.clear()
+    if _dispatcher_task is not None and _dispatcher_task.done():
+        _dispatcher_task = None
+
+
+def cancel_task_locally(task_id: str) -> None:
+    """Signal cooperative cancel to a worker in this process."""
+    _get_cancel_event(task_id).set()
+    mark_cancelled(task_id)
+
+
+def active_task_count() -> int:
+    return len(_active)
+
+
+def dispatcher_running() -> bool:
+    return _dispatcher_task is not None and not _dispatcher_task.done()
+
+
+__all__ = [
+    "OwnershipLost",
+    "active_task_count",
+    "cancel_task_locally",
+    "dispatcher_running",
+    "drain_pending_tasks",
+    "is_queue_full",
+    "reset_runner_state",
+    "start_dispatcher",
+    "stop_dispatcher",
+    "trigger_queue_processing",
+]

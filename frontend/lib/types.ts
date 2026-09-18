@@ -50,7 +50,8 @@ export interface ScanSummary {
 
 export interface TaskStatusResponse {
   task_id: string;
-  status: string; // "pending" | "running" | "completed" | "failed"
+  status: string; // API: "pending" | "running" | "completed" | "failed"
+  // Backend may store cancelled/dead; API maps both to "failed".
   stage: string; // "queued" | "downloading" | "extracting" | "scanning" | "assessing" | "repairing" | "finished"
   progress: number;
   owner: string | null;

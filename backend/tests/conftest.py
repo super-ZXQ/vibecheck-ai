@@ -12,6 +12,45 @@ from pathlib import Path
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _backend_test_defaults(monkeypatch):
+    """Default test policy: no auto-dispatcher, single attempt (fail fast).
+
+    Production defaults are max_task_attempts=3 and app_env=production.
+    Individual tests override these when they need recovery/retry behavior.
+    """
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "app_env", "test")
+    monkeypatch.setattr(settings, "max_task_attempts", 1)
+    monkeypatch.setattr(settings, "max_running_tasks", 2)
+    monkeypatch.setattr(settings, "task_lease_seconds", 60)
+    monkeypatch.setattr(settings, "task_heartbeat_seconds", 5)
+    monkeypatch.setattr(settings, "lease_reaper_seconds", 5)
+    monkeypatch.setattr(settings, "retry_base_seconds", 1)
+    monkeypatch.setattr(settings, "retry_max_seconds", 2)
+    monkeypatch.setattr(settings, "shutdown_grace_seconds", 0.0)
+    yield
+
+
+def make_extract_under_tmp(name: str = "task-mock-extract"):
+    """Create a VibeCheck-named extract dir under settings.tmp_dir."""
+    from pathlib import Path
+
+    from app.core.config import settings
+    from app.core.safe_extract import ExtractionResult
+
+    dest = Path(settings.tmp_dir) / name
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "README.md").write_text("# mock\n")
+    return ExtractionResult(
+        dest_dir=str(dest),
+        file_count=1,
+        total_size=30,
+        top_level_dir="mock-extract",
+    )
+
 # --- Synthetic test constants ---
 # These strings have the correct FORMAT but are NOT real, valid credentials.
 # Runtime-constructed mixed-character values to avoid low-entropy patterns.
