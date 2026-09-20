@@ -82,8 +82,8 @@ from app.services.task_manager import (
     STATUS_PENDING,
     STATUS_RUNNING,
     QueueCapacityError,
-    admit_repo_task,
-    admit_upload_task,
+    admit_repo_task_async,
+    admit_upload_task_async,
     get_task,
     request_cancel,
 )
@@ -194,8 +194,7 @@ async def create_check(
         )
 
     try:
-        task, created = await asyncio.to_thread(
-            admit_repo_task,
+        task, created = await admit_repo_task_async(
             repo_info.url,
             repo_info.owner,
             repo_info.repo,
@@ -306,7 +305,7 @@ async def create_upload_check(
 
     # Only now create the task (rejected uploads never create tasks).
     try:
-        task = admit_upload_task(
+        task = await admit_upload_task_async(
             repo_url=f"{LOCAL_UPLOAD_PREFIX}{uuid.uuid4().hex}",
             owner="local",
             repo_name="上传项目",

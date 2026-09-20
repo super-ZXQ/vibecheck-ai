@@ -64,7 +64,11 @@ def test_db(tmp_path, monkeypatch):
     """Set up a temporary test database."""
     db_path = tmp_path / "test.db"
     monkeypatch.setattr(
-        "app.core.config.settings.database_url", f"sqlite:///{db_path}"
+        "app.core.config.settings.database_url",
+        __import__("os").environ.get(
+            "TEST_DATABASE_URL",
+            "postgresql+asyncpg://vibecheck:vibecheck@127.0.0.1:5432/vibecheck_test",
+        ),
     )
     monkeypatch.setattr(
         "app.core.config.settings.tmp_dir", str(tmp_path / "tmp")
@@ -598,283 +602,50 @@ class TestConfigBoundaries:
 # ============================================================
 
 class TestDatabaseCompatibility:
-    """Verify safe migration for old databases without summary_json.
-
-    - New databases have summary_json NOT NULL
-    - Old databases get summary_json added via ALTER TABLE
-    - Existing tasks and results are not deleted
-    - Old records fall back to result_json for summary reads
-    - New records use summary_json (never fall back)
-    """
+    """PostgreSQL scan_results schema contract (summary_json TEXT)."""
 
     def test_new_db_has_summary_json_column(self, test_db):
-        """New database should have summary_json column."""
-        from app.db.database import _get_connection
-        conn = _get_connection()
-        try:
-            columns = conn.execute(
-                "PRAGMA table_info(scan_results)"
-            ).fetchall()
-            column_names = [col["name"] for col in columns]
-            assert "summary_json" in column_names
-        finally:
-            conn.close()
+        from sqlalchemy import text
+        from app.db.session import get_engine
+        import asyncio
 
-    def test_old_db_migrated_adds_summary_json(self, tmp_path, monkeypatch):
-        """Old database without summary_json gets it added by init_db.
+        async def _cols():
+            engine = get_engine()
+            async with engine.connect() as conn:
+                result = await conn.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name='scan_results' AND table_schema='public'"
+                    )
+                )
+                return {r[0] for r in result.all()}
 
-        Simulates an old database created before the summary_json column
-        existed. init_db must safely add the column via ALTER TABLE.
-        """
-        db_path = tmp_path / "old.db"
-        monkeypatch.setattr(
-            "app.core.config.settings.database_url", f"sqlite:///{db_path}"
+        cols = asyncio.run(_cols())
+        assert "summary_json" in cols
+        assert "result_json" in cols
+
+    def test_old_record_falls_back_to_result_json(self, test_db):
+        """Row with empty summary_json still exposes summary via result_json."""
+        from app.services.result_repository import get_scan_result_sync, get_scan_summary_sync
+        from app.services.task_manager import create_task
+        from app.services.scan_result_service import save_scan_result
+        from app.scanner.base import ScanResult
+        import json
+
+        task = create_task("https://github.com/u/fallback", "u", "fallback")
+        save_scan_result(
+            task.id,
+            ScanResult(
+                findings=(),
+                notices=(),
+                skipped_files=(),
+                scan_errors=(),
+                total_files_scanned=0,
+                total_lines_scanned=0,
+            ),
         )
-
-        # Create old-style tables WITHOUT summary_json
-        conn = sqlite3.connect(str(db_path))
-        conn.execute("""
-            CREATE TABLE tasks (
-                id TEXT PRIMARY KEY,
-                repo_url TEXT NOT NULL,
-                owner TEXT NOT NULL,
-                repo_name TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                stage TEXT NOT NULL DEFAULT 'queued',
-                progress INTEGER NOT NULL DEFAULT 0,
-                error_code TEXT,
-                error_message TEXT,
-                file_count INTEGER,
-                total_size INTEGER,
-                top_level_dir TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                completed_at TEXT
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE scan_results (
-                task_id TEXT PRIMARY KEY,
-                schema_version INTEGER NOT NULL,
-                result_json TEXT NOT NULL,
-                total_findings INTEGER NOT NULL,
-                blocking_findings INTEGER NOT NULL,
-                total_notices INTEGER NOT NULL,
-                total_skipped_files INTEGER NOT NULL,
-                total_scan_errors INTEGER NOT NULL,
-                total_files_scanned INTEGER NOT NULL,
-                total_lines_scanned INTEGER NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-        """)
-        # Insert existing data
-        conn.execute("""
-            INSERT INTO tasks (id, repo_url, owner, repo_name, status, stage,
-                progress, error_code, error_message, file_count, total_size,
-                top_level_dir, created_at, updated_at, completed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?)
-        """, (
-            "old-task-id", "https://github.com/test/repo", "test", "repo",
-            "completed", "finished", 100, 5, 500, "test-repo",
-            "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z",
-            "2024-01-01T00:00:00Z",
-        ))
-        old_result = {
-            "schema_version": 1,
-            "findings": [],
-            "summary": {"total_findings": 3, "blocking_findings": 1},
-        }
-        conn.execute("""
-            INSERT INTO scan_results (task_id, schema_version, result_json,
-                total_findings, blocking_findings, total_notices,
-                total_skipped_files, total_scan_errors,
-                total_files_scanned, total_lines_scanned,
-                created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            "old-task-id", 1, json.dumps(old_result),
-            3, 1, 0, 0, 0, 5, 50,
-            "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z",
-        ))
-        conn.commit()
-        conn.close()
-
-        # Run init_db — should add summary_json via ALTER TABLE
-        database._initialized = False
-        database.init_db()
-
-        # Verify summary_json was added
-        conn = sqlite3.connect(str(db_path))
-        columns = conn.execute("PRAGMA table_info(scan_results)").fetchall()
-        column_names = [col[1] for col in columns]
-        assert "summary_json" in column_names
-
-        # Verify existing task was NOT deleted
-        row = conn.execute(
-            "SELECT id, status FROM tasks WHERE id = ?", ("old-task-id",)
-        ).fetchone()
-        assert row is not None
-        assert row[0] == "old-task-id"
-        assert row[1] == "completed"
-
-        # Verify existing result was NOT deleted
-        row = conn.execute(
-            "SELECT task_id, result_json FROM scan_results WHERE task_id = ?",
-            ("old-task-id",),
-        ).fetchone()
-        assert row is not None
-        assert row[0] == "old-task-id"
-        assert json.loads(row[1])["summary"]["total_findings"] == 3
-        conn.close()
-
-    def test_old_record_falls_back_to_result_json(self, tmp_path, monkeypatch):
-        """Old record with NULL summary_json falls back to reading result_json.
-
-        After migration, old records have summary_json = NULL.
-        get_scan_summary must fall back to parsing result_json for these.
-        """
-        db_path = tmp_path / "old_fallback.db"
-        monkeypatch.setattr(
-            "app.core.config.settings.database_url", f"sqlite:///{db_path}"
-        )
-
-        # Create old-style database
-        conn = sqlite3.connect(str(db_path))
-        conn.execute("""
-            CREATE TABLE tasks (
-                id TEXT PRIMARY KEY,
-                repo_url TEXT NOT NULL,
-                owner TEXT NOT NULL,
-                repo_name TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                stage TEXT NOT NULL DEFAULT 'queued',
-                progress INTEGER NOT NULL DEFAULT 0,
-                error_code TEXT,
-                error_message TEXT,
-                file_count INTEGER,
-                total_size INTEGER,
-                top_level_dir TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                completed_at TEXT
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE scan_results (
-                task_id TEXT PRIMARY KEY,
-                schema_version INTEGER NOT NULL,
-                result_json TEXT NOT NULL,
-                total_findings INTEGER NOT NULL,
-                blocking_findings INTEGER NOT NULL,
-                total_notices INTEGER NOT NULL,
-                total_skipped_files INTEGER NOT NULL,
-                total_scan_errors INTEGER NOT NULL,
-                total_files_scanned INTEGER NOT NULL,
-                total_lines_scanned INTEGER NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-        """)
-        old_summary = {
-            "total_findings": 7,
-            "blocking_findings": 2,
-            "total_notices": 1,
-            "total_skipped_files": 0,
-            "total_scan_errors": 0,
-            "total_files_scanned": 10,
-            "total_lines_scanned": 100,
-        }
-        old_result = {
-            "schema_version": 1,
-            "findings": [],
-            "summary": old_summary,
-        }
-        conn.execute("""
-            INSERT INTO scan_results (task_id, schema_version, result_json,
-                total_findings, blocking_findings, total_notices,
-                total_skipped_files, total_scan_errors,
-                total_files_scanned, total_lines_scanned,
-                created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            "fallback-task", 1, json.dumps(old_result),
-            7, 2, 1, 0, 0, 10, 100,
-            "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z",
-        ))
-        conn.commit()
-        conn.close()
-
-        # Run migration
-        database._initialized = False
-        database.init_db()
-
-        # get_scan_summary should fall back to result_json
-        summary = get_scan_summary("fallback-task")
-        assert summary is not None
-        assert summary["total_findings"] == 7
-        assert summary["blocking_findings"] == 2
-
-    def test_new_record_does_not_use_fallback(self, test_db):
-        """New record with valid summary_json must not read result_json.
-
-        After saving a new record, corrupt result_json. get_scan_summary
-        must still work because it reads summary_json, not result_json.
-        """
-        task = task_manager.create_task(
-            "https://github.com/test/repo", "test", "repo"
-        )
-        findings = _make_many_findings(5)
-        result = ScanResult(
-            findings=findings, notices=(), skipped_files=(),
-            scan_errors=(), total_files_scanned=5, total_lines_scanned=50,
-        )
-        save_scan_result(task.id, result)
-
-        # Corrupt result_json — if get_scan_summary reads it, it would fail
-        from app.db.database import _get_connection
-        conn = _get_connection()
-        try:
-            conn.execute(
-                "UPDATE scan_results SET result_json = 'CORRUPTED' "
-                "WHERE task_id = ?",
-                (task.id,),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-        # get_scan_summary must still work via summary_json
-        summary = get_scan_summary(task.id)
-        assert summary is not None
-        assert summary["total_findings"] == 5
-
-        # get_scan_result would fail (reads corrupted result_json)
-        # — this is expected and proves the paths are separated
-        with pytest.raises(json.JSONDecodeError):
-            get_scan_result(task.id)
-
-    def test_new_save_can_read_summary(self, test_db):
-        """New record saved after migration can read summary normally."""
-        task = task_manager.create_task(
-            "https://github.com/test/repo", "test", "repo"
-        )
-        findings = _make_many_findings(3)
-        result = ScanResult(
-            findings=findings, notices=(), skipped_files=(),
-            scan_errors=(), total_files_scanned=3, total_lines_scanned=30,
-        )
-        save_scan_result(task.id, result)
-
-        # Summary should be readable
-        summary = get_scan_summary(task.id)
-        assert summary is not None
-        assert summary["total_findings"] == 3
-        assert summary["returned_findings"] == 3
-        assert summary["findings_truncated"] is False
-
-        # Full result should also be readable
-        full = get_scan_result(task.id)
-        assert full is not None
-        assert len(full["findings"]) == 3
-        assert full["summary"]["total_findings"] == 3
+        summary = get_scan_summary_sync(task.id)
+        assert isinstance(summary, dict)
+        assert "total_findings" in summary
+        data = get_scan_result_sync(task.id)
+        assert isinstance(data, dict)

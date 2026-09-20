@@ -56,7 +56,13 @@ from tests.conftest import (
 def client(tmp_path, monkeypatch):
     """设置临时测试数据库和 TestClient。"""
     db_path = tmp_path / "test.db"
-    monkeypatch.setattr("app.core.config.settings.database_url", f"sqlite:///{db_path}")
+    monkeypatch.setattr(
+        "app.core.config.settings.database_url",
+        __import__("os").environ.get(
+            "TEST_DATABASE_URL",
+            "postgresql+asyncpg://vibecheck:vibecheck@127.0.0.1:5432/vibecheck_test",
+        ),
+    )
     database._initialized = False
     database.init_db()
     with TestClient(app) as c:

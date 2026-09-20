@@ -1,9 +1,90 @@
 # Task Execution Model
 
-VibeCheck uses a **single-instance bounded concurrency** background task
-engine on SQLite (WAL). It is **not** a distributed queue. Python locks
-reduce contention; **SQLite `BEGIN IMMEDIATE` transactions are the
-correctness boundary** for claim and recovery.
+VibeCheck uses **PostgreSQL-backed durable bounded task execution** with
+**multi-worker-safe database claiming**. It is **not** a Celery/distributed
+broker queue.
+
+**Claim correctness boundary:** PostgreSQL transaction + `SELECT ... FOR UPDATE
+SKIP LOCKED` (SQLite `BEGIN IMMEDIATE` was the pre-upgrade boundary).
+
+## Status machine
+
+| Status | Meaning | API `status` |
+| --- | --- | --- |
+| `pending` | Queued or waiting for retry (`next_attempt_at`) | `pending` |
+| `running` | Claimed by a worker with an active lease | `running` |
+| `completed` | Pipeline finished; results persisted | `completed` |
+| `failed` | Terminal failure (permanent error or retries exhausted) | `failed` |
+| `cancelled` | Cancel requested; resources released | `failed` (`TASK_CANCELLED`) |
+| `dead` | Lease expired after max attempts (crash recovery terminal) | `failed` |
+
+Legal transitions (terminal states never return to `running`):
+
+```
+pending  → running | completed | failed | cancelled | dead
+running  → running | completed | failed | cancelled | dead | pending (retry/recover)
+completed/failed/cancelled/dead → ∅
+```
+
+## Atomic claim (PostgreSQL)
+
+`claim_next_pending(worker_id)`:
+
+1. Open SQLAlchemy `AsyncSession` transaction
+2. `SELECT` due `pending` tasks
+   `ORDER BY next_attempt_at NULLS FIRST, created_at`
+   `FOR UPDATE SKIP LOCKED LIMIT 1`
+3. Guarded `UPDATE` to `running` with `worker_id`, `lease_expires_at`,
+   `last_heartbeat_at`, `attempt_count + 1`
+4. Commit
+
+Two concurrent workers cannot claim the same task.
+
+## Schema authority
+
+- **Alembic** owns PostgreSQL schema (`alembic upgrade head`)
+- `create_all` is only for isolated unit tests / local smoke
+- Production runtime default is `postgresql+asyncpg://...`
+- SQLite is not a production database in this architecture
+
+## Lease, heartbeat, recovery
+
+- Times stored as `TIMESTAMPTZ` (timezone-aware UTC in Python)
+- Heartbeat only updates tasks still `running` and owned by `worker_id`
+- Startup + runtime reaper call `recover_expired_tasks()`:
+  - expired + attempts remaining → `pending`
+  - expired + attempts exhausted → `dead`
+  - terminal statuses untouched
+- Recovery uses `FOR UPDATE SKIP LOCKED` so concurrent recoverers do not
+  double-requeue the same task
+
+## Deduplication
+
+Key: `normalized_repo_url|resolved_commit_sha|scanner_version`
+
+- Partial unique index `uq_tasks_active_dedup` on active rows
+- Completed match → reuse desensitized results + `reused_from_task_id`
+- Running match at submit → return existing `task_id`
+- Local uploads are not reused across users by default
+
+## Why not Celery?
+
+Broker + worker fleet + complex routing is unnecessary for V1. PostgreSQL
+`SKIP LOCKED` + lease + heartbeat + bounded retry demonstrates reliable
+task execution with one less moving part.
+
+## BYOK
+
+User LLM API keys live **only in process memory**. They are never columns,
+never logs, never metric labels.
+
+## Honest capability statement
+
+- **PostgreSQL-backed durable bounded task execution**
+- **multi-worker-safe database task claiming** (SKIP LOCKED + lease fencing)
+- Not a Celery/Kafka distributed queue product
+- Load/fault experiments use synthetic/mock repositories
+
 
 ## Status machine
 

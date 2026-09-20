@@ -56,7 +56,13 @@ from app.services.task_manager import create_task, mark_completed
 @pytest.fixture
 def test_db(tmp_path, monkeypatch):
     db_path = tmp_path / "test.db"
-    monkeypatch.setattr("app.core.config.settings.database_url", f"sqlite:///{db_path}")
+    monkeypatch.setattr(
+        "app.core.config.settings.database_url",
+        __import__("os").environ.get(
+            "TEST_DATABASE_URL",
+            "postgresql+asyncpg://vibecheck:vibecheck@127.0.0.1:5432/vibecheck_test",
+        ),
+    )
     database._initialized = False
     database.init_db()
     yield db_path
@@ -181,8 +187,10 @@ def _create_task_raw(task_id):
             """INSERT INTO tasks
                (id, repo_url, owner, repo_name, status, stage, progress,
                 error_code, error_message, file_count, total_size, top_level_dir,
-                created_at, updated_at, completed_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, NULL)""",
+                created_at, updated_at, completed_at,
+                attempt_count, max_attempts, scanner_version)
+               VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, NULL,
+                       0, 3, 'scanner-v1')""",
             (task_id, "https://github.com/test/repo", "test", "repo",
              "completed", "finished", 100, ts, ts),
         )

@@ -23,6 +23,7 @@ from app.api.repair import router as repair_router
 from app.core.config import Settings, settings
 from app.core.security_headers import SecurityHeadersMiddleware
 from app.db.database import check_database_ready, init_db
+from app.db.session import dispose_engine
 from app.services import metrics as metrics_mod
 from app.services.task_manager import (
     get_pending_count,
@@ -75,7 +76,6 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        # Graceful shutdown: stop claiming; unfinished work recovers via lease.
         try:
             await stop_dispatcher()
         except Exception as e:
@@ -83,6 +83,10 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         try:
             from app.services.llm_user_config import clear_user_configs
             clear_user_configs()
+        except Exception:
+            pass
+        try:
+            await dispose_engine()
         except Exception:
             pass
 

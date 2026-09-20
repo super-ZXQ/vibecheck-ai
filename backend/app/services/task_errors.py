@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
+from typing import Any
 
 from app.core.config import settings
 
@@ -121,7 +122,7 @@ def compute_backoff_seconds(attempt_count: int, *, jitter: bool = True) -> float
 class RetryDecision:
     should_retry: bool
     category: str
-    next_attempt_at: str | None
+    next_attempt_at: Any | None
 
 
 def decide_retry(
@@ -137,15 +138,11 @@ def decide_retry(
     """
     from datetime import datetime, timedelta, timezone
 
-    from app.db.database import now_iso
-
     cat = category or category_for_error_code(error_code)
     max_attempts = max(1, settings.max_task_attempts)
     if not is_retryable(cat) or attempt_count >= max_attempts:
         return RetryDecision(False, cat, None)
 
     delay = compute_backoff_seconds(attempt_count)
-    next_at = (
-        datetime.now(timezone.utc) + timedelta(seconds=delay)
-    ).isoformat()
-    return RetryDecision(True, cat, next_at or now_iso())
+    next_at: Any = datetime.now(timezone.utc) + timedelta(seconds=delay)
+    return RetryDecision(True, cat, next_at)

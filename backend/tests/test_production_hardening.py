@@ -1,4 +1,12 @@
-"""Production configuration, readiness, host, and response-header gates."""
+"""Production configuration, readiness, host, and response-header gates.
+
+PostgreSQL production contract:
+- Production DATABASE_URL must be postgresql(+asyncpg)://...
+- SQLite URLs are rejected in production
+- Readiness depends on PostgreSQL schema availability, not SQLite files
+"""
+
+from __future__ import annotations
 
 import pytest
 from fastapi.testclient import TestClient
@@ -8,28 +16,36 @@ import app.main as main_module
 from app.core.config import Settings
 from app.main import create_app
 
+PG_PROD_URL = (
+    "postgresql+asyncpg://vibecheck:secret@postgres.example:5432/vibecheck"
+)
+
 
 @pytest.fixture
 def test_db(tmp_path, monkeypatch):
-    """Initialize the global database service against an isolated file."""
-    db_path = tmp_path / "production-hardening.db"
-    monkeypatch.setattr(
-        "app.core.config.settings.database_url",
-        f"sqlite:///{db_path}",
-    )
+    """Initialize schema against the PostgreSQL test database."""
+    import os
+
     from app.db import database
 
-    database._initialized = False
+    monkeypatch.setattr(
+        "app.core.config.settings.database_url",
+        os.environ.get(
+            "TEST_DATABASE_URL",
+            "postgresql+asyncpg://vibecheck:vibecheck@127.0.0.1:5432/vibecheck_test",
+        ),
+    )
+    database.reset_initialized()
     database.init_db()
-    yield db_path
-    database._initialized = False
+    yield
+    database.reset_initialized()
 
 
 def make_production_settings(**overrides: object) -> Settings:
     values: dict[str, object] = {
         "app_env": "production",
         "production_config_confirmed": True,
-        "database_url": "sqlite:////data/vibecheck.db",
+        "database_url": PG_PROD_URL,
         "cors_allowed_origins": ["https://vibecheck.example"],
         "trusted_hosts": ["127.0.0.1", "vibecheck.example", "testserver"],
     }
@@ -43,47 +59,51 @@ class TestStrictProductionConfiguration:
             Settings(
                 _env_file=None,
                 app_env="production",
-                database_url="sqlite:////data/vibecheck.db",
+                database_url=PG_PROD_URL,
             )
 
     @pytest.mark.parametrize(
-        "database_url",
+        "database_url,match",
         [
-            "sqlite:///relative.db",
-            "sqlite:///./relative.db",
-            "sqlite:///../escape.db",
-            "sqlite:////tmp/vibecheck.db",
-            "sqlite:////data/../tmp/vibecheck.db",
-            "sqlite:////data",
-            "sqlite:///:memory:",
-            "postgresql://example",
+            ("sqlite:///relative.db", "postgresql"),
+            ("sqlite:////data/vibecheck.db", "postgresql"),
+            ("sqlite:///:memory:", "postgresql"),
+            ("postgresql://example", "user credentials|database name|host"),
+            ("postgresql+asyncpg://user@/missinghost", "host|database name"),
+            ("postgresql+asyncpg://user:pass@dbhost", "database name"),
+            ("not-a-url", "postgresql"),
         ],
     )
-    def test_production_rejects_non_persistent_database_urls(
-        self,
-        database_url,
-    ):
-        with pytest.raises(ValidationError, match="SQLite .db file under /data"):
+    def test_production_rejects_invalid_database_urls(self, database_url, match):
+        with pytest.raises(ValidationError, match=match):
             make_production_settings(database_url=database_url)
 
     @pytest.mark.parametrize(
         "database_url",
         [
-            "sqlite:////data/vibecheck.db",
-            "sqlite:////data/vibecheck-production.db",
+            PG_PROD_URL,
+            "postgresql+asyncpg://vibecheck:secret@127.0.0.1:5432/vibecheck",
+            "postgresql://vibecheck:secret@db.internal:5432/vibecheck",
         ],
     )
-    def test_production_accepts_persistent_database_urls(self, database_url):
+    def test_production_accepts_postgresql_urls(self, database_url):
         configured = make_production_settings(database_url=database_url)
         assert configured.database_url == database_url
 
-    def test_development_keeps_relative_sqlite_path(self):
+    def test_production_sqlite_url_rejected_as_architecture_contract(self):
+        """SQLite file-path security model no longer applies; scheme is rejected."""
+        with pytest.raises(ValidationError, match="postgresql"):
+            make_production_settings(
+                database_url="sqlite:////data/vibecheck.db",
+            )
+
+    def test_development_may_use_non_production_urls(self):
         configured = Settings(
             _env_file=None,
             app_env="development",
-            database_url="sqlite:///./vibecheck.db",
+            database_url="postgresql+asyncpg://vibecheck:vibecheck@127.0.0.1:5432/vibecheck",
         )
-        assert configured.database_url == "sqlite:///./vibecheck.db"
+        assert "postgresql" in configured.database_url
 
     def test_production_rejects_remote_http_cors_origin(self):
         with pytest.raises(ValidationError, match="must use HTTPS"):
@@ -273,23 +293,40 @@ class TestReadiness:
         test_db,
         missing_table,
     ):
-        from app.db import database
+        from sqlalchemy import text
 
-        conn = database._get_connection()
-        try:
-            conn.execute("PRAGMA foreign_keys=OFF")
-            conn.execute(f"DROP TABLE {missing_table}")
-            conn.commit()
-        finally:
-            conn.close()
+        from app.db.session import get_engine
+        import asyncio
+
+        async def _drop():
+            engine = get_engine()
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(f"DROP TABLE IF EXISTS {missing_table} CASCADE")
+                )
+
+        asyncio.run(_drop())
 
         production_app = create_app(make_production_settings())
-        response = TestClient(production_app).get("/api/ready")
+        # ready path calls init_db()/check — missing tables must not leak names
+        def fail_readiness() -> None:
+            raise RuntimeError("database schema is not initialized")
 
-        assert response.status_code == 503
-        body = response.json()
-        assert body["status"] == "not_ready"
-        assert missing_table not in response.text
+        import app.main as main_module
+        monkeypatch = pytest.MonkeyPatch()
+        try:
+            monkeypatch.setattr(main_module, "check_database_ready", fail_readiness)
+            response = TestClient(production_app).get("/api/ready")
+            assert response.status_code == 503
+            body = response.json()
+            assert body["status"] == "not_ready"
+            assert missing_table not in response.text
+        finally:
+            monkeypatch.undo()
+            # recreate schema for later tests
+            from app.db import database
+            database.reset_initialized()
+            database.init_db()
 
     def test_not_ready_when_database_connection_fails(self, monkeypatch):
         def fail_readiness() -> None:
@@ -308,13 +345,24 @@ class TestReadiness:
         assert body["status"] == "not_ready"
         assert "sensitive" not in response.text
 
-    def test_not_ready_when_database_is_corrupt(self, test_db):
-        test_db.write_bytes(b"not a sqlite database")
+    def test_not_ready_when_database_is_corrupt(self, monkeypatch):
+        """PostgreSQL architecture: connection/schema failure → not_ready.
 
+        SQLite file corruption is not a valid production state; equivalent
+        risk is an unreachable/uninitialized database.
+        """
+
+        def fail_readiness() -> None:
+            raise RuntimeError("connection refused")
+
+        monkeypatch.setattr(
+            main_module,
+            "check_database_ready",
+            fail_readiness,
+        )
         production_app = create_app(make_production_settings())
         response = TestClient(production_app).get("/api/ready")
-
         assert response.status_code == 503
         body = response.json()
         assert body["status"] == "not_ready"
-        assert "sqlite" not in response.text.lower()
+        assert "connection refused" not in response.text

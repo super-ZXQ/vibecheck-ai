@@ -94,7 +94,13 @@ SYNTH_TOKEN_AIZA = "AIza" + _MIXED[:35]
 def test_db(tmp_path, monkeypatch):
     """设置临时测试数据库。"""
     db_path = tmp_path / "test.db"
-    monkeypatch.setattr("app.core.config.settings.database_url", f"sqlite:///{db_path}")
+    monkeypatch.setattr(
+        "app.core.config.settings.database_url",
+        __import__("os").environ.get(
+            "TEST_DATABASE_URL",
+            "postgresql+asyncpg://vibecheck:vibecheck@127.0.0.1:5432/vibecheck_test",
+        ),
+    )
     database._initialized = False
     database.init_db()
     yield db_path
@@ -105,7 +111,13 @@ def test_db(tmp_path, monkeypatch):
 def client(tmp_path, monkeypatch):
     """设置临时测试数据库和 TestClient。"""
     db_path = tmp_path / "test.db"
-    monkeypatch.setattr("app.core.config.settings.database_url", f"sqlite:///{db_path}")
+    monkeypatch.setattr(
+        "app.core.config.settings.database_url",
+        __import__("os").environ.get(
+            "TEST_DATABASE_URL",
+            "postgresql+asyncpg://vibecheck:vibecheck@127.0.0.1:5432/vibecheck_test",
+        ),
+    )
     database._initialized = False
     database.init_db()
     with TestClient(app) as c:
@@ -192,6 +204,11 @@ def _read_db_row(task_id):
 # ============================================================
 # 1. Finding 确定性全排序对抗测试
 # ============================================================
+
+
+def _iso(v):
+    return v.isoformat() if hasattr(v, "isoformat") else str(v)
+
 
 class TestDeterministicFullOrdering:
     """Finding 确定性全排序对抗测试。
@@ -787,15 +804,18 @@ class TestTimestampConsistency:
         row = _read_db_row(task.id)
         assert row is not None
 
-        # JSON created_at == DB created_at
-        assert persisted["created_at"] == row["created_at"]
-        # JSON updated_at == DB updated_at
-        assert persisted["updated_at"] == row["updated_at"]
+        def _iso(v):
+            return v.isoformat() if hasattr(v, "isoformat") else str(v)
+        # JSON created_at == DB created_at (normalized ISO)
+        assert _iso(persisted["created_at"]) == _iso(row["created_at"])
+        assert _iso(persisted["updated_at"]) == _iso(row["updated_at"])
 
         # 从 DB 读回的 JSON 也一致
         retrieved = get_assessment_result(task.id)
-        assert retrieved["created_at"] == row["created_at"]
-        assert retrieved["updated_at"] == row["updated_at"]
+        def _iso(v):
+            return v.isoformat() if hasattr(v, "isoformat") else str(v)
+        assert _iso(retrieved["created_at"]) == _iso(row["created_at"])
+        assert _iso(retrieved["updated_at"]) == _iso(row["updated_at"])
 
     def test_upsert_preserves_created_at_in_json_and_db(self, test_db):
         """第二次 upsert 后 JSON created_at 不变、数据库 created_at 不变。"""
@@ -816,8 +836,8 @@ class TestTimestampConsistency:
         row1 = _read_db_row(task.id)
 
         # 验证第一次保存的 JSON 和 DB 一致
-        assert persisted1["created_at"] == row1["created_at"]
-        assert persisted1["updated_at"] == row1["updated_at"]
+        assert _iso(persisted1["created_at"]) == _iso(row1["created_at"])
+        assert _iso(persisted1["updated_at"]) == _iso(row1["updated_at"])
 
         time.sleep(0.01)
 
@@ -829,12 +849,12 @@ class TestTimestampConsistency:
         # created_at 不变（JSON 和 DB 都不变）
         assert persisted2["created_at"] == persisted1["created_at"]
         assert row2["created_at"] == row1["created_at"]
-        assert persisted2["created_at"] == row2["created_at"]
+        assert _iso(persisted2["created_at"]) == _iso(row2["created_at"])
 
         # updated_at 变化（JSON 和 DB 同步更新）
         assert persisted2["updated_at"] != persisted1["updated_at"]
         assert row2["updated_at"] != row1["updated_at"]
-        assert persisted2["updated_at"] == row2["updated_at"]
+        assert _iso(persisted2["updated_at"]) == _iso(row2["updated_at"])
 
     def test_api_returns_db_timestamps(self, client):
         """API 返回的时间戳与数据库列一致。"""
@@ -862,8 +882,8 @@ class TestTimestampConsistency:
         data = response.json()
 
         # API 返回的时间戳与 DB 列一致
-        assert data["created_at"] == row["created_at"]
-        assert data["updated_at"] == row["updated_at"]
+        assert _iso(data["created_at"]) == _iso(row["created_at"])
+        assert _iso(data["updated_at"]) == _iso(row["updated_at"])
 
     def test_run_assessment_returns_persisted_version(self, test_db):
         """run_assessment 返回最终持久化版本，不是保存前的旧版本。"""
@@ -884,8 +904,8 @@ class TestTimestampConsistency:
         # 与 DB 列一致
         row = _read_db_row(task.id)
         assert row is not None
-        assert persisted["created_at"] == row["created_at"]
-        assert persisted["updated_at"] == row["updated_at"]
+        assert _iso(persisted["created_at"]) == _iso(row["created_at"])
+        assert _iso(persisted["updated_at"]) == _iso(row["updated_at"])
 
         # 与从 DB 读回的一致
         retrieved = get_assessment_result(task.id)

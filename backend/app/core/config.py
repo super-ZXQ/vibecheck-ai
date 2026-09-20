@@ -14,38 +14,25 @@ from pydantic_settings import BaseSettings
 
 
 def validate_production_database_url(database_url: str) -> None:
-    """Require a canonical persistent SQLite file inside Docker's /data."""
-    parsed = urlsplit(database_url)
-    if (
-        parsed.scheme != "sqlite"
-        or parsed.netloc
-        or parsed.query
-        or parsed.fragment
-        or not database_url.startswith("sqlite:////")
-    ):
-        raise ValueError(
-            "production database_url must be a SQLite .db file under /data"
-        )
+    """Require PostgreSQL async URL for production runtime.
 
-    raw_path = database_url.removeprefix("sqlite:///")
-    path = PurePosixPath(raw_path)
-    normalized_path = PurePosixPath(posixpath.normpath(str(path)))
-    if (
-        not path.is_absolute()
-        or ".." in path.parts
-        or normalized_path == PurePosixPath("/data")
-        or normalized_path.suffix != ".db"
-    ):
+    SQLite is not a production database for this upgrade. Credentials must
+    not be empty placeholders; host/db name must be present.
+    """
+    parsed = urlsplit(database_url.replace("+asyncpg", "").replace("+psycopg", ""))
+    # Accept postgresql://user:pass@host:port/db
+    if parsed.scheme not in {"postgresql", "postgres"}:
         raise ValueError(
-            "production database_url must be a SQLite .db file under /data"
+            "production database_url must use the postgresql scheme "
+            "(postgresql+asyncpg://...)"
         )
-
-    try:
-        normalized_path.relative_to(PurePosixPath("/data"))
-    except ValueError as exc:
-        raise ValueError(
-            "production database_url must be a SQLite .db file under /data"
-        ) from exc
+    if not parsed.hostname:
+        raise ValueError("production database_url must include a host")
+    if not parsed.path or parsed.path == "/":
+        raise ValueError("production database_url must include a database name")
+    if "://" in database_url and "@" not in database_url:
+        # Allow trust/peer sockets only if explicitly intentional — require user.
+        raise ValueError("production database_url must include user credentials")
 
 
 class Settings(BaseSettings):
@@ -188,7 +175,12 @@ class Settings(BaseSettings):
     tmp_dir: str = "/tmp/vibecheck"  # isolated temp root
 
     # --- Database ---
-    database_url: str = "sqlite:///./vibecheck.db"
+    # Production/runtime default is PostgreSQL via asyncpg.
+    # SQLite is reserved for isolated unit tests only (not production).
+    database_url: str = "postgresql+asyncpg://vibecheck:vibecheck@127.0.0.1:5432/vibecheck"
+    db_pool_size: int = Field(default=5, ge=1, le=50)
+    db_max_overflow: int = Field(default=10, ge=0, le=100)
+    db_pool_recycle_seconds: int = Field(default=1800, ge=60)
 
     # --- Task queue / dispatcher (single-instance bounded concurrency) ---
     max_pending_tasks: int = 5  # max pending tasks in queue

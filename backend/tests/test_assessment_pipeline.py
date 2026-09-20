@@ -49,7 +49,13 @@ from app.services.scan_result_service import get_scan_result
 def test_db(tmp_path, monkeypatch):
     """设置临时测试数据库。"""
     db_path = tmp_path / "test.db"
-    monkeypatch.setattr("app.core.config.settings.database_url", f"sqlite:///{db_path}")
+    monkeypatch.setattr(
+        "app.core.config.settings.database_url",
+        __import__("os").environ.get(
+            "TEST_DATABASE_URL",
+            "postgresql+asyncpg://vibecheck:vibecheck@127.0.0.1:5432/vibecheck_test",
+        ),
+    )
     monkeypatch.setattr(
         "app.core.config.settings.tmp_dir", str(tmp_path / "tmp")
     )
@@ -63,7 +69,13 @@ def test_db(tmp_path, monkeypatch):
 def client(tmp_path, monkeypatch):
     """设置临时测试数据库和 TestClient（用于 API 测试）。"""
     db_path = tmp_path / "test.db"
-    monkeypatch.setattr("app.core.config.settings.database_url", f"sqlite:///{db_path}")
+    monkeypatch.setattr(
+        "app.core.config.settings.database_url",
+        __import__("os").environ.get(
+            "TEST_DATABASE_URL",
+            "postgresql+asyncpg://vibecheck:vibecheck@127.0.0.1:5432/vibecheck_test",
+        ),
+    )
     monkeypatch.setattr(
         "app.core.config.settings.tmp_dir", str(tmp_path / "tmp")
     )

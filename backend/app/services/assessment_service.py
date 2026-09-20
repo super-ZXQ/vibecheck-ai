@@ -1211,205 +1211,27 @@ def assess_scan_result(task_id: str, scan_result: dict[str, Any]) -> dict[str, A
 def get_scan_result_with_timestamp(
     task_id: str,
 ) -> tuple[dict[str, Any], str] | None:
-    """Read the persisted scan result and its updated_at timestamp.
+    """Read persisted scan result + updated_at via result repository."""
+    from app.services.result_repository import get_scan_result_sync
 
-    This is the bridge between P0-5 persistence and P0-6 assessment.
-    The assessment engine reads ONLY from SQLite — never from temp.
-
-    Returns:
-        (scan_result_dict, scan_updated_at) or None if no scan result
-        has been persisted for this task_id.
-    """
     init_db()
+    data = get_scan_result_sync(task_id)
+    if data is None:
+        return None
+    parsed = data if isinstance(data, dict) else json.loads(data)
+    ts = now_iso()
     conn = _get_connection()
     try:
         row = conn.execute(
-            "SELECT result_json, updated_at FROM scan_results WHERE task_id = ?",
+            "SELECT updated_at FROM scan_results WHERE task_id = ?",
             (task_id,),
         ).fetchone()
-        if row is None:
-            return None
-        parsed = json.loads(row["result_json"])
-        return normalize_scan_result_dimensions(parsed), row["updated_at"]
+        if row is not None and row["updated_at"] is not None:
+            v = row["updated_at"]
+            ts = v.isoformat() if hasattr(v, "isoformat") else str(v)
     finally:
         conn.close()
-
-
-def save_assessment_result(
-    task_id: str,
-    assessment: dict[str, Any],
-    source_scan_updated_at: str,
-) -> dict[str, Any]:
-    """Persist an assessment result to the assessment_results table.
-
-    Uses SQLite native upsert (INSERT ON CONFLICT DO UPDATE):
-    - created_at is preserved on update (only set on first INSERT).
-    - updated_at is always refreshed.
-    - source_scan_updated_at tracks which scan_results version this
-      assessment was computed from.
-
-    This function is the EXPLICIT SERIALIZATION BOUNDARY:
-    - Calls serialize_assessment_result() to build a safe dict with
-      strict field whitelists and defensive desensitization.
-    - Forces schema_version, policy_version, assessment_scope, and
-      task_id from policy constants / parameters — never trusts the
-      input assessment dict.
-    - The same created_at and updated_at values are used in both the
-      assessment_json and the database columns, ensuring consistency.
-
-    Args:
-        task_id:                The authoritative task ID (used for both
-                                the DB primary key and the JSON task_id).
-        assessment:             The AssessmentResult dict from
-                                assess_scan_result(). Its task_id,
-                                schema_version, etc. are NOT trusted.
-        source_scan_updated_at: The updated_at of the scan_results row
-                                this assessment was computed from.
-
-    Returns:
-        The final safe persisted dict (as written to assessment_json).
-        This is the authoritative version — callers should use this
-        return value rather than the pre-save assessment dict.
-
-    Raises:
-        AssessmentResultTooLargeError: If serialized assessment_json exceeds
-            assessment_max_json_bytes.
-        AssessmentPersistError: If any database operation fails.
-        AssessmentInternalError: If serialization fails (preserved, NOT
-            wrapped as AssessmentPersistError).
-    """
-    # --- A. Determine now timestamp ---
-    now = now_iso()
-
-    # --- B. Get database connection ---
-    # conn is initialized to None so that the finally block can safely
-    # check whether a connection was actually opened before attempting
-    # to close it. This prevents AttributeError if init_db or
-    # _get_connection fails before conn is assigned.
-    #
-    # _success tracks whether the try block completed without exception.
-    # It is used in the finally block to decide whether a close failure
-    # should raise a new AssessmentPersistError (no prior error) or be
-    # suppressed (prior error already in flight).
-    # We CANNOT use sys.exc_info() for this because inside the
-    # except handler for the close failure, sys.exc_info()[1] is the
-    # close exception itself — not None and not the original error.
-    conn = None
-    safe_assessment = None
-    assessment_json = None
-    _success = False
-
-    try:
-        # init_db and _get_connection are inside the try so that
-        # sqlite3.Error from either is mapped to AssessmentPersistError.
-        init_db()
-        conn = _get_connection()
-
-        # --- C. Query existing created_at ---
-        existing = conn.execute(
-            "SELECT created_at FROM assessment_results WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()
-
-        if existing is not None:
-            created_at = existing["created_at"]
-        else:
-            created_at = now
-
-        # --- D. Explicit serialization ---
-        # serialize_assessment_result may raise AssessmentSerializationError
-        # or AssessmentInternalError. These MUST be preserved as internal
-        # errors — they must NOT be wrapped as AssessmentPersistError.
-        safe_assessment = serialize_assessment_result(
-            task_id=task_id,
-            assessment=assessment,
-            created_at=created_at,
-            updated_at=now,
-        )
-
-        # Serialize to JSON with sort_keys for deterministic output.
-        assessment_json = json.dumps(
-            safe_assessment, ensure_ascii=False, sort_keys=True
-        )
-
-        # Check byte size limit — AssessmentResultTooLargeError stays independent.
-        if len(assessment_json.encode("utf-8")) > settings.assessment_max_json_bytes:
-            raise AssessmentResultTooLargeError(
-                "assessment_json exceeds assessment_max_json_bytes"
-            )
-
-        # --- E. Execute upsert and commit ---
-        conn.execute(
-            """INSERT INTO assessment_results
-               (task_id, schema_version, policy_version, assessment_scope,
-                assessment_json, score, verdict, source_scan_updated_at,
-                created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(task_id) DO UPDATE SET
-                   schema_version=excluded.schema_version,
-                   policy_version=excluded.policy_version,
-                   assessment_scope=excluded.assessment_scope,
-                   assessment_json=excluded.assessment_json,
-                   score=excluded.score,
-                   verdict=excluded.verdict,
-                   source_scan_updated_at=excluded.source_scan_updated_at,
-                   updated_at=excluded.updated_at""",
-            (
-                task_id,
-                safe_assessment["schema_version"],
-                safe_assessment["policy_version"],
-                safe_assessment["assessment_scope"],
-                assessment_json,
-                safe_assessment["score"],
-                safe_assessment["verdict"],
-                source_scan_updated_at,
-                created_at,
-                now,
-            ),
-        )
-        conn.commit()
-        _success = True
-    except (AssessmentResultTooLargeError, AssessmentInternalError):
-        # Serialization errors (AssessmentSerializationError extends
-        # AssessmentInternalError) and size limit errors must NOT be
-        # wrapped as AssessmentPersistError — they are internal errors.
-        # Attempt rollback if we have a connection, but never let
-        # rollback failure mask the original exception.
-        if conn is not None:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-        raise
-    except Exception:
-        # All other exceptions (sqlite3.Error, etc.) are database
-        # failures → AssessmentPersistError.
-        # Never expose str(exc), repr(exc), or DB details.
-        if conn is not None:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-        raise AssessmentPersistError(
-            "Failed to persist assessment result"
-        )
-    finally:
-        # --- F. Close connection (exactly once) ---
-        # If there was no prior exception (_success is True) but close
-        # fails, that is a database failure → AssessmentPersistError.
-        # If there WAS a prior exception (_success is False), close
-        # failure must NOT mask it — we suppress the close error.
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                if _success:
-                    raise AssessmentPersistError(
-                        "Failed to close database connection"
-                    )
-
-    return safe_assessment
-
+    return normalize_scan_result_dimensions(parsed), ts
 
 def _normalize_score_breakdown(breakdown: list[dict[str, Any]]) -> None:
     """Normalize score_breakdown entries in-place.
@@ -1433,95 +1255,113 @@ def _normalize_score_breakdown(breakdown: list[dict[str, Any]]) -> None:
             entry["rule_name"] = _RULE_DISPLAY_NAMES.get(rid, rid)
 
 
+
+def save_assessment_result(
+    task_id: str,
+    assessment: dict[str, Any],
+    source_scan_updated_at: str,
+) -> dict[str, Any]:
+    """Persist an assessment result via SQLAlchemy result repository."""
+    from app.core.config import settings
+    from app.services.result_repository import save_assessment_sync
+
+    now = now_iso()
+    if hasattr(source_scan_updated_at, "isoformat"):
+        source_scan_updated_at = source_scan_updated_at.isoformat()
+    if not isinstance(source_scan_updated_at, str):
+        source_scan_updated_at = str(source_scan_updated_at)
+    init_db()
+    try:
+        safe_assessment = serialize_assessment_result(
+            task_id=task_id,
+            assessment=assessment,
+            created_at=now,
+            updated_at=now,
+        )
+        assessment_json = json.dumps(
+            safe_assessment, ensure_ascii=False, sort_keys=True
+        )
+        if len(assessment_json.encode("utf-8")) > settings.assessment_max_json_bytes:
+            raise AssessmentResultTooLargeError(
+                "assessment_json exceeds assessment_max_json_bytes"
+            )
+        save_assessment_sync(
+            task_id,
+            {
+                "schema_version": safe_assessment["schema_version"],
+                "policy_version": safe_assessment["policy_version"],
+                "assessment_scope": safe_assessment["assessment_scope"],
+                "assessment_json": safe_assessment,
+                "score": safe_assessment["score"],
+                "verdict": safe_assessment["verdict"],
+                "source_scan_updated_at": source_scan_updated_at,
+            },
+        )
+        # Align public JSON timestamps with authoritative DB values.
+        from app.db.database import _get_connection
+        conn = _get_connection()
+        try:
+            row = conn.execute(
+                "SELECT created_at, updated_at FROM assessment_results WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is not None:
+            def _iso(v):
+                return v.isoformat() if hasattr(v, "isoformat") else str(v)
+            safe_assessment["created_at"] = _iso(row["created_at"])
+            safe_assessment["updated_at"] = _iso(row["updated_at"])
+            from app.db.models import AssessmentResultRow
+            from app.db.session import get_session_factory
+            import json as _json
+            import asyncio as _aio
+
+            async def _rewrite():
+                factory = get_session_factory()
+                async with factory() as session:
+                    rr = await session.get(AssessmentResultRow, task_id)
+                    if rr is not None:
+                        rr.assessment_json = _json.dumps(
+                            safe_assessment, ensure_ascii=False
+                        )
+                        await session.commit()
+
+            _aio.run(_rewrite())
+        return safe_assessment
+    except (AssessmentResultTooLargeError, AssessmentInternalError):
+        raise
+    except Exception:
+        raise AssessmentPersistError("Failed to persist assessment result")
+
+
+def get_assessment_score_verdict(
+    task_id: str,
+) -> tuple[int, str] | None:
+    """Lightweight read for status polling — returns (score, verdict)."""
+    from app.services.result_repository import get_assessment_score_verdict_sync
+
+    init_db()
+    return get_assessment_score_verdict_sync(task_id)
+
+
 def get_assessment_result(task_id: str) -> dict[str, Any] | None:
-    """Read the full persisted assessment result for a task.
+    """Read persisted assessment via SQLAlchemy result repository."""
+    from app.services.result_repository import get_assessment_sync
 
-    Returns None if no assessment has been persisted for this task_id.
-    The returned dict has the same structure as the AssessmentResult
-    produced by assess_scan_result().
-
-    Validates the parsed JSON to ensure identity consistency:
-    - schema_version == ASSESSMENT_SCHEMA_VERSION
-    - policy_version == POLICY_VERSION
-    - assessment_scope == ASSESSMENT_SCOPE
-    - task_id matches the requested task_id
-    - score is an int in [0, 100]
-    - verdict is one of pass, warning, blocked
-
-    Args:
-        task_id: The task ID to look up.
-
-    Returns:
-        The AssessmentResult dict, or None if not found.
-
-    Raises:
-        AssessmentInternalError: If the database read fails, JSON parsing
-            fails, the top-level is not a dict, or any identity/schema
-            validation fails. The exception message never contains the
-            raw JSON, database errors, str(exc), or repr(exc).
-    """
-    # --- Full database error boundary: init_db, connection, execute,
-    # fetchone, row field reading, and connection close are ALL inside
-    # the try block. Any database exception is caught and mapped to
-    # AssessmentInternalError with a fixed safe message.
-    #
-    # Connection close semantics:
-    # - Connection is closed EXACTLY ONCE in the finally block.
-    # - When row is None (not found), we do NOT close in the try body.
-    # - close failure is NEVER silently ignored:
-    #   * If a DB read error already occurred → preserve that error.
-    #   * If no prior error → close failure becomes AssessmentInternalError.
-    #
-    # _db_error tracks whether a DB exception was already raised.
-    # We CANNOT use sys.exc_info() for this because inside the
-    # except handler for the close failure, sys.exc_info()[1] is the
-    # close exception itself — not None and not the original error.
-    conn = None
-    raw_json = None
-    _db_error = False
     try:
         init_db()
-        conn = _get_connection()
-        row = conn.execute(
-            "SELECT assessment_json FROM assessment_results WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()
-        if row is None:
-            # Do NOT close here — finally will close exactly once.
-            return None
-        raw_json = row["assessment_json"]
+        result = get_assessment_sync(task_id)
+    except AssessmentInternalError:
+        raise
     except Exception:
-        # Any DB error (init_db, connection, execute, fetchone, row read)
-        # is mapped to a fixed AssessmentInternalError.
-        # The original exception content is never exposed.
-        _db_error = True
         raise AssessmentInternalError(
             "Failed to read assessment from database"
         )
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                # If a DB exception is already in flight (_db_error is
-                # True), preserve it. Otherwise, close failure itself
-                # is an internal error.
-                if not _db_error:
-                    raise AssessmentInternalError(
-                        "Failed to close database connection"
-                    )
-
-    # --- Parse JSON ---
-    try:
-        result = json.loads(raw_json)
-    except (json.JSONDecodeError, TypeError):
-        raise AssessmentInternalError("Failed to parse assessment JSON")
-
-    # --- Validate top-level structure ---
+    if result is None:
+        return None
     if not isinstance(result, dict):
         raise AssessmentInternalError("Assessment JSON is not a dict")
-
-    # --- Validate identity fields ---
     if result.get("schema_version") != ASSESSMENT_SCHEMA_VERSION:
         raise AssessmentInternalError("Assessment schema_version mismatch")
     if result.get("policy_version") != POLICY_VERSION:
@@ -1530,53 +1370,14 @@ def get_assessment_result(task_id: str) -> dict[str, Any] | None:
         raise AssessmentInternalError("Assessment scope mismatch")
     if result.get("task_id") != task_id:
         raise AssessmentInternalError("Assessment task_id mismatch")
-
-    # --- Validate score (strict type: bool is NOT accepted) ---
     score = result.get("score")
     if type(score) is not int or score < 0 or score > 100:
         raise AssessmentInternalError("Assessment score invalid")
-
-    # --- Validate verdict ---
     verdict = result.get("verdict")
     if verdict not in _VALID_VERDICTS:
         raise AssessmentInternalError("Assessment verdict invalid")
-
-    # --- Normalize score_breakdown field names ---
-    # Stored data may use old field names (applied_deduction, rule_cap)
-    # from pre-v1 serializers. Map to current API field names.
     _normalize_score_breakdown(result.get("score_breakdown", []))
-
     return result
-
-
-def get_assessment_score_verdict(
-    task_id: str,
-) -> tuple[int, str] | None:
-    """Lightweight read for status polling — returns (score, verdict).
-
-    Reads ONLY the redundant score and verdict columns, avoiding
-    a full assessment_json parse on every poll.
-
-    Returns None if no assessment has been persisted.
-
-    Args:
-        task_id: The task ID to look up.
-
-    Returns:
-        (score, verdict) tuple, or None if not found.
-    """
-    init_db()
-    conn = _get_connection()
-    try:
-        row = conn.execute(
-            "SELECT score, verdict FROM assessment_results WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return row["score"], row["verdict"]
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------

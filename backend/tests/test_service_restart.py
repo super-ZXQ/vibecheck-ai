@@ -24,7 +24,11 @@ def test_db(tmp_path, monkeypatch):
     """Set up a temporary test database."""
     db_path = tmp_path / "test_restart.db"
     monkeypatch.setattr(
-        "app.core.config.settings.database_url", f"sqlite:///{db_path}"
+        "app.core.config.settings.database_url",
+        __import__("os").environ.get(
+            "TEST_DATABASE_URL",
+            "postgresql+asyncpg://vibecheck:vibecheck@127.0.0.1:5432/vibecheck_test",
+        ),
     )
     monkeypatch.setattr(
         "app.core.config.settings.tmp_dir", str(tmp_path / "tmp")
@@ -42,29 +46,45 @@ def test_db(tmp_path, monkeypatch):
 
 
 def _force_expired_lease(task_id: str) -> None:
-    conn = database._get_connection()
-    try:
-        past = (utc_now() - timedelta(seconds=300)).isoformat()
-        conn.execute(
-            "UPDATE tasks SET lease_expires_at = ? WHERE id = ?",
-            (past, task_id),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    import asyncio
+
+    from sqlalchemy import update
+    from app.db.models import TaskRow
+    from app.db.session import get_session_factory
+    from app.services.task_manager import utc_now
+
+    async def _run():
+        factory = get_session_factory()
+        async with factory() as session:
+            await session.execute(
+                update(TaskRow)
+                .where(TaskRow.id == task_id)
+                .values(lease_expires_at=utc_now() - timedelta(seconds=300))
+            )
+            await session.commit()
+
+    asyncio.run(_run())
 
 
 def _force_future_lease(task_id: str) -> None:
-    conn = database._get_connection()
-    try:
-        future = (utc_now() + timedelta(seconds=600)).isoformat()
-        conn.execute(
-            "UPDATE tasks SET lease_expires_at = ? WHERE id = ?",
-            (future, task_id),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    import asyncio
+
+    from sqlalchemy import update
+    from app.db.models import TaskRow
+    from app.db.session import get_session_factory
+    from app.services.task_manager import utc_now
+
+    async def _run():
+        factory = get_session_factory()
+        async with factory() as session:
+            await session.execute(
+                update(TaskRow)
+                .where(TaskRow.id == task_id)
+                .values(lease_expires_at=utc_now() + timedelta(seconds=600))
+            )
+            await session.commit()
+
+    asyncio.run(_run())
 
 
 class TestLeaseRecovery:
@@ -200,7 +220,19 @@ class TestLeaseRecovery:
         after = task_manager.get_task(task.id)
         assert after.last_heartbeat_at is not None
         assert after.lease_expires_at is not None
-        assert after.lease_expires_at >= (before or "")
+        # Both timestamps are timezone-aware datetime or ISO strings.
+        b = before if not isinstance(before, str) else before
+        a = after.lease_expires_at
+        if isinstance(a, str) or isinstance(b, str):
+            assert str(a) >= str(b or "")
+        else:
+            ba = b.replace(tzinfo=b.tzinfo) if getattr(b, "tzinfo", None) else b
+            aa = a if getattr(a, "tzinfo", None) else a
+            if getattr(aa, "tzinfo", None) and getattr(ba, "tzinfo", None) is None:
+                ba = ba.replace(tzinfo=aa.tzinfo)
+            if getattr(ba, "tzinfo", None) and getattr(aa, "tzinfo", None) is None:
+                aa = aa.replace(tzinfo=ba.tzinfo)
+            assert aa >= ba
 
 
 class TestStartupEvent:

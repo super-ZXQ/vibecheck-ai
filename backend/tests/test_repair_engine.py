@@ -46,7 +46,13 @@ from app.services.repair_service import RepairPlanInternalError, generate_repair
 def test_db(tmp_path, monkeypatch):
     """设置临时测试数据库。"""
     db_path = tmp_path / "test.db"
-    monkeypatch.setattr("app.core.config.settings.database_url", f"sqlite:///{db_path}")
+    monkeypatch.setattr(
+        "app.core.config.settings.database_url",
+        __import__("os").environ.get(
+            "TEST_DATABASE_URL",
+            "postgresql+asyncpg://vibecheck:vibecheck@127.0.0.1:5432/vibecheck_test",
+        ),
+    )
     database._initialized = False
     database.init_db()
     yield db_path

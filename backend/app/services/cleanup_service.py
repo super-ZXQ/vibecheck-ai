@@ -95,88 +95,56 @@ def _onerror_log(func, path, exc_info):
 
 
 def cleanup_expired_tasks() -> int:
-    """Delete tasks older than report_ttl_hours and all related data.
-
-    Deletes from: tasks, scan_results, assessment_results,
-    repair_results, llm_analysis_results.
-
-    Returns the number of tasks deleted.
-    """
+    """Delete expired completed/failed tasks via SQLAlchemy async repository."""
     if settings.report_ttl_hours <= 0:
-        # Cleanup disabled.
         return 0
-
     from datetime import datetime, timedelta
 
-    init_db()
-    conn = _get_connection()
-    try:
-        # Fetch all completed/failed tasks with completed_at.
-        rows = conn.execute(
-            """SELECT id, completed_at FROM tasks
-               WHERE status IN ('completed', 'failed')
-               AND completed_at IS NOT NULL""",
-        ).fetchall()
+    from sqlalchemy import delete, select
+    from app.db.models import (
+        AssessmentResultRow,
+        LlmAnalysisResultRow,
+        RepairResultRow,
+        ScanResultRow,
+        TaskRow,
+    )
+    from app.db.session import get_session_factory
+    import asyncio
+    import concurrent.futures
 
-        if not rows:
-            return 0
-
-        # Filter expired tasks in Python (SQLite julianday has
-        # limited ISO 8601 / timezone support).
-        cutoff = datetime.now(timezone.utc) - timedelta(
-            hours=settings.report_ttl_hours
-        )
-        expired_ids: list[str] = []
-        for row in rows:
-            try:
-                completed_str = row["completed_at"]
-                # Handle both "Z" suffix and "+00:00" formats.
-                if completed_str.endswith("Z"):
-                    completed = datetime.fromisoformat(
-                        completed_str
-                    )
-                else:
-                    completed = datetime.fromisoformat(completed_str)
-                    if completed.tzinfo is None:
-                        completed = completed.replace(tzinfo=timezone.utc)
-                if completed < cutoff:
-                    expired_ids.append(row["id"])
-            except (ValueError, TypeError):
-                # Skip unparseable timestamps.
-                continue
-
-        if not expired_ids:
-            return 0
-
-        count = len(expired_ids)
-        placeholders = ",".join("?" * count)
-
-        # Delete from all related tables in a single transaction.
-        # Related tables use task_id; the tasks table uses id.
-        for table in (
-            "llm_analysis_results",
-            "repair_results",
-            "assessment_results",
-            "scan_results",
-        ):
-            conn.execute(
-                f"DELETE FROM {table} WHERE task_id IN ({placeholders})",
-                expired_ids,
+    async def _run() -> int:
+        factory = get_session_factory()
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=settings.report_ttl_hours)
+        async with factory() as session:
+            result = await session.execute(
+                select(TaskRow.id, TaskRow.completed_at).where(
+                    TaskRow.status.in_(("completed", "failed", "cancelled", "dead")),
+                    TaskRow.completed_at.isnot(None),
+                    TaskRow.completed_at < cutoff,
+                )
             )
-        conn.execute(
-            f"DELETE FROM tasks WHERE id IN ({placeholders})",
-            expired_ids,
-        )
-        conn.commit()
+            ids = [row[0] for row in result.all()]
+            if not ids:
+                return 0
+            for model in (
+                LlmAnalysisResultRow,
+                RepairResultRow,
+                AssessmentResultRow,
+                ScanResultRow,
+            ):
+                await session.execute(delete(model).where(model.task_id.in_(ids)))
+            await session.execute(delete(TaskRow).where(TaskRow.id.in_(ids)))
+            await session.commit()
+            return len(ids)
 
-        logger.info("Expired report cleanup: deleted %d task(s)", count)
-        return count
-    except Exception:
-        logger.error("Expired report cleanup failed — database error")
-        conn.rollback()
-        return 0
-    finally:
-        conn.close()
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_run())
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, _run()).result()
+
+
 
 
 def maybe_trigger_cleanup() -> None:

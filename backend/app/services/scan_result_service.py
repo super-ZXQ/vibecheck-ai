@@ -542,174 +542,52 @@ def serialize_scan_result(scan_result: ScanResult) -> dict:
 # ---------------------------------------------------------------------------
 
 def save_scan_result(task_id: str, scan_result: ScanResult) -> None:
-    """Persist a scan result snapshot for a task.
-
-    Uses SQLite native upsert (INSERT ON CONFLICT DO UPDATE) — created_at
-    is preserved on update, only updated_at changes.
-
-    Args:
-        task_id:      The task ID this result belongs to.
-        scan_result:  The ScanResult from scan_directory().
-
-    Raises:
-        ScanResultTooLargeError: If serialized result_json exceeds
-            scan_max_result_json_bytes. The caller must handle this
-            and mark the task as failed with SCAN_RESULT_TOO_LARGE.
-        sqlite3.Error: If the database operation fails. The caller must
-                       handle this and mark the task as failed with
-                       SCAN_RESULT_PERSIST_FAILED.
-    """
+    """Persist a scan result snapshot via SQLAlchemy result repository."""
     from app.core.config import settings
+    from app.services.result_repository import save_scan_result_sync
 
     init_db()
-    now = now_iso()
-
-    # Serialize BEFORE opening the transaction — if serialization fails,
-    # we don't want a half-open transaction.
     result_dict = serialize_scan_result(scan_result)
     result_json = json.dumps(result_dict, ensure_ascii=False, sort_keys=True)
-
-    # Check byte size limit — refuse to persist oversized snapshots
     if len(result_json.encode("utf-8")) > settings.scan_max_result_json_bytes:
         raise ScanResultTooLargeError(
             "result_json exceeds scan_max_result_json_bytes"
         )
-
     summary = result_dict["summary"]
-    summary_json = json.dumps(
-        summary,
-        ensure_ascii=False,
-        sort_keys=True,
+    totals = {
+        "total_findings": summary["total_findings"],
+        "blocking_findings": summary["blocking_findings"],
+        "total_notices": summary["total_notices"],
+        "total_skipped_files": summary["total_skipped_files"],
+        "total_scan_errors": summary["total_scan_errors"],
+        "total_files_scanned": summary["total_files_scanned"],
+        "total_lines_scanned": summary["total_lines_scanned"],
+    }
+    save_scan_result_sync(
+        task_id,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "result_json": result_dict,
+            "summary_json": summary,
+            "totals": totals,
+        },
     )
-
-    conn = _get_connection()
-    try:
-        conn.execute(
-            """INSERT INTO scan_results
-               (task_id, schema_version, result_json, summary_json,
-                total_findings, blocking_findings, total_notices,
-                total_skipped_files, total_scan_errors,
-                total_files_scanned, total_lines_scanned,
-                created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(task_id) DO UPDATE SET
-                   schema_version=excluded.schema_version,
-                   result_json=excluded.result_json,
-                   summary_json=excluded.summary_json,
-                   total_findings=excluded.total_findings,
-                   blocking_findings=excluded.blocking_findings,
-                   total_notices=excluded.total_notices,
-                   total_skipped_files=excluded.total_skipped_files,
-                   total_scan_errors=excluded.total_scan_errors,
-                   total_files_scanned=excluded.total_files_scanned,
-                   total_lines_scanned=excluded.total_lines_scanned,
-                   updated_at=excluded.updated_at""",
-            (
-                task_id,
-                SCHEMA_VERSION,
-                result_json,
-                summary_json,
-                summary["total_findings"],
-                summary["blocking_findings"],
-                summary["total_notices"],
-                summary["total_skipped_files"],
-                summary["total_scan_errors"],
-                summary["total_files_scanned"],
-                summary["total_lines_scanned"],
-                now,  # created_at — only set on first INSERT, preserved on UPDATE
-                now,  # updated_at — always updated
-            ),
-        )
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def get_scan_result(task_id: str) -> dict | None:
-    """Get the full persisted scan result for a task.
+    """Get the full persisted scan result for a task."""
+    from app.services.result_repository import get_scan_result_sync
 
-    Returns None if no result has been persisted for this task_id.
-    The returned dict has the same structure as serialize_scan_result().
-
-    Args:
-        task_id: The task ID to look up.
-
-    Returns:
-        A dict with findings, notices, skipped_files, scan_errors,
-        summary, and schema_version — or None if not found.
-    """
     init_db()
-    conn = _get_connection()
-    try:
-        row = conn.execute(
-            "SELECT result_json FROM scan_results WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        parsed = json.loads(row["result_json"])
-        return normalize_scan_result_dimensions(parsed)
-    finally:
-        conn.close()
+    parsed = get_scan_result_sync(task_id)
+    if parsed is None:
+        return None
+    return normalize_scan_result_dimensions(parsed)
 
 
 def get_scan_summary(task_id: str) -> dict | None:
-    """Get only the summary portion of a persisted scan result.
+    """Get only the summary portion of a persisted scan result."""
+    from app.services.result_repository import get_scan_summary_sync
 
-    Returns None if no result has been persisted for this task_id.
-    The returned dict includes both total_* (actual scan counts) and
-    returned_* / *_truncated (persisted subset metadata).
-
-    Normal path reads ONLY summary_json — a lightweight column that
-    never exceeds a few hundred bytes. This avoids loading and parsing
-    the full result_json (up to 8 MB) on every status poll.
-
-    Fallback path: for old records created before the summary_json
-    column existed (summary_json is NULL or empty), falls back to
-    reading result_json. New records must NEVER enter this path —
-    save_scan_result always sets summary_json.
-
-    Args:
-        task_id: The task ID to look up.
-
-    Returns:
-        A dict with total_findings, blocking_findings, total_notices,
-        total_skipped_files, total_scan_errors, total_files_scanned,
-        total_lines_scanned, returned_findings, findings_truncated,
-        returned_notices, notices_truncated, returned_skipped_files,
-        skipped_files_truncated, returned_scan_errors,
-        scan_errors_truncated — or None if not found.
-    """
     init_db()
-    conn = _get_connection()
-    try:
-        # Normal path: read only summary_json (lightweight).
-        row = conn.execute(
-            "SELECT summary_json FROM scan_results WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()
-        if row is None:
-            return None
-
-        summary_json = row["summary_json"]
-        if summary_json:
-            # Normal path — summary_json exists and is valid.
-            return normalize_scan_summary_dimensions(json.loads(summary_json))
-
-        # Fallback for old records (summary_json is NULL or empty).
-        # These are records created before the summary_json column
-        # was added. Only in this case do we read the full result_json.
-        # New records must NEVER enter this path.
-        row = conn.execute(
-            "SELECT result_json FROM scan_results WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        result_dict = json.loads(row["result_json"])
-        summary = result_dict.get("summary")
-        if not isinstance(summary, dict):
-            return None
-        return normalize_scan_summary_dimensions(summary)
-    finally:
-        conn.close()
+    return get_scan_summary_sync(task_id)

@@ -1,539 +1,330 @@
-"""SQLite database layer — the single source of truth for task status.
+"""Database lifecycle compatibility layer (SQLAlchemy 2 async + PostgreSQL).
 
-Design:
-- Uses Python's built-in sqlite3 module (no extra dependencies).
-- Each operation opens a short-lived connection (SQLite handles this efficiently).
-- WAL mode enabled for better concurrency.
-- Thread-safe via check_same_thread=False + short-lived connections.
-- NEVER stores downloaded repository source files or raw sensitive content.
-- scan_results may store explicitly masked display snippets (snippet_masked).
-- Masked snippets must never contain original secrets.
-
-Tables:
-- tasks:              Task lifecycle records (P0-3).
-- scan_results:       Persisted scan result snapshots (P0-5). One row per task_id.
-                      result_json contains only desensitized public models from P0-4.
-- assessment_results: Persisted security assessment snapshots (P0-6). One row
-                      per task_id. assessment_json contains only deterministic
-                      scoring output computed from the already-desensitized
-                      scan_results. score and verdict are redundant columns for
-                      lightweight polling queries. Never contains raw secrets.
-- repair_results:     Persisted repair plan snapshots (P0-7). One row per
-                      task_id. repair_json contains only deterministic repair
-                      plan output computed from the already-desensitized
-                      scan_results and assessment_results. plan_status and
-                      total/blocking group counts are redundant columns for
-                      lightweight polling queries. Never contains raw secrets.
+Production schema is owned by Alembic. create_all is only for smoke/tests.
+Legacy sync `_get_connection()` remains for transitional tests and executes
+SQL through SQLAlchemy against PostgreSQL (not sqlite3).
 """
 
-import os
-import sqlite3
-import threading
-import urllib.parse
+from __future__ import annotations
+
+import asyncio
+import concurrent.futures
+import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from app.core.config import settings
-
-# Lock for DDL operations
-_init_lock = threading.Lock()
-_initialized = False
-
-# Production data root — can be overridden in tests via monkeypatch.
-_DATA_ROOT = Path("/data")
-
-_REQUIRED_TABLES = frozenset(
-    {
-        "tasks",
-        "scan_results",
-        "assessment_results",
-        "repair_results",
-        "llm_analysis_results",
-    }
+from app.db.base import Base
+from app.db import models  # noqa: F401
+from app.db.session import (
+    check_database_ready as _async_check_ready,
+    dispose_engine,
+    get_engine,
+    get_session_factory,
 )
 
+logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Production database path validation (symlink / traversal defence)
-# ---------------------------------------------------------------------------
-
-def validate_production_database_path(
-    database_url: str,
-    data_root: Path = Path("/data"),
-) -> Path:
-    """Validate the production database path against symlink and traversal attacks.
-
-    Complements the URL lexical validation in config.py with runtime
-    real-path checks.  Returns the resolved database path on success.
-
-    Raises ValueError on any validation failure.  Error messages never
-    include the full database path.
-
-    Checks performed:
-      1. URL-decode the path and reject encoded path-traversal characters.
-      2. Resolve data_root (must exist) and database path (parent must exist).
-      3. Require the resolved database path to be inside data_root.
-      4. Walk every existing path component from data_root to the database
-         file and reject if any component is a symlink — even if the
-         symlink target is inside data_root (unified rejection policy).
-    """
-    # --- Step 1: Extract and URL-decode the path ---
-    if not database_url.startswith("sqlite:///"):
-        raise ValueError("production database_url must use the sqlite scheme")
-
-    raw_path = database_url.removeprefix("sqlite:///")
-
-    # Reject encoded dangerous characters in the raw URL.
-    lower_raw = raw_path.lower()
-    for encoded in ("%2e", "%2f", "%5c", "%00"):
-        if encoded in lower_raw:
-            raise ValueError(
-                "production database path contains forbidden encoded character"
-            )
-
-    # URL-decode the path.
-    decoded_path = urllib.parse.unquote(raw_path)
-
-    # Check decoded path for dangerous content.
-    if "\x00" in decoded_path:
-        raise ValueError("production database path contains NUL character")
-    # On POSIX, backslash is not a path separator and could be used to confuse path validation.  On Windows, backslashes are valid path separators.
-    if os.name != "nt" and "\\" in decoded_path:
-        raise ValueError("production database path contains backslash")
-
-    # --- Step 2: Use real Path for resolution ---
-    database_path = Path(decoded_path)
-
-    if not database_path.is_absolute():
-        raise ValueError("production database path must be absolute")
-
-    # Normalize without resolving symlinks so the original path chain remains
-    # observable. Reject traversal before checking each component.
-    if ".." in database_path.parts:
-        raise ValueError("production database path is outside the data root")
-
-    data_root_absolute = Path(os.path.abspath(data_root))
-    database_path_absolute = Path(os.path.abspath(database_path))
-    try:
-        lexical_relative = database_path_absolute.relative_to(
-            data_root_absolute
-        )
-    except ValueError as exc:
-        raise ValueError(
-            "production database path is outside the data root"
-        ) from exc
-
-    # Check the lexical path before resolve() erases symlink components.
-    if data_root_absolute.is_symlink():
-        raise ValueError(
-            "production database path contains a symlink component"
-        )
-    current = data_root_absolute
-    for component in lexical_relative.parts:
-        current = current / component
-        if current.is_symlink():
-            raise ValueError(
-                "production database path contains a symlink component"
-            )
-
-    # Resolve data_root (must exist) and enforce containment against the real
-    # target as a second, independent check.
-    data_root_resolved = data_root_absolute.resolve(strict=True)
-    database_path_resolved = database_path_absolute.resolve(strict=False)
-    try:
-        database_path_resolved.relative_to(data_root_resolved)
-    except ValueError as exc:
-        raise ValueError(
-            "production database path is outside the data root"
-        ) from exc
-
-    return database_path_resolved
-
-
-def _verify_database_list_path(
-    conn: sqlite3.Connection,
-    data_root: Path | None = None,
-) -> None:
-    """Verify the actual opened database path via PRAGMA database_list.
-
-    After SQLite opens the database, confirm the real file path is still
-    inside data_root.  This catches runtime symlink replacement that
-    occurs after the initial path validation.
-
-    Raises ValueError if the connection's main database is outside
-    data_root.  Error messages never include the full database path.
-    """
-    if data_root is None:
-        data_root = _DATA_ROOT
-
-    data_root_resolved = data_root.resolve(strict=True)
-
-    rows = conn.execute("PRAGMA database_list").fetchall()
-    for row in rows:
-        if row["name"] == "main":
-            db_file = row["file"]
-            if not db_file:
-                # In-memory database — must not happen in production.
-                raise ValueError("production database is in-memory")
-            db_path = Path(db_file).resolve(strict=False)
-            try:
-                db_path.relative_to(data_root_resolved)
-            except ValueError:
-                raise ValueError(
-                    "production database connection opened outside the data root"
-                )
-            return
-
-    raise ValueError("production database connection has no main database")
-
-
-# ---------------------------------------------------------------------------
-# Connection management
-# ---------------------------------------------------------------------------
-
-def _get_db_path() -> str:
-    """Extract the filesystem path from the database_url setting."""
-    url = settings.database_url
-    if url.startswith("sqlite:///"):
-        return url.replace("sqlite:///", "")
-    if url.startswith("sqlite://"):
-        return url.replace("sqlite://", "")
-    return url
-
-
-def _is_production_data_path() -> bool:
-    """Return True when production mode with a /data SQLite path is active."""
-    return (
-        settings.app_env == "production"
-        and settings.database_url.startswith("sqlite:////data/")
-    )
-
-
-def _get_connection() -> sqlite3.Connection:
-    """Create a new SQLite connection with proper settings."""
-    if _is_production_data_path():
-        validated = validate_production_database_path(
-            settings.database_url,
-            _DATA_ROOT,
-        )
-        db_path = str(validated)
-    else:
-        db_path = _get_db_path()
-
-    # Ensure parent directory exists
-    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    try:
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=5000")
-
-        if _is_production_data_path():
-            _verify_database_list_path(conn, _DATA_ROOT)
-            validate_production_database_path(
-                settings.database_url,
-                _DATA_ROOT,
-            )
-    except Exception:
-        conn.close()
-        raise
-
-    return conn
-
-
-def _migrate_tasks_table(conn: sqlite3.Connection) -> None:
-    """Add production-like task columns to existing SQLite databases.
-
-    Backward compatible: uses ALTER TABLE ADD COLUMN only. Never drops or
-    recreates the table. New columns have safe defaults for historical rows.
-    """
-    columns = conn.execute("PRAGMA table_info(tasks)").fetchall()
-    existing = {col["name"] for col in columns}
-    # (column_name, ddl fragment)
-    migrations: list[tuple[str, str]] = [
-        ("attempt_count", "attempt_count INTEGER NOT NULL DEFAULT 0"),
-        ("max_attempts", "max_attempts INTEGER NOT NULL DEFAULT 3"),
-        ("worker_id", "worker_id TEXT"),
-        ("lease_expires_at", "lease_expires_at TEXT"),
-        ("last_heartbeat_at", "last_heartbeat_at TEXT"),
-        ("next_attempt_at", "next_attempt_at TEXT"),
-        ("failure_category", "failure_category TEXT"),
-        ("resolved_commit_sha", "resolved_commit_sha TEXT"),
-        ("scanner_version", "scanner_version TEXT"),
-        ("deduplication_key", "deduplication_key TEXT"),
-        ("reused_from_task_id", "reused_from_task_id TEXT"),
-        ("cancelled_at", "cancelled_at TEXT"),
-    ]
-    for name, ddl in migrations:
-        if name not in existing:
-            conn.execute(f"ALTER TABLE tasks ADD COLUMN {ddl}")
-
-
-def begin_immediate(conn: sqlite3.Connection) -> None:
-    """Start an IMMEDIATE transaction — exclusive write lock for claim/recover.
-
-    Python's sqlite3 default isolation opens deferred transactions; IMMEDIATE
-    is required so two concurrent claimers cannot both read the same pending
-    row before either writes.
-    """
-    conn.isolation_level = None
-    conn.execute("BEGIN IMMEDIATE")
-
-
-def commit_txn(conn: sqlite3.Connection) -> None:
-    conn.execute("COMMIT")
-    conn.isolation_level = "DEFERRED"
-
-
-def rollback_txn(conn: sqlite3.Connection) -> None:
-    try:
-        conn.execute("ROLLBACK")
-    except sqlite3.Error:
-        pass
-    conn.isolation_level = "DEFERRED"
-
-
-def init_db() -> None:
-    """Initialize the database — create tables if they don't exist.
-
-    Safe to call multiple times.
-    """
-    global _initialized
-    with _init_lock:
-        if _initialized:
-            return
-        conn = _get_connection()
-        try:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS tasks (
-                    id TEXT PRIMARY KEY,
-                    repo_url TEXT NOT NULL,
-                    owner TEXT NOT NULL,
-                    repo_name TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending',
-                    stage TEXT NOT NULL DEFAULT 'queued',
-                    progress INTEGER NOT NULL DEFAULT 0,
-                    error_code TEXT,
-                    error_message TEXT,
-                    file_count INTEGER,
-                    total_size INTEGER,
-                    top_level_dir TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    completed_at TEXT,
-                    attempt_count INTEGER NOT NULL DEFAULT 0,
-                    max_attempts INTEGER NOT NULL DEFAULT 3,
-                    worker_id TEXT,
-                    lease_expires_at TEXT,
-                    last_heartbeat_at TEXT,
-                    next_attempt_at TEXT,
-                    failure_category TEXT,
-                    resolved_commit_sha TEXT,
-                    scanner_version TEXT,
-                    deduplication_key TEXT,
-                    reused_from_task_id TEXT,
-                    cancelled_at TEXT
-                )
-            """)
-            _migrate_tasks_table(conn)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at)
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_tasks_status_next_attempt
-                ON tasks(status, next_attempt_at)
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_tasks_lease_expires
-                ON tasks(lease_expires_at)
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_tasks_dedup_key
-                ON tasks(deduplication_key)
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_tasks_dedup_status
-                ON tasks(deduplication_key, status)
-            """)
-            # --- scan_results: one persisted snapshot per task (P0-5) ---
-            # result_json contains ONLY desensitized public models from P0-4.
-            # Never stores raw secrets, absolute paths, or internal objects.
-            # summary_json (P0-5 review): lightweight summary extracted from
-            # result_json, stored separately so status polling never needs to
-            # load or parse the full (up to 8 MB) result_json.
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS scan_results (
-                    task_id TEXT PRIMARY KEY,
-                    schema_version INTEGER NOT NULL,
-                    result_json TEXT NOT NULL,
-                    summary_json TEXT NOT NULL,
-                    total_findings INTEGER NOT NULL,
-                    blocking_findings INTEGER NOT NULL,
-                    total_notices INTEGER NOT NULL,
-                    total_skipped_files INTEGER NOT NULL,
-                    total_scan_errors INTEGER NOT NULL,
-                    total_files_scanned INTEGER NOT NULL,
-                    total_lines_scanned INTEGER NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    FOREIGN KEY (task_id) REFERENCES tasks(id)
-                )
-            """)
-            # --- Migration: add summary_json column if missing ---
-            # Old databases created before this change don't have
-            # summary_json. We add it as nullable so old records keep
-            # working — get_scan_summary falls back to result_json for
-            # records with NULL summary_json. New records always set it.
-            columns = conn.execute(
-                "PRAGMA table_info(scan_results)"
-            ).fetchall()
-            column_names = [col["name"] for col in columns]
-            if "summary_json" not in column_names:
-                conn.execute(
-                    "ALTER TABLE scan_results ADD COLUMN summary_json TEXT"
-                )
-            # --- assessment_results: one persisted assessment per task (P0-6) ---
-            # assessment_json contains ONLY deterministic scoring output computed
-            # from the already-desensitized scan_results. No raw secrets, no
-            # temp paths, no internal exception objects.
-            # score and verdict are redundant columns so polling queries can
-            # read two lightweight values instead of parsing assessment_json.
-            # source_scan_updated_at tracks which scan_results version this
-            # assessment was computed from.
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS assessment_results (
-                    task_id TEXT PRIMARY KEY,
-                    schema_version INTEGER NOT NULL,
-                    policy_version TEXT NOT NULL,
-                    assessment_scope TEXT NOT NULL,
-                    assessment_json TEXT NOT NULL,
-                    score INTEGER NOT NULL,
-                    verdict TEXT NOT NULL,
-                    source_scan_updated_at TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    FOREIGN KEY (task_id) REFERENCES tasks(id)
-                )
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_assessment_verdict
-                ON assessment_results(verdict)
-            """)
-            # --- repair_results: one persisted repair plan per task (P0-7) ---
-            # repair_json contains ONLY deterministic repair plan output
-            # computed from the already-desensitized scan_results and
-            # assessment_results. No raw secrets, no temp paths, no
-            # internal exception objects, no repo_url.
-            # plan_status and total/blocking group counts are redundant
-            # columns so polling queries can read lightweight values
-            # instead of parsing repair_json.
-            # source_scan_updated_at and source_assessment_updated_at
-            # track which scan_results and assessment_results versions
-            # this repair plan was computed from.
-            # No repair_status index is created — it has no actual query
-            # use at this stage.
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS repair_results (
-                    task_id TEXT PRIMARY KEY,
-                    schema_version INTEGER NOT NULL,
-                    policy_version TEXT NOT NULL,
-                    repair_scope TEXT NOT NULL,
-                    repair_json TEXT NOT NULL,
-                    plan_status TEXT NOT NULL,
-                    total_repair_groups INTEGER NOT NULL,
-                    blocking_repair_groups INTEGER NOT NULL,
-                    source_scan_updated_at TEXT NOT NULL,
-                    source_assessment_updated_at TEXT NOT NULL,
-                    source_assessment_policy_version TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    FOREIGN KEY (task_id) REFERENCES tasks(id)
-                )
-            """)
-            # --- llm_analysis_results: one persisted LLM analysis per task (P1-4) ---
-            # analysis_json contains ONLY desensitized explanations and
-            # repair instructions for non-blocking findings. Never stores
-            # raw secrets, original code snippets, or absolute paths.
-            # source = "llm" when LLM produced the analysis, "fallback"
-            # when LLM was unavailable or failed and templates were used.
-            # total_analyzed and total_fallback are redundant columns for
-            # lightweight polling queries.
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS llm_analysis_results (
-                    task_id TEXT PRIMARY KEY,
-                    schema_version INTEGER NOT NULL,
-                    analysis_json TEXT NOT NULL,
-                    total_analyzed INTEGER NOT NULL,
-                    total_fallback INTEGER NOT NULL,
-                    source TEXT NOT NULL,
-                    source_scan_updated_at TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    FOREIGN KEY (task_id) REFERENCES tasks(id)
-                )
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_llm_analysis_source
-                ON llm_analysis_results(source)
-            """)
-            conn.commit()
-            _initialized = True
-        finally:
-            conn.close()
-
-
-def check_database_ready() -> None:
-    """Raise when the database is unavailable or not initialized."""
-    conn = _get_connection()
-    try:
-        rows = conn.execute(
-            """
-            SELECT name
-            FROM sqlite_master
-            WHERE type = 'table'
-              AND name IN (
-                  'tasks',
-                  'scan_results',
-                  'assessment_results',
-                  'repair_results',
-                  'llm_analysis_results'
-              )
-            """
-        ).fetchall()
-        present_tables = {row["name"] for row in rows}
-        if present_tables != _REQUIRED_TABLES:
-            raise RuntimeError("database schema is not initialized")
-    finally:
-        conn.close()
-
-
-def reset_db() -> None:
-    """Drop and recreate all tables — for testing only."""
-    global _initialized
-    with _init_lock:
-        conn = _get_connection()
-        try:
-            # Drop llm_analysis_results, repair_results, assessment_results,
-            # and scan_results first (FK references tasks)
-            conn.execute("DROP TABLE IF EXISTS llm_analysis_results")
-            conn.execute("DROP TABLE IF EXISTS repair_results")
-            conn.execute("DROP TABLE IF EXISTS assessment_results")
-            conn.execute("DROP TABLE IF EXISTS scan_results")
-            conn.execute("DROP TABLE IF EXISTS tasks")
-            conn.commit()
-        finally:
-            conn.close()
-        _initialized = False
-    # Call init_db() OUTSIDE the lock to avoid deadlock
-    # (init_db() also acquires _init_lock — threading.Lock is not reentrant)
-    init_db()
+_initialized = False
+_DATA_ROOT = Path("/data")
 
 
 def now_iso() -> str:
-    """Return current UTC time in ISO 8601 format."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _run(coro):
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
+async def _create_all_async() -> None:
+    engine = get_engine()
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+
+def init_db() -> None:
+    global _initialized
+    if _initialized:
+        return
+    _run(_create_all_async())
+    _initialized = True
+
+
+def reset_initialized() -> None:
+    global _initialized
+    _initialized = False
+
+
+async def reset_engine_async() -> None:
+    global _initialized
+    await dispose_engine()
+    _initialized = False
+
+
+def reset_engine() -> None:
+    _run(reset_engine_async())
+
+
+def check_database_ready() -> None:
+    _run(_async_check_ready())
+
+
+class _LegacyRow(dict):
+    def __getitem__(self, key):  # type: ignore[override]
+        if isinstance(key, int):
+            return list(self.values())[key]
+        return super().__getitem__(key)
+
+
+class _LegacyResult:
+    def __init__(self, rows: list[dict], rowcount: int = 0):
+        self._rows = rows
+        self.rowcount = rowcount
+
+    def fetchone(self):
+        return _LegacyRow(self._rows[0]) if self._rows else None
+
+    def fetchall(self):
+        return [_LegacyRow(r) for r in self._rows]
+
+
+
+_TS_COLS = {
+    "created_at",
+    "updated_at",
+    "completed_at",
+    "lease_expires_at",
+    "last_heartbeat_at",
+    "next_attempt_at",
+    "cancelled_at",
+}
+
+
+def _insert_columns(sql: str) -> list[str]:
+    m = re.search(r"INSERT\s+INTO\s+\w+\s*\(([^)]+)\)", sql, re.I | re.S)
+    if not m:
+        return []
+    raw = m.group(1).replace("\n", " ").replace("\r", " ")
+    return [c.strip().strip('`"') for c in raw.split(",") if c.strip()]
+
+
+def _insert_qmark_columns(sql: str) -> list[str]:
+    """Column names corresponding 1:1 to ``?`` placeholders in VALUES.
+
+    INSERT statements may skip columns with literal NULL; positional ``?``
+    params must not be mapped onto the raw column list by index.
+    """
+    cols = _insert_columns(sql)
+    m = re.search(r"VALUES\s*\(([^)]+)\)", sql, re.I | re.S)
+    if not m:
+        return cols
+    vals = [v.strip() for v in m.group(1).replace("\n", " ").split(",")]
+    out: list[str] = []
+    for i, v in enumerate(vals):
+        if v == "?" and i < len(cols):
+            out.append(cols[i])
+    return out
+
+
+def _update_timestamp_columns(sql: str) -> set[str]:
+    """Column names that appear in SET ... as timestamp targets."""
+    found = set()
+    for col in _TS_COLS:
+        if re.search(rf"\b{col}\s*=", sql, re.I):
+            found.add(col)
+    return found
+
+
+def _maybe_datetime(value: Any) -> Any:
+    """Coerce ISO timestamp strings for PostgreSQL TIMESTAMPTZ columns."""
+    if not isinstance(value, str):
+        return value
+    s = value.strip()
+    if len(s) < 19 or ("T" not in s and " " not in s):
+        return value
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return value
+
+
+
+def _rewrite_sqlite_upsert(sql: str) -> str:
+    """Convert SQLite INSERT OR REPLACE into PostgreSQL upsert."""
+    m = re.search(
+        r"INSERT\s+OR\s+REPLACE\s+INTO\s+(\w+)\s*\(([^)]+)\)",
+        sql,
+        re.I | re.S,
+    )
+    if not m:
+        return sql
+    table = m.group(1)
+    cols = [c.strip().strip('`"') for c in m.group(2).replace("\n", " ").split(",")]
+    if not cols:
+        return sql
+    pk = cols[0]
+    rest = cols[1:]
+    sql2 = re.sub(
+        r"INSERT\s+OR\s+REPLACE\s+INTO",
+        "INSERT INTO",
+        sql,
+        count=1,
+        flags=re.I,
+    )
+    if not rest:
+        return sql2
+    idx = sql2.rfind(")")
+    if idx < 0:
+        return sql2
+    updates = ", ".join(f"{c}=EXCLUDED.{c}" for c in rest)
+    return sql2[: idx + 1] + f" ON CONFLICT ({pk}) DO UPDATE SET {updates}" + sql2[idx + 1 :]
+
+
+def _convert_sql(sql: str, params: Any) -> tuple[str, dict]:
+    sql = _rewrite_sqlite_upsert(sql)
+    """Convert sqlite-style qmark params to SQLAlchemy named params.
+
+    Only known TIMESTAMP columns receive datetime coercion so TEXT columns
+    (source_*_updated_at, repair_json, etc.) keep ISO strings.
+    """
+    if params is None:
+        return sql, {}
+    if isinstance(params, dict):
+        out = dict(params)
+        ts_names = _update_timestamp_columns(sql)
+        for k, v in list(out.items()):
+            if k in _TS_COLS or k in ts_names:
+                out[k] = _maybe_datetime(v)
+        return sql, out
+    seq = list(params)
+    named: dict[str, Any] = {}
+    if re.search(r"INSERT\s+INTO", sql, re.I):
+        cols = _insert_qmark_columns(sql)
+    else:
+        # UPDATE ... SET col = ?, col2 = ? — map ? to assignment targets in order
+        cols = re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\?", sql)
+    ts_names = _update_timestamp_columns(sql)
+    parts = []
+    i = 0
+    for ch in sql:
+        if ch == "?":
+            key = f"p{i}"
+            val = seq[i] if i < len(seq) else None
+            col = cols[i] if i < len(cols) else ""
+            if col in _TS_COLS or col in ts_names:
+                val = _maybe_datetime(val)
+            named[key] = val
+            parts.append(f":{key}")
+            i += 1
+        else:
+            parts.append(ch)
+    return "".join(parts), named
+
+
+
+class _LegacyConnection:
+    """Sync facade executing SQL via SQLAlchemy async engine + asyncio.run."""
+
+    def __init__(self) -> None:
+        self.rowcount = 0
+
+    def execute(self, sql: str, params: Any = None) -> _LegacyResult:
+        from sqlalchemy import text
+
+        new_sql, named = _convert_sql(sql, params)
+
+        async def _exec():
+            engine = get_engine()
+            async with engine.begin() as conn:
+                result = await conn.execute(text(new_sql), named)
+                rows: list[dict] = []
+                try:
+                    mappings = result.mappings()
+                    rows = [dict(m) for m in mappings.all()]
+                except Exception:
+                    try:
+                        rows = [dict(r._mapping) for r in result.all()]
+                    except Exception:
+                        rows = []
+                return rows, result.rowcount or 0
+
+        rows, rc = _run(_exec())
+        self.rowcount = rc
+        return _LegacyResult(rows, rc)
+
+    def commit(self) -> None:
+        return None
+
+    def rollback(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+def _get_connection():
+    return _LegacyConnection()
+
+
+def reset_db() -> None:
+    async def _reset() -> None:
+        engine = get_engine()
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+            await conn.run_sync(Base.metadata.create_all)
+
+    global _initialized
+    reset_engine()
+    _run(_reset())
+    _initialized = True
+
+
+def validate_production_database_path(database_url: str, data_root: Path | None = None) -> Path:
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(database_url.replace("+asyncpg", ""))
+    if parsed.scheme not in {"postgresql", "postgres"}:
+        raise ValueError("production database_url must use the postgresql scheme")
+    return Path("/data")
+
+
+def _verify_database_list_path(conn, data_root=None) -> None:
+    return None
+
+
+def _is_production_data_path() -> bool:
+    return settings.app_env == "production" and settings.database_url.startswith(
+        ("postgresql", "postgres")
+    )
+
+
+def _get_db_path() -> str:
+    return settings.database_url
+
+
+def _get_session_factory():
+    return get_session_factory()
+
+
+__all__ = [
+    "init_db",
+    "reset_db",
+    "check_database_ready",
+    "now_iso",
+    "reset_engine",
+    "reset_initialized",
+    "_get_connection",
+    "_get_session_factory",
+    "validate_production_database_path",
+]

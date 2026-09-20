@@ -26,45 +26,42 @@
 | --- | --- |
 | 前端 | Next.js (App Router) + React + TypeScript |
 | 前端测试 | Playwright (e2e) + Node 内置测试运行器 (单元) |
-| 后端 | FastAPI + Pydantic（SQLite 直连，无 ORM） |
-| 后端测试 | pytest |
-| 存储 | SQLite（WAL + busy_timeout） |
-| 任务执行 | **single-instance bounded concurrency**（默认 `MAX_RUNNING_TASKS=2`） |
-| 运行 | Docker Compose（开发 / 生产双模式） |
+| 后端 | FastAPI + Pydantic + **SQLAlchemy 2 async** |
+| 数据库 | **PostgreSQL 16**（`asyncpg`） |
+| Schema 迁移 | **Alembic**（生产 schema 唯一权威） |
+| 后端测试 | pytest（PostgreSQL service container） |
+| 任务执行 | **PostgreSQL-backed durable bounded task execution** |
+| Claim | `SELECT ... FOR UPDATE SKIP LOCKED` + lease/heartbeat |
+| 运行 | Docker Compose（frontend + backend + postgres） |
 
 ## 任务执行能力（诚实声明）
 
-本项目的工程主线是 **安全输入处理 + 可靠后台任务**，不是 LangGraph / RAG /
-Text-to-SQL / Kafka / Kubernetes。
+工程主线仍是 **安全仓库扫描 + 可靠后台任务**，不是 LangGraph/RAG/Celery 集群。
 
-当前实现（可由代码与测试证明）：
+- **multi-worker-safe database task claiming**（PostgreSQL `SKIP LOCKED` + lease fencing）
+- 有界并发、原子领取、lease/心跳/恢复、有界重试、去重、取消、Prometheus
+- **不使用 Celery/Redis/Kafka**：V1 不需要 broker；`SKIP LOCKED` + lease 足够演示可靠任务
+- Schema 变更走 **Alembic**，不在生产 `create_all` 偷偷建表
+- BYOK LLM Key 仍只在进程内存，**不进 PostgreSQL**
+- SQLite **不是**正式运行库（最多用于极少数隔离单测）
 
-- **有界并发**：默认最多 2 个任务同时运行；Dispatcher 持续补满空闲槽位。
-- **原子领取**：`claim_next_pending()` 使用 SQLite `BEGIN IMMEDIATE`，同一任务不会被领取两次。
-- **Lease 与心跳**：运行任务定期续约；崩溃后 `recover_expired_tasks()` 按 lease 恢复，而不是把队列全部标失败。
-- **有界重试**：瞬时错误（GitHub 429、超时等）指数退避重试；非法仓库/恶意压缩包等永久错误不重试。
-- **去重**：`normalized_repo_url + resolved_commit_sha + scanner_version` 已完成结果可安全复用；同一仓库运行中提交会合并。
-- **取消**：`POST /api/check/{task_id}/cancel` 幂等；清理临时目录与内存 LLM 凭据。
-- **BYOK**：用户 LLM Key 仅存进程内存，不落库、不写日志、不进指标 label。
-- **可观测性**：`/metrics`（Prometheus 文本）与 `/api/ready`（数据库就绪；LLM 降级单独展示）。
+### 数据库与任务配置
 
-**边界：**
+| 环境变量 | 默认/说明 |
+| --- | --- |
+| `DATABASE_URL` | `postgresql+asyncpg://user:pass@host:5432/db` |
+| `MAX_PENDING_TASKS` | 5，满则 `429 QUEUE_FULL` |
+| `MAX_RUNNING_TASKS` | 2，有界并发 |
+| `TASK_LEASE_SECONDS` / `TASK_HEARTBEAT_SECONDS` | lease / 心跳 |
+| `MAX_TASK_ATTEMPTS` | 3 |
+| `LEASE_REAPER_SECONDS` | 30，运行期 lease 回收 |
 
-- 这是 **single-instance bounded concurrency**，使用 **SQLite WAL**，**不是**大规模分布式队列。
-- 压测与故障注入使用 **本地合成仓库 / mock**，不是 GitHub 公共接口高频压测，也 **没有**真实线上业务流量（除非后续另有部署记录）。
-- 详见 `docs/TASK_EXECUTION.md`、`docs/RESILIENCE.md`、`docs/LOAD_TEST_REPORT.md`、`docs/PUBLIC_DEPLOYMENT.md`。
+开发 compose 会启动 PostgreSQL healthcheck；backend `depends_on: service_healthy`。
+迁移：`cd backend && alembic upgrade head`。
 
-### 任务执行相关配置
+**兼容层说明**：`database._get_connection()` 等仅为测试/过渡兼容 facade，生产主路径是 Route → Service → Repository → SQLAlchemy AsyncSession → PostgreSQL。
 
-| 环境变量 | 默认 | 说明 |
-| --- | --- | --- |
-| `MAX_PENDING_TASKS` | 5 | 队列容量，满则 `429 QUEUE_FULL` |
-| `MAX_RUNNING_TASKS` | 2 | 有界并发 |
-| `TASK_LEASE_SECONDS` | 120 | 任务 lease |
-| `TASK_HEARTBEAT_SECONDS` | 20 | 心跳间隔 |
-| `MAX_TASK_ATTEMPTS` | 3 | 最大尝试次数 |
-| `RETRY_BASE_SECONDS` / `RETRY_MAX_SECONDS` | 2 / 60 | 退避 |
-| `LEASE_REAPER_SECONDS` | 30 | 运行期 lease 回收间隔（≤ lease） |
+**Windows 本地 Docker 限制**：在部分 Windows + Docker Desktop 环境，`uvicorn`/asyncpg 可能出现 event loop/proactor 启动问题；此时可用 compose 启动 PostgreSQL，再在主机进程内运行 backend 完成业务验证。CI 与 Linux 容器环境不受此限制。
 
 ## 快速开始
 
@@ -237,7 +234,7 @@ vibecheck/
 │   │   │   ├── safe_extract.py  # 安全解压（防穿越/拒链接/限大小）
 │   │   │   ├── zip_extract.py   # 安全 ZIP 解压
 │   │   │   └── security/        # 脱敏（统一赋值解析与掩码）
-│   │   ├── db/                  # SQLite（WAL / busy_timeout）
+│   │   ├── db/                  # SQLAlchemy 2 async + Alembic + repositories
 │   │   ├── scanner/             # 扫描规则（基础/部署/文档/敏感信息等）
 │   │   ├── services/            # 任务流水线（下载/解压/扫描/评估/修复/LLM）
 │   │   └── ...

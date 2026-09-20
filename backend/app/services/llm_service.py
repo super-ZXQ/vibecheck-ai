@@ -71,21 +71,11 @@ class LLMAnalysisTooLargeError(Exception):
 # ---------------------------------------------------------------------------
 
 def get_llm_analysis_available(task_id: str) -> bool:
-    """Lightweight check for status polling — returns True if an LLM
-    analysis result exists for the task.
+    """Lightweight check for status polling — True if analysis exists."""
+    from app.services.result_repository import get_llm_analysis_available_sync
 
-    Reads ONLY the task_id column — does NOT parse analysis_json.
-    """
     init_db()
-    conn = _get_connection()
-    try:
-        row = conn.execute(
-            "SELECT 1 FROM llm_analysis_results WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()
-        return row is not None
-    finally:
-        conn.close()
+    return get_llm_analysis_available_sync(task_id)
 
 
 # ---------------------------------------------------------------------------
@@ -505,35 +495,25 @@ def _save_llm_analysis(
             "LLM analysis result exceeds size limit"
         )
 
-    now = now_iso()
-    conn = _get_connection()
+    from app.services.result_repository import save_llm_analysis_sync
+
     try:
-        conn.execute(
-            """INSERT OR REPLACE INTO llm_analysis_results
-               (task_id, schema_version, analysis_json,
-                total_analyzed, total_fallback, source,
-                source_scan_updated_at, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                task_id,
-                SCHEMA_VERSION,
-                analysis_json,
-                len(analysis_items),
-                total_fallback,
-                source,
-                scan_updated_at,
-                now,
-                now,
-            ),
+        save_llm_analysis_sync(
+            task_id,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "analysis_json": output,
+                "total_analyzed": len(analysis_items),
+                "total_fallback": total_fallback,
+                "source": source,
+                "source_scan_updated_at": scan_updated_at,
+            },
         )
-        conn.commit()
     except Exception as e:
         logger.error(
             "LLM analysis persistence failed: %s", type(e).__name__
         )
         raise LLMAnalysisPersistError("Failed to persist LLM analysis")
-    finally:
-        conn.close()
 
     return output
 
@@ -672,72 +652,20 @@ def _generate_fallback_only(
 # ---------------------------------------------------------------------------
 
 def get_llm_analysis(task_id: str) -> dict | None:
-    """Retrieve the persisted LLM analysis result for a task.
+    """Retrieve the persisted LLM analysis result for a task."""
+    from app.services.result_repository import get_llm_analysis_sync
 
-    Returns None if no result has been persisted.
-
-    The returned dict has the structure:
-    {
-        "schema_version": int,
-        "scope": str,
-        "task_id": str,
-        "total_analyzed": int,
-        "total_llm": int,
-        "total_fallback": int,
-        "source": str,  # "llm", "fallback", or "mixed"
-        "items": [
-            {
-                "rule_id": str,
-                "rule_name": str,
-                "file_path": str,
-                "severity": str,
-                "explanation": str,
-                "instruction": str,
-                "source": str,  # "llm" or "fallback"
-            },
-            ...
-        ]
-    }
-    """
     init_db()
-    conn = _get_connection()
-    try:
-        row = conn.execute(
-            "SELECT analysis_json FROM llm_analysis_results WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return json.loads(row["analysis_json"])
-    except Exception:
-        # Malformed JSON or DB failure — treat as "not available".
-        logger.error(
-            "Failed to read LLM analysis for task %s", task_id
-        )
-        return None
-    finally:
-        conn.close()
+    return get_llm_analysis_sync(task_id)
 
 
 def get_llm_analysis_summary(task_id: str) -> dict | None:
-    """Lightweight summary for status polling — reads only redundant columns.
-
-    Returns None if no result has been persisted.
-    """
-    init_db()
-    conn = _get_connection()
-    try:
-        row = conn.execute(
-            """SELECT total_analyzed, total_fallback, source
-               FROM llm_analysis_results WHERE task_id = ?""",
-            (task_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return {
-            "total_analyzed": row["total_analyzed"],
-            "total_fallback": row["total_fallback"],
-            "source": row["source"],
-        }
-    finally:
-        conn.close()
+    """Lightweight summary for status polling."""
+    data = get_llm_analysis(task_id)
+    if data is None:
+        return None
+    return {
+        "total_analyzed": data.get("total_analyzed", 0),
+        "total_fallback": data.get("total_fallback", 0),
+        "source": data.get("source", "fallback"),
+    }

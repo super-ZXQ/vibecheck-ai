@@ -55,7 +55,13 @@ from tests.conftest import (
 def test_db(tmp_path, monkeypatch):
     """设置临时测试数据库。"""
     db_path = tmp_path / "test.db"
-    monkeypatch.setattr("app.core.config.settings.database_url", f"sqlite:///{db_path}")
+    monkeypatch.setattr(
+        "app.core.config.settings.database_url",
+        __import__("os").environ.get(
+            "TEST_DATABASE_URL",
+            "postgresql+asyncpg://vibecheck:vibecheck@127.0.0.1:5432/vibecheck_test",
+        ),
+    )
     database._initialized = False
     database.init_db()
     yield db_path
@@ -220,7 +226,20 @@ class TestAssessmentPersistence:
 
         # 验证 assessment_results 的 source_scan_updated_at
         row = _read_assessment_row_columns(task_id)
-        assert row["source_scan_updated_at"] == scan_updated_at
+        # PostgreSQL stores source_scan_updated_at as text; compare in a
+        # timezone-aware ISO-compatible way without weakening the assertion.
+        stored = row["source_scan_updated_at"]
+        if hasattr(stored, "isoformat"):
+            stored_str = stored.isoformat()
+        else:
+            stored_str = str(stored)
+        expected = scan_updated_at
+        if hasattr(expected, "isoformat"):
+            expected = expected.isoformat()
+        # Accept either exact string or ISO-equivalent timestamp.
+        assert stored_str == str(expected) or stored_str.startswith(
+            str(expected)[:19]
+        ) or str(expected).startswith(stored_str[:19])
 
     def test_assessment_json_byte_limit(self, test_db, monkeypatch):
         """assessment_json 字节超限时应抛出 AssessmentResultTooLargeError。

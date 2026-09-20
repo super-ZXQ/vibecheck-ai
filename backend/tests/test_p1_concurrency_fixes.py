@@ -30,7 +30,14 @@ from app.services.task_manager import (
 @pytest.fixture
 def test_db(tmp_path, monkeypatch):
     db_path = tmp_path / "p1.db"
-    monkeypatch.setattr(settings, "database_url", f"sqlite:///{db_path}")
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        __import__("os").environ.get(
+            "TEST_DATABASE_URL",
+            "postgresql+asyncpg://vibecheck:vibecheck@127.0.0.1:5432/vibecheck_test",
+        ),
+    )
     monkeypatch.setattr(settings, "tmp_dir", str(tmp_path / "tmp"))
     (tmp_path / "tmp").mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(settings, "max_task_attempts", 3)

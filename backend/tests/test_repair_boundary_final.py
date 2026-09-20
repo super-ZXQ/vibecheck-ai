@@ -49,7 +49,11 @@ from app.services.task_manager import create_task, mark_completed
 def test_db(tmp_path, monkeypatch):
     db_path = tmp_path / "test.db"
     monkeypatch.setattr(
-        "app.core.config.settings.database_url", f"sqlite:///{db_path}"
+        "app.core.config.settings.database_url",
+        __import__("os").environ.get(
+            "TEST_DATABASE_URL",
+            "postgresql+asyncpg://vibecheck:vibecheck@127.0.0.1:5432/vibecheck_test",
+        ),
     )
     monkeypatch.setattr(
         "app.core.config.settings.tmp_dir", str(tmp_path / "tmp")

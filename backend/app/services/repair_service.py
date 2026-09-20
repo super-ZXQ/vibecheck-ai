@@ -431,71 +431,43 @@ def _safe_masked_desc(value: Any) -> str:
 # ---------------------------------------------------------------------------
 
 def _read_scan_result(task_id: str) -> tuple[dict, dict, str]:
-    """Read persisted scan result, summary, and updated_at from SQLite.
+    """Read persisted scan result, summary, and scan_results.updated_at."""
+    from app.services.result_repository import get_scan_result_sync
 
-    Returns:
-        (scan_result_dict, summary_dict, scan_updated_at)
-
-    Raises:
-        RepairPlanInternalError: If the scan result is missing, cannot
-            be parsed, or has an invalid structure.
-    """
-    conn = None
-    _db_error = False
     try:
         init_db()
+        data = get_scan_result_sync(task_id)
+        if data is None:
+            raise RepairPlanInternalError("No scan result found for task")
+        scan_result = data if isinstance(data, dict) else json.loads(data)
+        if not isinstance(scan_result, dict):
+            raise RepairPlanInternalError("Scan result is not a dict")
+        summary = scan_result.get("summary") or {}
+        if isinstance(summary, str):
+            summary = json.loads(summary)
+        if not isinstance(summary, dict):
+            raise RepairPlanInternalError("Scan summary is not a dict")
+        scan_updated_at = now_iso()
         conn = _get_connection()
-        row = conn.execute(
-            "SELECT result_json, summary_json, updated_at "
-            "FROM scan_results WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()
-        if row is None:
-            raise RepairPlanInternalError(
-                "No scan result found for task"
-            )
-        result_json = row["result_json"]
-        summary_json = row["summary_json"]
-        scan_updated_at = row["updated_at"]
+        try:
+            row = conn.execute(
+                "SELECT updated_at FROM scan_results WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is not None and row["updated_at"] is not None:
+                v = row["updated_at"]
+                scan_updated_at = _iso_ts(v) if not isinstance(v, str) else v
+        finally:
+            conn.close()
+        return (
+            normalize_scan_result_dimensions(scan_result),
+            normalize_scan_summary_dimensions(summary),
+            scan_updated_at,
+        )
     except RepairPlanInternalError:
-        _db_error = True
         raise
     except Exception:
-        _db_error = True
-        raise RepairPlanInternalError(
-            "Failed to read scan result from database"
-        )
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                if not _db_error:
-                    raise RepairPlanInternalError(
-                        "Failed to close database connection"
-                    )
-
-    # Parse JSON
-    try:
-        scan_result = json.loads(result_json)
-    except (json.JSONDecodeError, TypeError):
-        raise RepairPlanInternalError("Failed to parse scan result JSON")
-
-    try:
-        summary = json.loads(summary_json) if summary_json else {}
-    except (json.JSONDecodeError, TypeError):
-        raise RepairPlanInternalError("Failed to parse scan summary JSON")
-
-    if not isinstance(scan_result, dict):
-        raise RepairPlanInternalError("Scan result is not a dict")
-    if not isinstance(summary, dict):
-        raise RepairPlanInternalError("Scan summary is not a dict")
-
-    return (
-        normalize_scan_result_dimensions(scan_result),
-        normalize_scan_summary_dimensions(summary),
-        scan_updated_at,
-    )
+        raise RepairPlanInternalError("Failed to read scan result from database")
 
 
 def _read_assessment(task_id: str) -> tuple[dict, str, str, str]:
@@ -526,9 +498,9 @@ def _read_assessment(task_id: str) -> tuple[dict, str, str, str]:
                 "No assessment found for task"
             )
         assessment_json = row["assessment_json"]
-        assessment_updated_at = row["updated_at"]
+        assessment_updated_at = _iso_ts(row["updated_at"])
         assessment_policy_version = row["policy_version"]
-        source_scan_updated_at = row["source_scan_updated_at"]
+        source_scan_updated_at = _iso_ts(row["source_scan_updated_at"])
     except RepairPlanInternalError:
         _db_error = True
         raise
@@ -593,7 +565,7 @@ def _validate_consistency(
         raise RepairPlanInternalError("Assessment task_id mismatch")
 
     # Check 2: source_scan_updated_at (table column) matches scan updated_at
-    if source_scan_updated_at != scan_updated_at:
+    if _iso_ts(source_scan_updated_at) != _iso_ts(scan_updated_at):
         raise RepairPlanInternalError(
             "Assessment source_scan_updated_at does not match scan updated_at"
         )
@@ -1777,8 +1749,9 @@ def _validate_repair_snapshot_identity(
     def _validate_non_empty_str(
         value: Any, field_name: str
     ) -> None:
-        """Strict validation: must be exactly str (not bool/int/etc)
-        and non-empty. No implicit conversion."""
+        """Non-empty string; datetime accepted and treated as ISO timestamp."""
+        if hasattr(value, "isoformat"):
+            return
         if type(value) is not str:
             _fail(f"{field_name} is not a str")
         if not value:
@@ -1978,6 +1951,19 @@ def _serialize_summary(
     }
 
 
+def _iso_ts(value):
+    """Normalize DB/JSON timestamps to comparable ISO-8601 UTC strings."""
+    if value is None:
+        return ""
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            return str(value)
+    s = str(value).strip().replace("Z", "+00:00")
+    return s
+
+
 def serialize_repair_plan(
     task_id: str,
     repair_plan: dict,
@@ -2145,6 +2131,10 @@ def save_repair_result(
         RepairPlanInternalError: If serialization fails.
     """
     now = now_iso()
+    if hasattr(source_scan_updated_at, "isoformat"):
+        source_scan_updated_at = source_scan_updated_at.isoformat()
+    if hasattr(source_assessment_updated_at, "isoformat"):
+        source_assessment_updated_at = source_assessment_updated_at.isoformat()
     conn = None
     safe_plan = None
     repair_json = None
@@ -2162,6 +2152,8 @@ def save_repair_result(
 
         if existing is not None:
             created_at = existing["created_at"]
+            if hasattr(created_at, "isoformat"):
+                created_at = created_at.isoformat()
         else:
             created_at = now
 
@@ -2187,73 +2179,77 @@ def save_repair_result(
                 "repair_json exceeds repair_max_json_bytes"
             )
 
-        # Execute upsert and commit
-        # Use safe_plan's final validated+masked fields for DB columns
-        # to ensure JSON and DB column consistency.
-        conn.execute(
-            """INSERT INTO repair_results
-               (task_id, schema_version, policy_version, repair_scope,
-                repair_json, plan_status, total_repair_groups,
-                blocking_repair_groups, source_scan_updated_at,
-                source_assessment_updated_at,
-                source_assessment_policy_version,
-                created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(task_id) DO UPDATE SET
-                   schema_version=excluded.schema_version,
-                   policy_version=excluded.policy_version,
-                   repair_scope=excluded.repair_scope,
-                   repair_json=excluded.repair_json,
-                   plan_status=excluded.plan_status,
-                   total_repair_groups=excluded.total_repair_groups,
-                   blocking_repair_groups=excluded.blocking_repair_groups,
-                   source_scan_updated_at=excluded.source_scan_updated_at,
-                   source_assessment_updated_at=excluded.source_assessment_updated_at,
-                   source_assessment_policy_version=excluded.source_assessment_policy_version,
-                   updated_at=excluded.updated_at""",
-            (
-                safe_plan["task_id"],
-                safe_plan["schema_version"],
-                safe_plan["policy_version"],
-                safe_plan["repair_scope"],
-                repair_json,
-                safe_plan["plan_status"],
-                safe_plan["summary"]["total_repair_groups"],
-                safe_plan["summary"]["blocking_repair_groups"],
-                safe_plan["source_scan_updated_at"],
-                safe_plan["source_assessment_updated_at"],
-                safe_plan["source_assessment_policy_version"],
-                safe_plan["created_at"],
-                safe_plan["updated_at"],
-            ),
+        from app.services.result_repository import save_repair_plan_sync
+        from app.db.repositories.results import get_repair_plan as _get_plan_async
+        from app.services import result_repository as _rr
+
+        _groups_total = (
+            safe_plan.get("total_repair_groups")
+            or (safe_plan.get("summary") or {}).get("total_repair_groups", 0)
         )
-        conn.commit()
+        _groups_blocking = (
+            safe_plan.get("blocking_repair_groups")
+            or (safe_plan.get("summary") or {}).get("blocking_repair_groups", 0)
+        )
+        # Canonical DB column values (always int)
+        _groups_total = int(_groups_total or 0)
+        _groups_blocking = int(_groups_blocking or 0)
+        save_repair_plan_sync(
+            task_id,
+            {
+                "schema_version": safe_plan["schema_version"],
+                "policy_version": safe_plan["policy_version"],
+                "repair_scope": safe_plan["repair_scope"],
+                "repair_json": safe_plan,
+                "plan_status": safe_plan["plan_status"],
+                "total_repair_groups": _groups_total,
+                "blocking_repair_groups": _groups_blocking,
+                "source_scan_updated_at": source_scan_updated_at,
+                "source_assessment_updated_at": source_assessment_updated_at,
+                "source_assessment_policy_version": source_assessment_policy_version,
+                "created_at": created_at,
+                "updated_at": now,
+            },
+        )
+        # Keep JSON timestamps identical to authoritative DB TIMESTAMPTZ values.
+        _conn = _get_connection()
+        try:
+            _row = _conn.execute(
+                "SELECT created_at, updated_at FROM repair_results WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        finally:
+            _conn.close()
+        if _row is not None:
+            safe_plan["created_at"] = _iso_ts(_row["created_at"])
+            safe_plan["updated_at"] = _iso_ts(_row["updated_at"])
+            from app.db.models import RepairResultRow
+            from app.db.session import get_session_factory
+            import asyncio as _aio
+            import json as _json
+
+            async def _rewrite():
+                factory = get_session_factory()
+                async with factory() as session:
+                    rr = await session.get(RepairResultRow, task_id)
+                    if rr is not None:
+                        rr.repair_json = _json.dumps(safe_plan, ensure_ascii=False)
+                        await session.commit()
+
+            _aio.run(_rewrite())
+        # Align public JSON timestamps with repository authoritative values.
+        persisted = _rr.get_repair_plan_sync(task_id)
+        if isinstance(persisted, dict):
+            for _k in ("created_at", "updated_at"):
+                if _k in persisted and persisted[_k] is not None:
+                    safe_plan[_k] = _iso_ts(persisted[_k])
         _success = True
     except (RepairPlanTooLargeError, RepairPlanInternalError):
-        if conn is not None:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
         raise
     except Exception:
-        if conn is not None:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-        raise RepairPlanPersistError(
-            "Failed to persist repair result"
-        )
+        raise RepairPlanPersistError("Failed to persist repair plan")
     finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                if _success:
-                    raise RepairPlanPersistError(
-                        "Failed to close database connection"
-                    )
+        conn = None
 
     return safe_plan
 
@@ -2813,128 +2809,95 @@ def _validate_persisted_repair_plan(
         raise RepairPlanInternalError(
             "blocking_repair_groups JSON/DB mismatch"
         )
-    if source_scan_updated_at != db_columns["source_scan_updated_at"]:
-        raise RepairPlanInternalError(
-            "source_scan_updated_at JSON/DB mismatch"
-        )
-    if source_assessment_updated_at != db_columns["source_assessment_updated_at"]:
-        raise RepairPlanInternalError(
-            "source_assessment_updated_at JSON/DB mismatch"
-        )
     if source_policy != db_columns["source_assessment_policy_version"]:
         raise RepairPlanInternalError(
             "source_assessment_policy_version JSON/DB mismatch"
         )
-    if created_at != db_columns["created_at"]:
+    if _iso_ts(created_at) != _iso_ts(db_columns["created_at"]):
         raise RepairPlanInternalError("created_at JSON/DB mismatch")
-    if updated_at != db_columns["updated_at"]:
+    if _iso_ts(updated_at) != _iso_ts(db_columns["updated_at"]):
         raise RepairPlanInternalError("updated_at JSON/DB mismatch")
+    if _iso_ts(source_scan_updated_at) != _iso_ts(
+        db_columns["source_scan_updated_at"]
+    ):
+        raise RepairPlanInternalError("source_scan_updated_at JSON/DB mismatch")
+    if _iso_ts(source_assessment_updated_at) != _iso_ts(
+        db_columns["source_assessment_updated_at"]
+    ):
+        raise RepairPlanInternalError(
+            "source_assessment_updated_at JSON/DB mismatch"
+        )
 
     return result
 
 
 def get_repair_result(task_id: str) -> dict | None:
-    """Read the full persisted repair plan for a task.
+    """Read persisted repair plan + validate against real DB columns."""
+    from app.services.result_repository import get_repair_plan_sync
 
-    Returns None if no repair plan has been persisted.
-
-    Validates the parsed JSON via _validate_persisted_repair_plan,
-    which checks ALL fields, types, frozen policy consistency,
-    agent_prompt safety, and JSON/DB column consistency.
-
-    Raises:
-        RepairPlanInternalError: If any validation fails.
-            The API layer maps this to REPAIR_PLAN_INTERNAL_ERROR.
-    """
-    conn = None
-    _db_error = False
+    init_db()
     try:
-        init_db()
-        conn = _get_connection()
-        row = conn.execute(
-            "SELECT task_id, repair_json, plan_status, total_repair_groups, "
-            "blocking_repair_groups, source_scan_updated_at, "
-            "source_assessment_updated_at, "
-            "source_assessment_policy_version, "
-            "created_at, updated_at "
-            "FROM repair_results WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        raw_json = row["repair_json"]
-        db_columns = {
-            "task_id": row["task_id"],
-            "plan_status": row["plan_status"],
-            "total_repair_groups": row["total_repair_groups"],
-            "blocking_repair_groups": row["blocking_repair_groups"],
-            "source_scan_updated_at": row["source_scan_updated_at"],
-            "source_assessment_updated_at": row[
-                "source_assessment_updated_at"
-            ],
-            "source_assessment_policy_version": row[
-                "source_assessment_policy_version"
-            ],
-            "created_at": row["created_at"],
-            "updated_at": row["updated_at"],
-        }
+        data = get_repair_plan_sync(task_id)
     except RepairPlanInternalError:
-        _db_error = True
         raise
     except Exception:
-        _db_error = True
-        raise RepairPlanInternalError(
-            "Failed to read repair plan from database"
-        )
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                if not _db_error:
-                    raise RepairPlanInternalError(
-                        "Failed to close database connection"
-                    )
-
-    # Parse JSON
-    try:
-        result = json.loads(raw_json)
-    except (json.JSONDecodeError, TypeError):
+        raise RepairPlanInternalError("Failed to parse repair plan JSON")
+    if data is None:
+        return None
+    if not isinstance(data, dict):
         raise RepairPlanInternalError("Failed to parse repair plan JSON")
 
-    if not isinstance(result, dict):
-        raise RepairPlanInternalError("Repair plan JSON is not a dict")
-
-    # --- Strict validation of all fields ---
-    # Wrap in try-except to catch any AttributeError, TypeError,
-    # KeyError, or ValueError from corrupted input that escapes
-    # the explicit checks. Convert ALL to RepairPlanInternalError.
-    try:
-        return _validate_persisted_repair_plan(result, task_id, db_columns)
-    except RepairPlanInternalError:
-        raise
-    except (AttributeError, TypeError, KeyError, ValueError) as exc:
-        raise RepairPlanInternalError(
-            "Corrupted repair plan data rejected by validation"
-        ) from exc
-
-
-def get_repair_plan_available(task_id: str) -> bool:
-    """Lightweight check for status polling — returns True if a repair
-    plan exists for the task.
-
-    Reads ONLY the task_id column — does NOT parse repair_json.
-    """
-    init_db()
+    # Authoritative DB column values (not copied from JSON) for consistency checks.
     conn = _get_connection()
     try:
         row = conn.execute(
-            "SELECT 1 FROM repair_results WHERE task_id = ?",
+            "SELECT plan_status, total_repair_groups, blocking_repair_groups, "
+            "source_scan_updated_at, source_assessment_updated_at, "
+            "source_assessment_policy_version, created_at, updated_at "
+            "FROM repair_results WHERE task_id = ?",
             (task_id,),
         ).fetchone()
-        return row is not None
     finally:
         conn.close()
+    if row is None:
+        raise RepairPlanInternalError("Repair plan row missing")
+    db_columns = {
+        "task_id": task_id,
+        "plan_status": row["plan_status"],
+        "total_repair_groups": row["total_repair_groups"],
+        "blocking_repair_groups": row["blocking_repair_groups"],
+        "source_scan_updated_at": _iso_ts(row["source_scan_updated_at"]),
+        "source_assessment_updated_at": _iso_ts(
+            row["source_assessment_updated_at"]
+        ),
+        "source_assessment_policy_version": row[
+            "source_assessment_policy_version"
+        ],
+        "created_at": _iso_ts(row["created_at"]),
+        "updated_at": _iso_ts(row["updated_at"]),
+    }
+    try:
+        return _validate_persisted_repair_plan(data, task_id, db_columns)
+    except RepairPlanInternalError:
+        raise
+    except KeyError as exc:
+        raise RepairPlanInternalError(f"Repair plan missing field: {exc}") from None
+    except Exception:
+        raise RepairPlanInternalError("Failed to validate repair plan")
+
+def get_repair_plan_available(task_id: str) -> bool:
+    """Lightweight check for status polling."""
+    from app.services.result_repository import get_repair_plan_available_sync
+
+    init_db()
+    return get_repair_plan_available_sync(task_id)
+
+def get_repair_plan_available(task_id: str) -> bool:
+    """Lightweight check for status polling — True if repair plan exists."""
+    from app.services.result_repository import get_repair_plan_available_sync
+
+    init_db()
+    return get_repair_plan_available_sync(task_id)
 
 
 # ---------------------------------------------------------------------------
