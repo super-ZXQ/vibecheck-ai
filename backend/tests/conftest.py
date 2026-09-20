@@ -64,6 +64,7 @@ def clean_tables(*tables: str) -> None:
     import asyncio
 
     from sqlalchemy import text
+
     from app.db.session import get_engine
 
     names = list(tables) or [
@@ -110,7 +111,9 @@ def _ensure_schema() -> None:
         # matches the public persistence contract (raw JSON string).
         try:
             import asyncio as _aio
+
             from sqlalchemy import text as _text
+
             from app.db.session import get_engine as _ge
             async def _alter():
                 eng = _ge()
@@ -137,8 +140,8 @@ def _ensure_schema() -> None:
 def _backend_test_defaults(monkeypatch, tmp_path):
     from app.core.config import settings
     from app.db import database
-    from app.services.llm_user_config import clear_user_configs
     from app.services.background_runner import reset_runner_state
+    from app.services.llm_user_config import clear_user_configs
 
     monkeypatch.setattr(settings, "database_url", _test_database_url())
     monkeypatch.setattr(settings, "tmp_dir", str(tmp_path / "tmp"))

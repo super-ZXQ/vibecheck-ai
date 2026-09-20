@@ -132,7 +132,7 @@ class TaskRecord:
     cancelled_at: datetime | str | None = None
 
     @classmethod
-    def from_row(cls, row: TaskRow) -> "TaskRecord":
+    def from_row(cls, row: TaskRow) -> TaskRecord:
         return cls(
             id=row.id,
             repo_url=row.repo_url,
@@ -204,7 +204,6 @@ class TaskRecord:
                 resp["error_message"] = get_error_message(DEAD_TASK)
 
         if self.api_status == STATUS_COMPLETED:
-            from app.services.result_repository import load_status_enrichment
 
             enrichment = load_status_enrichment_sync(self.id)
             resp.update(enrichment)
@@ -504,11 +503,12 @@ async def mark_completed(
         return False
     if row.status in TERMINAL_STATUSES:
         return False
-    if worker_id is not None and row.worker_id not in (None, worker_id):
-        # Allow complete from pending (dedup reuse) when worker_id matches claim
-        # or no worker owns it yet.
-        if row.worker_id != worker_id:
-            return False
+    if (
+        worker_id is not None
+        and row.worker_id not in (None, worker_id)
+        and row.worker_id != worker_id
+    ):
+        return False
     conditions = [
         TaskRow.id == task_id,
         TaskRow.status.not_in(TERMINAL_STATUSES),

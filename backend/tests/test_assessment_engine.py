@@ -67,7 +67,6 @@ def test_db(tmp_path, monkeypatch):
     大多数引擎测试不需要数据库，直接调用 assess_scan_result 即可。
     此 fixture 供需要 DB 访问的测试使用。
     """
-    db_path = tmp_path / "test.db"
     monkeypatch.setattr(
         "app.core.config.settings.database_url",
         __import__("os").environ.get(
@@ -77,7 +76,7 @@ def test_db(tmp_path, monkeypatch):
     )
     database._initialized = False
     database.init_db()
-    yield db_path
+    yield tmp_path
     database._initialized = False
 
 

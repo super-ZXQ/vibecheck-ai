@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-from typing import Any, Coroutine, TypeVar
+from collections.abc import Coroutine
+from typing import Any, TypeVar
 
 from app.db.repositories import results as result_repo
 from app.db.session import get_session_factory
@@ -107,11 +108,7 @@ def save_repair_plan_sync(task_id: str, payload: dict[str, Any]) -> None:
 
 
 def get_repair_plan_sync(task_id: str) -> dict[str, Any] | None:
-    try:
-        return _run(_with_session(result_repo.get_repair_plan, task_id))
-    except Exception:
-        # Invalid/corrupted JSONB/text payload → domain error at service layer
-        raise
+    return _run(_with_session(result_repo.get_repair_plan, task_id))
 
 
 def get_repair_plan_available_sync(task_id: str) -> bool:

@@ -2179,9 +2179,8 @@ def save_repair_result(
                 "repair_json exceeds repair_max_json_bytes"
             )
 
-        from app.services.result_repository import save_repair_plan_sync
-        from app.db.repositories.results import get_repair_plan as _get_plan_async
         from app.services import result_repository as _rr
+        from app.services.result_repository import save_repair_plan_sync
 
         _groups_total = (
             safe_plan.get("total_repair_groups")
@@ -2223,10 +2222,11 @@ def save_repair_result(
         if _row is not None:
             safe_plan["created_at"] = _iso_ts(_row["created_at"])
             safe_plan["updated_at"] = _iso_ts(_row["updated_at"])
-            from app.db.models import RepairResultRow
-            from app.db.session import get_session_factory
             import asyncio as _aio
             import json as _json
+
+            from app.db.models import RepairResultRow
+            from app.db.session import get_session_factory
 
             async def _rewrite():
                 factory = get_session_factory()
@@ -2884,13 +2884,6 @@ def get_repair_result(task_id: str) -> dict | None:
         raise RepairPlanInternalError(f"Repair plan missing field: {exc}") from None
     except Exception:
         raise RepairPlanInternalError("Failed to validate repair plan")
-
-def get_repair_plan_available(task_id: str) -> bool:
-    """Lightweight check for status polling."""
-    from app.services.result_repository import get_repair_plan_available_sync
-
-    init_db()
-    return get_repair_plan_available_sync(task_id)
 
 def get_repair_plan_available(task_id: str) -> bool:
     """Lightweight check for status polling — True if repair plan exists."""

@@ -1312,10 +1312,11 @@ def save_assessment_result(
                 return v.isoformat() if hasattr(v, "isoformat") else str(v)
             safe_assessment["created_at"] = _iso(row["created_at"])
             safe_assessment["updated_at"] = _iso(row["updated_at"])
+            import asyncio as _aio
+            import json as _json
+
             from app.db.models import AssessmentResultRow
             from app.db.session import get_session_factory
-            import json as _json
-            import asyncio as _aio
 
             async def _rewrite():
                 factory = get_session_factory()

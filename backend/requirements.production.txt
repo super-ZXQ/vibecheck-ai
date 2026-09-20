@@ -4,3 +4,8 @@ httpx==0.27.0
 pydantic==2.13.4
 pydantic-settings==2.3.4
 python-multipart==0.0.32
+# PostgreSQL persistence (runtime requirement after SQLite → PostgreSQL migration)
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+greenlet==3.1.1

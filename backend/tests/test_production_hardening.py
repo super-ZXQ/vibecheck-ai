@@ -293,10 +293,11 @@ class TestReadiness:
         test_db,
         missing_table,
     ):
+        import asyncio
+
         from sqlalchemy import text
 
         from app.db.session import get_engine
-        import asyncio
 
         async def _drop():
             engine = get_engine()

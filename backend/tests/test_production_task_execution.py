@@ -39,7 +39,6 @@ from app.services.task_manager import utc_now
 
 @pytest.fixture
 def test_db(tmp_path, monkeypatch):
-    db_path = tmp_path / "prod.db"
     monkeypatch.setattr(
         "app.core.config.settings.database_url",
         __import__("os").environ.get(
@@ -53,7 +52,7 @@ def test_db(tmp_path, monkeypatch):
     (tmp_path / "tmp").mkdir(parents=True, exist_ok=True)
     database._initialized = False
     database.init_db()
-    yield db_path
+    yield tmp_path
     database._initialized = False
 
 
@@ -377,10 +376,10 @@ class TestBYOKSecurity:
             task_id = resp.json()["task_id"]
 
         # PostgreSQL contract: API key never appears in task/result rows.
-        from app.db.session import get_session_factory
-        from app.db.models import TaskRow
-        from sqlalchemy import select
         import asyncio
+
+        from app.db.models import TaskRow
+        from app.db.session import get_session_factory
 
         async def _scan_rows():
             factory = get_session_factory()
@@ -531,9 +530,11 @@ class TestQueueFullAPI:
 class TestMigrationCompat:
     def test_postgresql_schema_has_task_execution_columns(self, test_db):
         """Alembic/PostgreSQL schema includes the durable task execution fields."""
-        from sqlalchemy import text
-        from app.db.session import get_engine
         import asyncio
+
+        from sqlalchemy import text
+
+        from app.db.session import get_engine
 
         async def _cols():
             engine = get_engine()
@@ -588,8 +589,9 @@ class TestMigrationCompat:
         task = task_manager.create_task("https://github.com/u/persist", "u", "persist")
         from app.db import database
         database.reset_initialized()
-        from app.db.session import dispose_engine
         import asyncio
+
+        from app.db.session import dispose_engine
         asyncio.run(dispose_engine())
         database.init_db()
         rec = task_manager.get_task(task.id)

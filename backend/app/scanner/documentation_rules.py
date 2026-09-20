@@ -1928,7 +1928,7 @@ class DocumentationConsistencyProbe(RepositoryProbe):
                     if joined("go.mod") not in self.paths:
                         return False
                     base_path = target.replace("/...", "").replace("...", "")
-                    if base_path and base_path != ".":  # noqa: SIM102
+                    if base_path and base_path != ".":
                         if not self._path_exists(rooted(base_path), directory=True):
                             return False
                 elif target in {reference.base_dir, "."}:

@@ -16,10 +16,12 @@ from pathlib import Path
 from typing import Any
 
 from app.core.config import settings
-from app.db.base import Base
 from app.db import models  # noqa: F401
+from app.db.base import Base
 from app.db.session import (
     check_database_ready as _async_check_ready,
+)
+from app.db.session import (
     dispose_engine,
     get_engine,
     get_session_factory,
@@ -109,7 +111,7 @@ _TS_COLS = {
 
 
 def _insert_columns(sql: str) -> list[str]:
-    m = re.search(r"INSERT\s+INTO\s+\w+\s*\(([^)]+)\)", sql, re.I | re.S)
+    m = re.search(r"INSERT\s+INTO\s+\w+\s*\(([^)]+)\)", sql, re.IGNORECASE | re.DOTALL)
     if not m:
         return []
     raw = m.group(1).replace("\n", " ").replace("\r", " ")
@@ -123,7 +125,7 @@ def _insert_qmark_columns(sql: str) -> list[str]:
     params must not be mapped onto the raw column list by index.
     """
     cols = _insert_columns(sql)
-    m = re.search(r"VALUES\s*\(([^)]+)\)", sql, re.I | re.S)
+    m = re.search(r"VALUES\s*\(([^)]+)\)", sql, re.IGNORECASE | re.DOTALL)
     if not m:
         return cols
     vals = [v.strip() for v in m.group(1).replace("\n", " ").split(",")]
@@ -138,7 +140,7 @@ def _update_timestamp_columns(sql: str) -> set[str]:
     """Column names that appear in SET ... as timestamp targets."""
     found = set()
     for col in _TS_COLS:
-        if re.search(rf"\b{col}\s*=", sql, re.I):
+        if re.search(rf"\b{col}\s*=", sql, re.IGNORECASE):
             found.add(col)
     return found
 
@@ -151,7 +153,7 @@ def _maybe_datetime(value: Any) -> Any:
     if len(s) < 19 or ("T" not in s and " " not in s):
         return value
     try:
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(s if "+" in s[10:] or s.endswith("Z") is False else s[:-1] + "+00:00") if False else datetime.fromisoformat(s.replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt
@@ -165,11 +167,10 @@ def _rewrite_sqlite_upsert(sql: str) -> str:
     m = re.search(
         r"INSERT\s+OR\s+REPLACE\s+INTO\s+(\w+)\s*\(([^)]+)\)",
         sql,
-        re.I | re.S,
+        re.IGNORECASE | re.DOTALL,
     )
     if not m:
         return sql
-    table = m.group(1)
     cols = [c.strip().strip('`"') for c in m.group(2).replace("\n", " ").split(",")]
     if not cols:
         return sql
@@ -180,7 +181,7 @@ def _rewrite_sqlite_upsert(sql: str) -> str:
         "INSERT INTO",
         sql,
         count=1,
-        flags=re.I,
+        flags=re.IGNORECASE,
     )
     if not rest:
         return sql2
@@ -209,7 +210,7 @@ def _convert_sql(sql: str, params: Any) -> tuple[str, dict]:
         return sql, out
     seq = list(params)
     named: dict[str, Any] = {}
-    if re.search(r"INSERT\s+INTO", sql, re.I):
+    if re.search(r"INSERT\s+INTO", sql, re.IGNORECASE):
         cols = _insert_qmark_columns(sql)
     else:
         # UPDATE ... SET col = ?, col2 = ? — map ? to assignment targets in order
@@ -318,13 +319,13 @@ def _get_session_factory():
 
 
 __all__ = [
-    "init_db",
-    "reset_db",
-    "check_database_ready",
-    "now_iso",
-    "reset_engine",
-    "reset_initialized",
     "_get_connection",
     "_get_session_factory",
+    "check_database_ready",
+    "init_db",
+    "now_iso",
+    "reset_db",
+    "reset_engine",
+    "reset_initialized",
     "validate_production_database_path",
 ]

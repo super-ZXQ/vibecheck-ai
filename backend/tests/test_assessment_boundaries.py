@@ -15,7 +15,6 @@ All test strings are SYNTHETIC — format-correct but NOT real credentials.
 """
 
 import json
-import sqlite3
 from unittest.mock import patch
 
 import pytest
@@ -46,9 +45,6 @@ from app.services.assessment_service import (
     AssessmentPersistError,
     AssessmentSerializationError,
     _clean_path_from_text,
-    _normalize_sort_bool,
-    _normalize_sort_int,
-    _normalize_sort_str,
     _strict_bool,
     _strict_int,
     assess_scan_result,
@@ -73,7 +69,6 @@ SYNTH_TOKEN_GHP = "ghp_" + _MIXED[:36]
 
 @pytest.fixture
 def test_db(tmp_path, monkeypatch):
-    db_path = tmp_path / "test.db"
     monkeypatch.setattr(
         "app.core.config.settings.database_url",
         __import__("os").environ.get(
@@ -83,13 +78,12 @@ def test_db(tmp_path, monkeypatch):
     )
     database._initialized = False
     database.init_db()
-    yield db_path
+    yield tmp_path
     database._initialized = False
 
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
-    db_path = tmp_path / "test.db"
     monkeypatch.setattr(
         "app.core.config.settings.database_url",
         __import__("os").environ.get(

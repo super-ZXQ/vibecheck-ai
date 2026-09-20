@@ -32,7 +32,7 @@ import json
 from typing import Any
 
 from app.core.security.desensitize import mask_snippet, mask_untrusted_text
-from app.db.database import _get_connection, init_db, now_iso
+from app.db.database import init_db
 from app.scanner.base import (
     BASIC_SECURITY_DIMENSION,
     DEPLOYABILITY_PRODUCTION_DIMENSION,

@@ -48,7 +48,6 @@ from app.services.scan_result_service import get_scan_result
 @pytest.fixture
 def test_db(tmp_path, monkeypatch):
     """设置临时测试数据库。"""
-    db_path = tmp_path / "test.db"
     monkeypatch.setattr(
         "app.core.config.settings.database_url",
         __import__("os").environ.get(
@@ -61,14 +60,13 @@ def test_db(tmp_path, monkeypatch):
     )
     database._initialized = False
     database.init_db()
-    yield db_path
+    yield tmp_path
     database._initialized = False
 
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     """设置临时测试数据库和 TestClient（用于 API 测试）。"""
-    db_path = tmp_path / "test.db"
     monkeypatch.setattr(
         "app.core.config.settings.database_url",
         __import__("os").environ.get(

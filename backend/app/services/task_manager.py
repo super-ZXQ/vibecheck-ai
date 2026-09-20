@@ -9,56 +9,34 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
+from collections.abc import Coroutine
 from dataclasses import dataclass
-from typing import Any, Coroutine, TypeVar
+from typing import Any, TypeVar
 
 from app.core.config import settings
 from app.core.error_codes import get_error_message
+from app.core.scanner_version import SCANNER_VERSION
 from app.db.repositories import results as result_repo
 from app.db.repositories import tasks as task_repo
 from app.db.repositories.tasks import (
+    STAGE_QUEUED,
     STATUS_CANCELLED,
     STATUS_COMPLETED,
     STATUS_DEAD,
     STATUS_FAILED,
     STATUS_PENDING,
     STATUS_RUNNING,
-    STAGE_QUEUED,
     TERMINAL_STATUSES,
+    IllegalStateTransitionError,  # noqa: F401
     QueueCapacityError,
     TaskRecord,
-    admit_repo_task,
-    admit_upload_task,
+    _validate_transition,  # noqa: F401
     build_deduplication_key,
-    claim_next_pending,
-    count_tasks_by_status,
-    fail_or_retry,
-    find_completed_by_repo_sha,
-    find_running_by_repo,
-    get_pending_count,
-    get_running_count,
-    get_task,
-    has_claimable_pending,
-    is_cancel_requested,
     make_worker_id,
-    mark_cancelled,
-    mark_completed,
-    mark_dead,
-    mark_failed,
-    mark_running,
-    normalize_repo_url,
-    recover_expired_tasks,
-    request_cancel,
-    set_resolved_commit_sha,
-    touch_heartbeat,
     utc_now,
 )
-from app.db.repositories.tasks import IllegalStateTransitionError  # noqa: F401
-from app.db.repositories.tasks import _validate_transition  # noqa: F401
-from app.core.scanner_version import SCANNER_VERSION  # noqa: F401 — re-export
 from app.db.session import get_session_factory
 from app.services import metrics as metrics_mod
-from app.services.task_errors import category_for_error_code
 
 logger = logging.getLogger(__name__)
 
@@ -156,48 +134,48 @@ STAGE_FINISHED = "finished"
 
 # Re-export constants used across the codebase.
 __all__ = [
-    "QueueCapacityError",
-    "TaskRecord",
+    "STAGE_QUEUED",
+    "STATUS_CANCELLED",
+    "STATUS_COMPLETED",
+    "STATUS_DEAD",
+    "STATUS_FAILED",
     "STATUS_PENDING",
     "STATUS_RUNNING",
-    "STATUS_COMPLETED",
-    "STATUS_FAILED",
-    "STATUS_CANCELLED",
-    "STATUS_DEAD",
-    "STAGE_QUEUED",
     "TERMINAL_STATUSES",
-    "create_task",
-    "create_task_async",
+    "QueueCapacityError",
+    "TaskRecord",
     "admit_repo_task",
     "admit_upload_task",
+    "build_deduplication_key",
     "claim_next_pending",
-    "get_task",
+    "create_task",
+    "create_task_async",
+    "fail_or_retry",
     "get_pending_count",
+    "get_task",
     "is_queue_full",
     "is_queue_full_async",
-    "mark_running",
+    "make_worker_id",
+    "mark_cancelled",
     "mark_completed",
     "mark_failed",
-    "mark_cancelled",
-    "fail_or_retry",
+    "mark_running",
     "recover_expired_tasks",
     "request_cancel",
     "touch_heartbeat",
-    "build_deduplication_key",
-    "make_worker_id",
     "utc_now",
 ]
 
 
 def _run_sync(coro: Coroutine[Any, Any, T]) -> T:
     """Run a coroutine from sync test code without nested-loop errors."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)  # type: ignore[arg-type]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()  # type: ignore[arg-type]
 
-    async def _wrapped() -> T:
-        factory = get_session_factory()
-        async with factory() as session:
-            # Coroutines in this module are repository calls expecting a session
-            # OR higher-level helpers that open their own session.
-            return await coro  # type: ignore[misc]
 
     try:
         asyncio.get_running_loop()
@@ -576,7 +554,7 @@ def get_task_status_counts() -> dict[str, int]:
 
 def reset_runner_state() -> None:
     """Compatibility no-op for older tests that reset SQLite runner globals."""
-    return None
+    return
 
 
 def mark_stale_tasks_as_failed() -> int:

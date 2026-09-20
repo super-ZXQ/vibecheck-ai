@@ -6,7 +6,6 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
@@ -55,12 +54,14 @@ async def save_scan_result(
             ScanResultRow(
                 task_id=task_id,
                 schema_version=schema_version,
-                result_json=(
+                result_json=(  # type: ignore[arg-type]
+                
                 json.dumps(result_json, ensure_ascii=False)
                 if isinstance(result_json, dict)
                 else result_json
             ),
-                summary_json=(
+                summary_json=(  # type: ignore[arg-type]
+                
                 json.dumps(summary_json, ensure_ascii=False)
                 if isinstance(summary_json, dict)
                 else summary_json
@@ -78,12 +79,12 @@ async def save_scan_result(
         )
     else:
         existing.schema_version = schema_version
-        existing.result_json = (
+        existing.result_json = (  # type: ignore[assignment]
             json.dumps(result_json, ensure_ascii=False)
             if isinstance(result_json, dict)
             else result_json
         )
-        existing.summary_json = (
+        existing.summary_json = (  # type: ignore[assignment]
             json.dumps(summary_json, ensure_ascii=False)
             if isinstance(summary_json, dict)
             else summary_json
@@ -121,6 +122,7 @@ async def get_scan_result(session: AsyncSession, task_id: str) -> dict[str, Any]
 
 async def get_scan_summary(session: AsyncSession, task_id: str) -> dict[str, Any] | None:
     import json as _json
+
     from app.services.scan_result_service import normalize_scan_summary_dimensions
 
     row = await session.get(ScanResultRow, task_id)
@@ -200,7 +202,8 @@ async def save_assessment(
                 schema_version=schema_version,
                 policy_version=policy_version,
                 assessment_scope=assessment_scope,
-                assessment_json=(
+                assessment_json=(  # type: ignore[arg-type]
+                
                 json.dumps(assessment_json, ensure_ascii=False)
                 if isinstance(assessment_json, dict)
                 else assessment_json
@@ -216,7 +219,7 @@ async def save_assessment(
         existing.schema_version = schema_version
         existing.policy_version = policy_version
         existing.assessment_scope = assessment_scope
-        existing.assessment_json = (
+        existing.assessment_json = (  # type: ignore[assignment]
             json.dumps(assessment_json, ensure_ascii=False)
             if isinstance(assessment_json, dict)
             else assessment_json
@@ -274,7 +277,8 @@ async def save_repair_plan(
                 schema_version=schema_version,
                 policy_version=policy_version,
                 repair_scope=repair_scope,
-                repair_json=(
+                repair_json=(  # type: ignore[arg-type]
+                
                 json.dumps(repair_json, ensure_ascii=False)
                 if isinstance(repair_json, dict)
                 else repair_json
@@ -293,7 +297,7 @@ async def save_repair_plan(
         existing.schema_version = schema_version
         existing.policy_version = policy_version
         existing.repair_scope = repair_scope
-        existing.repair_json = (
+        existing.repair_json = (  # type: ignore[assignment]
             json.dumps(repair_json, ensure_ascii=False)
             if isinstance(repair_json, dict)
             else repair_json
@@ -344,7 +348,8 @@ async def save_llm_analysis(
             LlmAnalysisResultRow(
                 task_id=task_id,
                 schema_version=schema_version,
-                analysis_json=(
+                analysis_json=(  # type: ignore[arg-type]
+                
                 json.dumps(analysis_json, ensure_ascii=False)
                 if isinstance(analysis_json, dict)
                 else analysis_json
@@ -359,7 +364,7 @@ async def save_llm_analysis(
         )
     else:
         existing.schema_version = schema_version
-        existing.analysis_json = (
+        existing.analysis_json = (  # type: ignore[assignment]
             json.dumps(analysis_json, ensure_ascii=False)
             if isinstance(analysis_json, dict)
             else analysis_json

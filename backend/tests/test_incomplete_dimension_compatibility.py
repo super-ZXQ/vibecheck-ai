@@ -37,7 +37,6 @@ from app.services.scan_result_service import (
 
 @pytest.fixture
 def test_db(tmp_path, monkeypatch):
-    db_path = tmp_path / "test.db"
     monkeypatch.setattr(
         "app.core.config.settings.database_url",
         __import__("os").environ.get(

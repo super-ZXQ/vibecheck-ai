@@ -29,7 +29,6 @@ from app.services.task_manager import (
 
 @pytest.fixture
 def test_db(tmp_path, monkeypatch):
-    db_path = tmp_path / "p1.db"
     monkeypatch.setattr(
         settings,
         "database_url",
@@ -45,7 +44,7 @@ def test_db(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "max_pending_tasks", 5)
     database._initialized = False
     database.init_db()
-    yield db_path
+    yield tmp_path
     database._initialized = False
 
 

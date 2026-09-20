@@ -25,11 +25,7 @@ from app.core.security_headers import SecurityHeadersMiddleware
 from app.db.database import check_database_ready, init_db
 from app.db.session import dispose_engine
 from app.services import metrics as metrics_mod
-from app.services.task_manager import (
-    get_pending_count,
-    get_running_count,
-    recover_expired_tasks,
-)
+from app.services.task_manager import recover_expired_tasks
 
 logger = logging.getLogger(__name__)
 APP_VERSION = "0.2.0"
@@ -70,8 +66,9 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         except Exception as e:
             logger.error("Dispatcher start failed: %s", type(e).__name__)
 
-    metrics_mod.set_gauge("vibecheck_queue_depth", float(get_pending_count()))
-    metrics_mod.set_gauge("vibecheck_active_tasks", float(get_running_count()))
+    from app.services import task_manager as _tm0
+    metrics_mod.set_gauge("vibecheck_queue_depth", float(_tm0.get_pending_count()))
+    metrics_mod.set_gauge("vibecheck_active_tasks", float(_tm0.get_running_count()))
 
     try:
         yield
@@ -171,8 +168,10 @@ def create_app(app_settings: Settings = settings) -> FastAPI:
     async def prometheus_metrics() -> PlainTextResponse:
         """Prometheus metrics. Labels never include repo/task/paths/secrets."""
         try:
-            metrics_mod.set_gauge("vibecheck_queue_depth", float(get_pending_count()))
-            metrics_mod.set_gauge("vibecheck_active_tasks", float(get_running_count()))
+            from app.services.task_manager import get_pending_count as _gpc
+            from app.services.task_manager import get_running_count as _grc
+            metrics_mod.set_gauge("vibecheck_queue_depth", float(_gpc()))
+            metrics_mod.set_gauge("vibecheck_active_tasks", float(_grc()))
             from app.services.llm_user_config import count_user_configs
             metrics_mod.set_gauge(
                 "vibecheck_llm_keys_in_memory", float(count_user_configs())

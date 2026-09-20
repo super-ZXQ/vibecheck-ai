@@ -28,7 +28,6 @@ from app.services.llm_service import generate_and_save_llm_analysis
 
 @pytest.fixture
 def test_db(tmp_path, monkeypatch):
-    db_path = tmp_path / "test.db"
     monkeypatch.setattr(
         "app.core.config.settings.database_url",
         __import__("os").environ.get(
@@ -41,7 +40,7 @@ def test_db(tmp_path, monkeypatch):
     )
     database._initialized = False
     database.init_db()
-    yield db_path
+    yield tmp_path
     database._initialized = False
 
 

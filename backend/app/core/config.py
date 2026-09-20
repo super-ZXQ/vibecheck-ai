@@ -4,8 +4,6 @@ Sensitive values (GitHub Token, LLM API Key) are read from environment variables
 and NEVER hardcoded. This module is the single source of truth for all limits.
 """
 
-import posixpath
-from pathlib import PurePosixPath
 from typing import Literal
 from urllib.parse import urlsplit
 

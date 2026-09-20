@@ -25,7 +25,6 @@ from datetime import timezone
 from pathlib import Path
 
 from app.core.config import settings
-from app.db.database import _get_connection, init_db
 
 logger = logging.getLogger(__name__)
 
@@ -98,9 +97,12 @@ def cleanup_expired_tasks() -> int:
     """Delete expired completed/failed tasks via SQLAlchemy async repository."""
     if settings.report_ttl_hours <= 0:
         return 0
+    import asyncio
+    import concurrent.futures
     from datetime import datetime, timedelta
 
     from sqlalchemy import delete, select
+
     from app.db.models import (
         AssessmentResultRow,
         LlmAnalysisResultRow,
@@ -109,8 +111,6 @@ def cleanup_expired_tasks() -> int:
         TaskRow,
     )
     from app.db.session import get_session_factory
-    import asyncio
-    import concurrent.futures
 
     async def _run() -> int:
         factory = get_session_factory()

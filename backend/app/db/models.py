@@ -21,7 +21,6 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
-    UniqueConstraint,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -96,8 +95,8 @@ class ScanResultRow(Base):
         String(36), ForeignKey("tasks.id"), primary_key=True
     )
     schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
-    result_json: Mapped[dict] = mapped_column(Text, nullable=False)
-    summary_json: Mapped[dict | None] = mapped_column(Text)
+    result_json: Mapped[Any] = mapped_column(Text, nullable=False)
+    summary_json: Mapped[Any] = mapped_column(Text)
     total_findings: Mapped[int] = mapped_column(Integer, nullable=False)
     blocking_findings: Mapped[int] = mapped_column(Integer, nullable=False)
     total_notices: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -119,7 +118,7 @@ class AssessmentResultRow(Base):
     schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
     policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
     assessment_scope: Mapped[str] = mapped_column(String(64), nullable=False)
-    assessment_json: Mapped[dict] = mapped_column(Text, nullable=False)
+    assessment_json: Mapped[Any] = mapped_column(Text, nullable=False)
     score: Mapped[int] = mapped_column(Integer, nullable=False)
     verdict: Mapped[str] = mapped_column(String(32), nullable=False)
     source_scan_updated_at: Mapped[str] = mapped_column(Text, nullable=False)
@@ -136,7 +135,7 @@ class RepairResultRow(Base):
     schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
     policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
     repair_scope: Mapped[str] = mapped_column(String(64), nullable=False)
-    repair_json: Mapped[dict] = mapped_column(Text, nullable=False)
+    repair_json: Mapped[Any] = mapped_column(Text, nullable=False)
     plan_status: Mapped[str] = mapped_column(String(32), nullable=False)
     total_repair_groups: Mapped[int] = mapped_column(Integer, nullable=False)
     blocking_repair_groups: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -155,7 +154,7 @@ class LlmAnalysisResultRow(Base):
         String(36), ForeignKey("tasks.id"), primary_key=True
     )
     schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
-    analysis_json: Mapped[dict] = mapped_column(Text, nullable=False)
+    analysis_json: Mapped[Any] = mapped_column(Text, nullable=False)
     total_analyzed: Mapped[int] = mapped_column(Integer, nullable=False)
     total_fallback: Mapped[int] = mapped_column(Integer, nullable=False)
     source: Mapped[str] = mapped_column(String(32), nullable=False)

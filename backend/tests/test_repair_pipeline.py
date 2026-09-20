@@ -53,7 +53,6 @@ from tests.conftest import make_normal_tarball
 
 @pytest.fixture
 def test_db(tmp_path, monkeypatch):
-    db_path = tmp_path / "test.db"
     monkeypatch.setattr(
         "app.core.config.settings.database_url",
         __import__("os").environ.get(
@@ -64,7 +63,7 @@ def test_db(tmp_path, monkeypatch):
     monkeypatch.setattr("app.core.config.settings.tmp_dir", str(tmp_path / "tmp"))
     database._initialized = False
     database.init_db()
-    yield db_path
+    yield tmp_path
     database._initialized = False
 
 

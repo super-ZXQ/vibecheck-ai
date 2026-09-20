@@ -16,7 +16,6 @@ Covers the five test categories required by the P0-5 review:
 
 import asyncio
 import json
-import sqlite3
 import threading
 from pathlib import Path
 from unittest.mock import patch
@@ -62,7 +61,6 @@ RAW_TOKEN = "ghp_" + _MIXED_CHARS[:36]
 @pytest.fixture
 def test_db(tmp_path, monkeypatch):
     """Set up a temporary test database."""
-    db_path = tmp_path / "test.db"
     monkeypatch.setattr(
         "app.core.config.settings.database_url",
         __import__("os").environ.get(
@@ -75,7 +73,7 @@ def test_db(tmp_path, monkeypatch):
     )
     database._initialized = False
     database.init_db()
-    yield db_path
+    yield tmp_path
     database._initialized = False
 
 
@@ -605,9 +603,11 @@ class TestDatabaseCompatibility:
     """PostgreSQL scan_results schema contract (summary_json TEXT)."""
 
     def test_new_db_has_summary_json_column(self, test_db):
-        from sqlalchemy import text
-        from app.db.session import get_engine
         import asyncio
+
+        from sqlalchemy import text
+
+        from app.db.session import get_engine
 
         async def _cols():
             engine = get_engine()
@@ -626,11 +626,11 @@ class TestDatabaseCompatibility:
 
     def test_old_record_falls_back_to_result_json(self, test_db):
         """Row with empty summary_json still exposes summary via result_json."""
-        from app.services.result_repository import get_scan_result_sync, get_scan_summary_sync
-        from app.services.task_manager import create_task
-        from app.services.scan_result_service import save_scan_result
+
         from app.scanner.base import ScanResult
-        import json
+        from app.services.result_repository import get_scan_result_sync, get_scan_summary_sync
+        from app.services.scan_result_service import save_scan_result
+        from app.services.task_manager import create_task
 
         task = create_task("https://github.com/u/fallback", "u", "fallback")
         save_scan_result(

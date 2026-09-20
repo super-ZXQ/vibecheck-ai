@@ -51,13 +51,8 @@ class TestValidateProductionDatabaseUrl:
     )
     def test_rejects_invalid_urls(self, url, match):
         with pytest.raises((ValueError, ValidationError), match=match):
-            try:
-                validate_production_database_url(url)
-                _prod(url)
-            except ValidationError:
-                raise
-            except ValueError:
-                raise
+            validate_production_database_url(url)
+            _prod(url)
 
 
 class TestVerifyDatabaseListPath:

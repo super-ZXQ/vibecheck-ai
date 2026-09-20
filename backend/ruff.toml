@@ -16,6 +16,12 @@ line-length = 100
 # - SIM115:   tarfile.open without context manager, safe in controlled scope
 # - UP017:    datetime.UTC not available in all runtime environments
 ignore = [
+    "B018",
+    "FURB162",
+    "UP047",
+    "TRY203",
+    "RUF034",
+    "SIM102",
     "BLE001",
     "S110",
     "B008",

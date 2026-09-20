@@ -24,6 +24,7 @@ async def _reset_tasks() -> None:
     """Truncate task-related tables so tests do not share leftover rows."""
     from sqlalchemy import text
     from sqlalchemy.ext.asyncio import async_sessionmaker
+
     from app.db.session import get_engine
 
     engine = get_engine()
@@ -266,6 +267,7 @@ async def test_byok_not_in_task_row(monkeypatch):
 @pytest.mark.asyncio
 async def test_schema_has_required_tables():
     from sqlalchemy import text
+
     from app.db.session import get_engine
 
     engine = get_engine()

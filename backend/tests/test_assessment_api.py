@@ -55,7 +55,6 @@ from tests.conftest import (
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     """设置临时测试数据库和 TestClient。"""
-    db_path = tmp_path / "test.db"
     monkeypatch.setattr(
         "app.core.config.settings.database_url",
         __import__("os").environ.get(
