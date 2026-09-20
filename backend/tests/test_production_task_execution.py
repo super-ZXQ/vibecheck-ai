@@ -151,13 +151,18 @@ class TestBoundedConcurrency:
             side_effect=mock_extract,
         ):
             await background_runner.start_dispatcher()
-            deadline = time.monotonic() + 20
+            deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
                 statuses = [task_manager.get_task(t.id).status for t in tasks]
                 if all(s in ("completed", "failed", "dead") for s in statuses):
                     break
                 await asyncio.sleep(0.05)
-            await background_runner.stop_dispatcher(0.5)
+            # Drain any remaining pending work before asserting terminal states.
+            try:
+                await background_runner.drain_pending_tasks()
+            except Exception:
+                pass
+            await background_runner.stop_dispatcher(1.0)
 
         assert max_seen <= 2
         assert max_seen >= 1

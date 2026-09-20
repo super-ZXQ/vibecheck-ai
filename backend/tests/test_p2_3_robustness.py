@@ -149,13 +149,15 @@ class TestStateMachineValidation:
 class TestCleanupResidualTempFiles:
 
     def test_removes_stale_files(self, test_db, tmp_path):
-        """清理残留临时文件。"""
-        tmp_dir = Path(test_db.parent) / "tmp"
+        """清理残留临时文件（必须写入 settings.tmp_dir）。”"""
+        from app.core.config import settings
+
+        tmp_dir = Path(settings.tmp_dir)
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
-        # Create stale files
+        # Create stale files under the configured tmp root
         (tmp_dir / "download-abc.tar.gz").write_bytes(b"stale")
-        (tmp_dir / "task-xyz").mkdir()
+        (tmp_dir / "task-xyz").mkdir(exist_ok=True)
         (tmp_dir / "task-xyz" / "file.txt").write_text("stale")
 
         removed = cleanup_residual_temp_files()
@@ -165,7 +167,9 @@ class TestCleanupResidualTempFiles:
 
     def test_empty_dir_returns_zero(self, test_db, tmp_path):
         """空目录返回 0。"""
-        tmp_dir = Path(test_db.parent) / "tmp"
+        from app.core.config import settings
+
+        tmp_dir = Path(settings.tmp_dir)
         tmp_dir.mkdir(parents=True, exist_ok=True)
         removed = cleanup_residual_temp_files()
         assert removed == 0
