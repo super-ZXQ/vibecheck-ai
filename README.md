@@ -1,8 +1,12 @@
 # VibeCheck
 
+**AI-powered code quality and security analysis platform with PostgreSQL-backed task execution.**
+
 项目上线体检工具 — 面向 Vibe Coding 与 AI 编程初学者。
 
 用户提交公开 GitHub 仓库地址，系统读取代码与文档，从五个维度检查项目是否适合正式上线，输出评分、风险清单与可复制的修复指令。
+
+**Stack:** Next.js · FastAPI · PostgreSQL 16 · SQLAlchemy 2 Async · Alembic · Docker
 
 ## 功能特性
 
@@ -22,6 +26,8 @@
 
 ## 技术栈
 
+**Next.js + FastAPI + PostgreSQL + SQLAlchemy 2 Async + Alembic + Docker**
+
 | 层 | 技术 |
 | --- | --- |
 | 前端 | Next.js (App Router) + React + TypeScript |
@@ -33,6 +39,31 @@
 | 任务执行 | **PostgreSQL-backed durable bounded task execution** |
 | Claim | `SELECT ... FOR UPDATE SKIP LOCKED` + lease/heartbeat |
 | 运行 | Docker Compose（frontend + backend + postgres） |
+
+## 核心架构：可靠任务执行链路
+
+亮点不是「用了 PostgreSQL」，而是 **在没有 Celery / Redis / Kafka 的前提下，用数据库原语完成 multi-worker-safe 的后台任务**。
+
+```
+任务队列
+  ↓
+PostgreSQL 原子 Claim
+  ↓
+FOR UPDATE SKIP LOCKED
+  ↓
+Lease / Heartbeat / Fencing
+  ↓
+Retry / Recovery / Cancel / Dedup
+```
+
+| 环节 | 做法 |
+| --- | --- |
+| 入队 | 有界 pending / running；满则 `429 QUEUE_FULL`；同仓运行中任务 coalesce |
+| Claim | `SELECT ... FOR UPDATE SKIP LOCKED` + 每次 claim 唯一 `worker_id` 围栏令牌 |
+| 存活 | lease 超时 + heartbeat；dispatcher 周期 reaper 回收过期任务 |
+| 纠错 | 有界重试、失败恢复、幂等取消、结果去重（`reused_from_task_id`） |
+| 读写路径 | Route → Service → Repository → SQLAlchemy 2 AsyncSession → PostgreSQL |
+| Schema | Alembic 为唯一权威；生产路径不 `create_all` |
 
 ## 任务执行能力（诚实声明）
 
