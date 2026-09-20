@@ -319,6 +319,14 @@ async def recover_expired_tasks_async() -> dict[str, int]:
     return await _with_session(task_repo.recover_expired_tasks)
 
 
+async def get_pending_count_async() -> int:
+    return await _with_session(task_repo.get_pending_count)
+
+
+async def get_running_count_async() -> int:
+    return await _with_session(task_repo.get_running_count)
+
+
 async def request_cancel_async(task_id: str) -> str:
     return await _with_session(task_repo.request_cancel, task_id)
 

@@ -52,6 +52,15 @@ async def _create_all_async() -> None:
         await conn.run_sync(Base.metadata.create_all)
 
 
+async def init_db_async() -> None:
+    """Create schema on the *current* event loop (production lifespan)."""
+    global _initialized
+    if _initialized:
+        return
+    await _create_all_async()
+    _initialized = True
+
+
 def init_db() -> None:
     global _initialized
     if _initialized:

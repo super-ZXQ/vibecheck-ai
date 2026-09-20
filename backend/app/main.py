@@ -1,12 +1,13 @@
 """FastAPI application entry point.
 
-Production-like task execution:
-- Startup: init schema (with backward-compatible migrations), recover
-  expired leases, clean residual temp files, start bounded dispatcher.
-- Shutdown: stop claiming, grant a grace window, clear BYOK memory.
-- /metrics: Prometheus text exposition (no high-cardinality labels).
-- /api/ready: database readiness only; LLM outage does not fail readiness.
+PostgreSQL-backed production entry:
+- Startup: async schema ensure, lease recovery, dispatcher start
+- Shutdown: stop dispatcher, clear BYOK, dispose engine
+- /metrics: Prometheus text (no high-cardinality labels)
+- /api/ready: PostgreSQL readiness only; LLM outage is not fatal
 """
+
+from __future__ import annotations
 
 import logging
 from collections.abc import AsyncIterator
@@ -22,10 +23,9 @@ from app.api.check import router as check_router
 from app.api.repair import router as repair_router
 from app.core.config import Settings, settings
 from app.core.security_headers import SecurityHeadersMiddleware
-from app.db.database import check_database_ready, init_db
-from app.db.session import dispose_engine
+from app.db.database import init_db_async
+from app.db.session import check_database_ready, dispose_engine
 from app.services import metrics as metrics_mod
-from app.services.task_manager import recover_expired_tasks
 
 logger = logging.getLogger(__name__)
 APP_VERSION = "0.2.0"
@@ -33,12 +33,19 @@ APP_VERSION = "0.2.0"
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    """Initialize persistence, recover leased tasks, start dispatcher."""
-    init_db()
+    """Initialize PostgreSQL persistence and background dispatcher on this loop."""
+    # Schema ensure MUST run on the uvicorn event loop so the SQLAlchemy
+    # async engine binds to the same loop used by request handlers.
+    await init_db_async()
 
-    # Crash-safe recovery: do NOT force-fail running/pending tasks.
+    from app.services.task_manager import (
+        get_pending_count_async,
+        get_running_count_async,
+        recover_expired_tasks_async,
+    )
+
     try:
-        recovery = recover_expired_tasks()
+        recovery = await recover_expired_tasks_async()
         if recovery.get("requeued") or recovery.get("dead"):
             logger.info(
                 "Service restarted: requeued=%d dead=%d",
@@ -48,16 +55,18 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     except Exception as e:
         logger.error("Lease recovery failed: %s", type(e).__name__)
 
-    from app.services.cleanup_service import (
-        cleanup_expired_tasks,
-        cleanup_residual_temp_files,
-    )
-    cleanup_residual_temp_files()
-    expired = cleanup_expired_tasks()
-    if expired > 0:
-        logger.info("Startup cleanup: expired %d old report(s)", expired)
+    # Cleanup helpers are sync wrappers; run them without touching the
+    # request-loop SQLAlchemy engine (they use _run_sync internally).
+    try:
+        import asyncio as _aio
 
-    # Start bounded-concurrency dispatcher (skip in automated unit tests).
+        from app.services.cleanup_service import cleanup_expired_tasks, cleanup_residual_temp_files
+
+        await _aio.to_thread(cleanup_residual_temp_files)
+        await _aio.to_thread(cleanup_expired_tasks)
+    except Exception as e:
+        logger.error("Startup cleanup failed: %s", type(e).__name__)
+
     from app.services.background_runner import start_dispatcher, stop_dispatcher
 
     if settings.app_env != "test":
@@ -66,9 +75,11 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         except Exception as e:
             logger.error("Dispatcher start failed: %s", type(e).__name__)
 
-    from app.services import task_manager as _tm0
-    metrics_mod.set_gauge("vibecheck_queue_depth", float(_tm0.get_pending_count()))
-    metrics_mod.set_gauge("vibecheck_active_tasks", float(_tm0.get_running_count()))
+    try:
+        metrics_mod.set_gauge("vibecheck_queue_depth", float(await get_pending_count_async()))
+        metrics_mod.set_gauge("vibecheck_active_tasks", float(await get_running_count_async()))
+    except Exception:
+        pass
 
     try:
         yield
@@ -95,7 +106,7 @@ def create_app(app_settings: Settings = settings) -> FastAPI:
         title="VibeCheck",
         description=(
             "项目上线体检工具 — 安全扫描 + 可靠后台任务 "
-            "(single-instance bounded concurrency on SQLite WAL)"
+            "(PostgreSQL-backed durable bounded task execution)"
         ),
         version=APP_VERSION,
         docs_url=None if production else "/docs",
@@ -137,30 +148,28 @@ def create_app(app_settings: Settings = settings) -> FastAPI:
 
     @api.get("/api/ready", include_in_schema=False)
     async def readiness_check() -> JSONResponse:
-        """Readiness: database must be available. LLM outage is not fatal."""
+        """Readiness: PostgreSQL must be available. LLM outage is not fatal."""
         db_ok = False
         llm_configured = bool(
-            app_settings.llm_enabled and app_settings.llm_api_key and app_settings.llm_base_url
+            app_settings.llm_enabled
+            and app_settings.llm_api_key
+            and app_settings.llm_base_url
         )
         try:
-            check_database_ready()
+            # Async engine check on the request event loop.
+            await check_database_ready()
             db_ok = True
         except Exception:
             logger.error("Database readiness check failed")
 
         deps = {
             "database": "ok" if db_ok else "unavailable",
-            # External dependency degradation is shown separately and does
-            # not make the whole service unready.
             "llm": "configured" if llm_configured else "not_configured",
         }
         if not db_ok:
             return JSONResponse(
                 status_code=503,
-                content={
-                    "status": "not_ready",
-                    "dependencies": deps,
-                },
+                content={"status": "not_ready", "dependencies": deps},
             )
         return JSONResponse(content={"status": "ready", "dependencies": deps})
 
@@ -168,11 +177,17 @@ def create_app(app_settings: Settings = settings) -> FastAPI:
     async def prometheus_metrics() -> PlainTextResponse:
         """Prometheus metrics. Labels never include repo/task/paths/secrets."""
         try:
-            from app.services.task_manager import get_pending_count as _gpc
-            from app.services.task_manager import get_running_count as _grc
-            metrics_mod.set_gauge("vibecheck_queue_depth", float(_gpc()))
-            metrics_mod.set_gauge("vibecheck_active_tasks", float(_grc()))
             from app.services.llm_user_config import count_user_configs
+            from app.services.task_manager import (
+                get_pending_count_async,
+                get_running_count_async,
+            )
+            metrics_mod.set_gauge(
+                "vibecheck_queue_depth", float(await get_pending_count_async())
+            )
+            metrics_mod.set_gauge(
+                "vibecheck_active_tasks", float(await get_running_count_async())
+            )
             metrics_mod.set_gauge(
                 "vibecheck_llm_keys_in_memory", float(count_user_configs())
             )
