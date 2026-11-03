@@ -93,6 +93,14 @@ function handleCompletedTask(
   }
 }
 
+// The production build bakes NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
+// into the client, so these tests need a real server on that fixed port:
+// page.route cannot reproduce a body that hangs or a caller abort mid-read.
+// A local container or another project may already own 8000, so report that
+// as an explicit skip instead of seven confusing failures. CI has the port.
+let serverReady = false;
+let unavailableReason = "";
+
 test.beforeAll(async () => {
   responseHandler = (_request, response) => {
     sendJson(response, 500, { detail: { error_code: "INTERNAL_ERROR" } });
@@ -106,10 +114,22 @@ test.beforeAll(async () => {
     responseHandler(request, response);
   });
 
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(8000, resolve);
-  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(8000, "127.0.0.1", resolve);
+    });
+    serverReady = true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? "UNKNOWN";
+    unavailableReason =
+      `requires 127.0.0.1:8000 for a real streaming response server; ` +
+      `the port is already in use (${code})`;
+  }
+});
+
+test.beforeEach(() => {
+  test.skip(!serverReady, unavailableReason);
 });
 
 test.afterEach(() => {
@@ -121,6 +141,7 @@ test.afterEach(() => {
 });
 
 test.afterAll(async () => {
+  if (!serverReady) return;
   server.closeAllConnections();
   await new Promise<void>((resolve, reject) => {
     server.close((error) => {
