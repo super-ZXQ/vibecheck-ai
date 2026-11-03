@@ -2,9 +2,9 @@
  * Anonymous per-browser submitter key (task ownership).
  *
  * The key is generated once by this browser, kept in localStorage, and sent
- * as X-Submitter-Key on every task request. The backend records it on the
- * task, so only this browser can read or cancel that task — and a second
- * visitor submitting the same repository gets their own task instead of being
+ * as X-Submitter-Key on every task request. The backend stores a SHA-256
+ * digest of it on the task, so only this browser can read or cancel that task
+ * — and a second visitor submitting the same repository gets their own task instead of being
  * handed the first visitor's task id.
  *
  * It is not an identity: it contains no account, device or user data, and

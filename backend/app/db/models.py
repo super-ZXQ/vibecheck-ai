@@ -86,7 +86,8 @@ class TaskRow(Base):
     deduplication_key: Mapped[str | None] = mapped_column(Text)
     reused_from_task_id: Mapped[str | None] = mapped_column(String(36))
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    # Anonymous per-submitter key from X-Submitter-Key; NULL = no owner recorded.
+    # SHA-256 digest of the browser's X-Submitter-Key (never the raw key);
+    # NULL = no owner recorded.
     submitter_key: Mapped[str | None] = mapped_column(String(64))
 
 

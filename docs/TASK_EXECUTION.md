@@ -74,7 +74,7 @@ with plain `FOR UPDATE`.
 completion (`mark_completed`):
 
 - while queued/running: `normalized_repo_url|active|scanner_version|owner_scope`
-  (`owner_scope` is the submitter key, or `public` when no key was sent)
+  (`owner_scope` is the SHA-256 digest of the submitter key, or `public` when no key was sent)
 - once completed: `normalized_repo_url|resolved_commit_sha|scanner_version`
 
 - Partial unique index `uq_tasks_active_dedup` covers active rows only
@@ -98,9 +98,12 @@ repository, a second visitor was handed the first visitor's `task_id`.
 
 - The browser generates one anonymous key (32 hex chars, `lib/submitter-key.mjs`,
   kept in localStorage) and sends it as `X-Submitter-Key` on every task request.
-- `tasks.submitter_key` records it. Reads (`status`, `result`, `assessment`,
-  `repair-plan`, `llm-analysis`) and `cancel` answer `404 TASK_NOT_FOUND` —
-  identical to an unknown task id — when the key does not match.
+- `tasks.submitter_key` records its SHA-256 digest, never the raw key: a
+  database dump alone cannot be replayed as a bearer credential, while the
+  browser that holds the raw key still matches it exactly.
+- Reads (`status`, `result`, `assessment`, `repair-plan`, `llm-analysis`)
+  and `cancel` answer `404 TASK_NOT_FOUND` — identical to an unknown task id
+  — when the key does not match.
 - Active-task coalescing is scoped to the key, so concurrent submissions of
   the same repository from different browsers create separate tasks. The cost
   control that survives: repeats from the same browser still share one task,

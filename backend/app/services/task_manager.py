@@ -16,6 +16,7 @@ from typing import Any, TypeVar
 from app.core.config import settings
 from app.core.error_codes import get_error_message
 from app.core.scanner_version import SCANNER_VERSION
+from app.core.task_access import hash_submitter_key
 from app.db.repositories import results as result_repo
 from app.db.repositories import tasks as task_repo
 from app.db.repositories.tasks import (
@@ -225,6 +226,9 @@ async def create_task_async(
     async with factory() as session:
         now = _now()
         version = scanner_version or SCANNER_VERSION
+        submitter_digest = (
+            hash_submitter_key(submitter_key) if submitter_key else None
+        )
         row = TaskRow(
             id=str(_uuid.uuid4()),
             repo_url=repo_url,
@@ -238,7 +242,7 @@ async def create_task_async(
             attempt_count=0,
             max_attempts=max_attempts or settings.max_task_attempts,
             scanner_version=version,
-            submitter_key=submitter_key,
+            submitter_key=submitter_digest,
         )
         session.add(row)
         await session.commit()

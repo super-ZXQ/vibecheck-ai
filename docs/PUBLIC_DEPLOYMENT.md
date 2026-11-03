@@ -117,19 +117,24 @@ results remain valid; LLM stage falls back to templates with `source=fallback`.
 
 `X-Submitter-Key` is the second browser-held header. The frontend generates an
 anonymous 32-character key once, stores it in localStorage, and sends it on
-every task request; the backend records it on the task and requires the same
-value to read or cancel it. `allow_headers` in `app/main.py` must keep it or
-browsers cannot send it across origins.
+every task request; the backend stores only its SHA-256 digest and requires
+the same raw value to read or cancel it. `allow_headers` in `app/main.py` must
+keep it or browsers cannot send it across origins.
 
 - Migration `0002_submitter_key` adds one nullable column; no backfill and no
-  downtime. Tasks created before the upgrade stay reachable by task id, which
+  downtime. Tasks created before that upgrade stay reachable by task id, which
   matters only until the retention window passes.
+- Migration `0003_hashed_submitter_key` replaces existing plaintext keys and
+  their active coalescing keys with digests. It is one-way and browsers are
+  unaffected: the same raw key still opens the same tasks. Taking a database
+  dump no longer yields working credentials.
 - Requests with a wrong or absent key get the same `404 TASK_NOT_FOUND` as an
   unknown task, so the check does not confirm existence.
 - A submission without the header records no owner and remains reachable by
   task id alone — an intentional opt-out for API clients, not for the site.
-- The key is never stored server-side beyond that column, never returned, and
-  not an identity: clearing browser data drops access to that browser's tasks.
+- Only the digest is stored; the raw key never reaches the database, is never
+  returned, and is not an identity: clearing browser data drops access to that
+  browser's tasks.
 
 ## Restart behavior
 

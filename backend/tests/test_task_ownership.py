@@ -15,6 +15,7 @@ Ownership model under test:
 import pytest
 from fastapi.testclient import TestClient
 
+from app.core.task_access import hash_submitter_key
 from app.services import task_manager
 
 A_KEY = "aaaaaaaabbbbbbbbccccccccdddddddd"
@@ -88,7 +89,7 @@ class TestSubmitterKeyOnCreate:
                 "/api/check", json={"repo_url": repo}, headers=headers or {}
             )
 
-    def test_key_recorded_on_task(self, test_db):
+    def test_key_recorded_as_digest(self, test_db):
         from app.main import app
 
         with TestClient(app) as client:
@@ -97,7 +98,18 @@ class TestSubmitterKeyOnCreate:
             )
             assert resp.status_code == 202
             task_id = resp.json()["task_id"]
-        assert _row(task_id)[1] == A_KEY
+        _status, stored_key, dedup_key, _ = _row(task_id)
+        assert stored_key == hash_submitter_key(A_KEY)
+        assert len(stored_key) == 64
+        assert A_KEY not in stored_key
+        assert A_KEY not in (dedup_key or "")
+
+    def test_hash_is_stable_and_key_specific(self):
+        first = hash_submitter_key(A_KEY)
+        assert first == hash_submitter_key(A_KEY)
+        assert first != hash_submitter_key(B_KEY)
+        assert len(first) == 64
+        assert set(first) <= set("0123456789abcdef")
 
     def test_missing_key_leaves_task_unowned(self, test_db):
         from app.main import app

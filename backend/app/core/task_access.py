@@ -6,8 +6,9 @@ records which browser submitted a task, so reads and cancels can be scoped
 to that browser instead of to anyone who learns the task id.
 
 Contract:
-- Present and well-formed on submit: stored on the task, and every later
-  read or cancel of that task requires the same value.
+- Present and well-formed on submit: the SHA-256 digest is stored on the
+  task, and every later read or cancel of that task requires the raw value
+  that produces the same digest.
 - Absent on submit: the task records no owner and stays reachable by task id
   alone (the pre-ownership behaviour, kept for API clients that opt out).
 - Present but malformed on submit: 400, because a client that means to be
@@ -16,6 +17,8 @@ Contract:
   failed match never confirms that the task exists.
 """
 
+import hashlib
+import hmac
 import re
 from typing import TYPE_CHECKING, Annotated
 
@@ -28,11 +31,25 @@ if TYPE_CHECKING:
 
 SUBMITTER_KEY_HEADER = "X-Submitter-Key"
 
-# 16-64 URL-safe characters: long enough to be unguessable, short enough to
-# stay inside tasks.submitter_key VARCHAR(64).
+# 16-64 URL-safe characters: long enough to be unguessable.
 _KEY_PATTERN = re.compile(r"[A-Za-z0-9_-]{16,64}")
 
+# Domain separation so the digest cannot be confused with any other SHA-256
+# use of the same string. Versioned in case the scheme ever changes.
+_KEY_HASH_PREFIX = b"vibecheck-submitter-key:v1:"
+
 SubmitterKeyHeader = Annotated[str | None, Header(alias=SUBMITTER_KEY_HEADER)]
+
+
+def hash_submitter_key(key: str) -> str:
+    """Return the 64-character at-rest owner token for a validated key.
+
+    Only the digest reaches the database, so a dump cannot be replayed as a
+    bearer credential: the digest is one-way and the browser key carries 16-64
+    characters of client-generated entropy. The same raw key always hashes to
+    the same token, which keeps coalescing and access checks working.
+    """
+    return hashlib.sha256(_KEY_HASH_PREFIX + key.encode("utf-8")).hexdigest()
 
 
 def parse_submitter_key(raw: str | None) -> str | None:
@@ -70,7 +87,10 @@ def ensure_task_access(task: "TaskRecord", raw: str | None) -> None:
     """
     if task.submitter_key is None:
         return
-    if parse_submitter_key(raw) == task.submitter_key:
+    key = parse_submitter_key(raw)
+    if key is not None and hmac.compare_digest(
+        hash_submitter_key(key), task.submitter_key
+    ):
         return
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,

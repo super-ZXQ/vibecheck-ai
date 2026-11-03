@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.error_codes import DEAD_TASK, TASK_CANCELLED, get_error_message
 from app.core.scanner_version import SCANNER_VERSION
+from app.core.task_access import hash_submitter_key
 from app.db.models import TaskRow
 from app.services import metrics as metrics_mod
 from app.services.task_errors import category_for_error_code, decide_retry
@@ -83,6 +84,11 @@ def normalize_repo_url(repo_url: str) -> str:
     url = (repo_url or "").strip().rstrip("/")
     url = url.removesuffix(".git")
     return url.lower()
+
+
+def _owner_digest(submitter_key: str | None) -> str | None:
+    """Hash a caller-supplied owner key before it reaches rows or keys."""
+    return hash_submitter_key(submitter_key) if submitter_key else None
 
 
 def _admission_scope(submitter_key: str | None) -> str:
@@ -274,6 +280,7 @@ async def admit_repo_task(
     browser's in-flight task, so one visitor cannot read or cancel it. Clients
     that send no key keep sharing one task per repository (cost control).
     """
+    submitter_key = _owner_digest(submitter_key)
     version = scanner_version or SCANNER_VERSION
     normalized = normalize_repo_url(repo_url)
     now = utc_now()
@@ -361,6 +368,7 @@ async def admit_upload_task(
     max_attempts: int | None = None,
     submitter_key: str | None = None,
 ) -> TaskRecord:
+    submitter_key = _owner_digest(submitter_key)
     now = utc_now()
     try:
         from sqlalchemy import text as _text
