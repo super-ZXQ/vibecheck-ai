@@ -111,12 +111,26 @@ jobs:
             echo "FAIL: expected SIGTERM exit code 143"
             exit 1
           fi
-          # Verify port 3001 is free
+          # The npm wrapper exits on SIGTERM before the runner's node child has
+          # finished tearing down the Next dev tree, so poll instead of
+          # sampling once: a fixed check raced cleanup and read a live process.
+          for _ in $(seq 1 60); do
+            if ! ss -tlnp | grep -q ":3001 "; then
+              break
+            fi
+            sleep 0.5
+          done
           if ss -tlnp | grep ":3001 "; then
             echo "FAIL: port 3001 still in use after SIGTERM"
             exit 1
           fi
-          # Verify no orphaned Next.js or Node processes
+          # Verify no orphaned Next.js processes survived the cleanup window.
+          for _ in $(seq 1 40); do
+            if ! pgrep -f "next dev" >/dev/null; then
+              break
+            fi
+            sleep 0.5
+          done
           if pgrep -f "next dev" | grep -v $$; then
             echo "FAIL: orphaned next dev process found"
             pkill -f "next dev" || true
