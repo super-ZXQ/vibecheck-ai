@@ -31,7 +31,11 @@ const openStreamingResponses = new Set<ServerResponse>();
 function corsHeaders() {
   return {
     "Access-Control-Allow-Origin": FRONTEND_ORIGIN,
-    "Access-Control-Allow-Headers": "Content-Type, Accept",
+    // Mirror app/main.py's CORS allow_headers. The client sends the ownership
+    // header on every task request; without it here the browser rejects the
+    // preflight and none of these requests ever reach this server.
+    "Access-Control-Allow-Headers":
+      "Content-Type, Accept, X-LLM-API-KEY, X-LLM-BASE-URL, X-LLM-MODEL, X-Submitter-Key",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Content-Type": "application/json",
   };
