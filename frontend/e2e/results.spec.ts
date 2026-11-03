@@ -36,6 +36,11 @@ test.describe("All results success", () => {
     await expect(page.locator(".score-number")).toContainText("45");
     await expect(page.locator(".score-verdict")).toContainText("不推荐上线");
 
+    // The headline scores blocking issues only; calling it a security score
+    // implied a blend across dimensions that the backend does not compute.
+    await expect(page.locator(".stage-label").first()).toHaveText("阻断项评分");
+    await expect(page.locator("body")).not.toContainText("安全评分");
+
     // Verify scan results tab is active and has content
     await expect(page.locator(".tab-active")).toContainText("扫描结果");
     await expect(page.locator(".findings-table")).toBeVisible();
@@ -45,6 +50,9 @@ test.describe("All results success", () => {
     await expect(page.locator(".tab-active")).toContainText("安全评估");
     // Use .first() because both ScoreSummary and AssessmentDetails have .score-number
     await expect(page.locator(".score-number").first()).toContainText("45");
+    await expect(
+      page.getByText("阻断项评分（封顶后）", { exact: true }),
+    ).toBeVisible();
 
     // Switch to repair plan tab
     await page.locator(".tab", { hasText: "修复计划" }).click();

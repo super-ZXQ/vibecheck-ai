@@ -1,6 +1,9 @@
 /**
- * ScoreSummary — displays the overall security score as an SVG ring
+ * ScoreSummary — displays the blocking-issue score as an SVG ring
  * plus the verdict badge.
+ *
+ * The score only reflects the sensitive-information dimension's blocking
+ * risk; the other scan dimensions are reported but not blended in.
  *
  * Score color thresholds mirror the backend verdict policy:
  *   >= 75 pass (green) / 50-74 warning (amber) / < 50 blocked (red).
@@ -74,7 +77,7 @@ export function ScoreSummary({ taskStatus }: ScoreSummaryProps) {
             height="122"
             viewBox="0 0 122 122"
             role="img"
-            aria-label={`安全评分 ${clamped} 分`}
+            aria-label={`阻断项评分 ${clamped} 分`}
           >
             <defs>
               <linearGradient id={gradientId} x1="0" y1="0" x2="1" y2="1">
@@ -107,7 +110,7 @@ export function ScoreSummary({ taskStatus }: ScoreSummaryProps) {
           </div>
         </div>
         <div>
-          <div className="stage-label">安全评分</div>
+          <div className="stage-label">阻断项评分</div>
           <div>
             <span className={`score-verdict ${verdictClass}`}>
               {verdictLabel}
@@ -124,7 +127,7 @@ export function ScoreSummary({ taskStatus }: ScoreSummaryProps) {
             </div>
           )}
           <div className="score-meta score-scope-note">
-            评分范围：敏感数据安全维度（非综合上线成熟度评分）
+            只计入敏感信息安全维度的阻断风险；未完成内容、可部署性、基础安全、文档一致性暂不计入，不是综合上线成熟度评分。
           </div>
         </div>
       </div>

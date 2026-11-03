@@ -165,7 +165,7 @@ export function ScanResults({ scanResult, llmAnalysis }: ScanResultsProps) {
         </div>
       </div>
       <p className="dimension-score-notice">
-        未完成内容、可部署性、基础安全和文档一致性暂不计入安全评分。
+        敏感信息安全计入阻断项评分；未完成内容、可部署性、基础安全和文档一致性暂不计入。
       </p>
 
       {/* --- Findings --- */}

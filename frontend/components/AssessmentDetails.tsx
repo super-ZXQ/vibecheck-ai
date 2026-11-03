@@ -25,12 +25,12 @@ export function AssessmentDetails({ assessment }: AssessmentDetailsProps) {
       <div className="card">
         <div className="score-display">
           <div>
-            <div className="stage-label">最终评分</div>
+            <div className="stage-label">阻断项评分（封顶后）</div>
             <div className="score-number">{assessment.score}</div>
           </div>
           {assessment.score_before_caps !== assessment.score && (
             <div>
-              <div className="stage-label">扣分前评分</div>
+              <div className="stage-label">封顶前评分</div>
               <div style={{ fontSize: "1.5rem", fontWeight: 600 }}>
                 {assessment.score_before_caps}
               </div>
