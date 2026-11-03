@@ -123,6 +123,12 @@ def get_repair_plan_available_sync(task_id: str) -> bool:
     return bool(_run(_with_session(result_repo.get_repair_plan_available, task_id)))
 
 
+async def get_repair_plan_with_columns_async(
+    task_id: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    return await _with_session(result_repo.get_repair_plan_with_columns, task_id)
+
+
 def save_llm_analysis_sync(task_id: str, payload: dict[str, Any]) -> None:
     async def _save():
         await _with_session(

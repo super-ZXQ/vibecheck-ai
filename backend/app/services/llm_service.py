@@ -62,7 +62,7 @@ _MAX_SNIPPET_CHARS = 500
 # ---------------------------------------------------------------------------
 
 class LLMAnalysisPersistError(Exception):
-    """SQLite persistence failure for LLM analysis."""
+    """PostgreSQL persistence failure for LLM analysis."""
 
 
 class LLMAnalysisTooLargeError(Exception):
@@ -497,7 +497,7 @@ def _save_llm_analysis(
     Returns the safe output dict.
 
     Raises:
-        LLMAnalysisPersistError: If SQLite write fails.
+        LLMAnalysisPersistError: If the PostgreSQL write fails.
         LLMAnalysisTooLargeError: If serialized JSON exceeds size limit.
     """
     if total_llm > 0 and total_fallback > 0:

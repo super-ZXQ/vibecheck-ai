@@ -19,6 +19,7 @@
 16. 安全空修复计划的结构验证（所有字段匹配预期值）
 """
 
+import asyncio
 import json
 import uuid
 
@@ -356,6 +357,34 @@ class TestRepairAPI:
         assert data["summary"]["blocking_repair_groups"] == 1
         assert isinstance(data["repair_groups"], list)
         assert isinstance(data["verification_steps"], list)
+
+    # --- 6b. 异步读取路径 ---
+
+    def test_async_read_matches_sync_read(self, test_db):
+        """get_repair_result_async validates the same plan as the sync path."""
+        from app.services.repair_service import (
+            get_repair_result,
+            get_repair_result_async,
+        )
+
+        task_id = _create_completed_task()
+        _insert_repair_plan(task_id)
+
+        sync_result = get_repair_result(task_id)
+        async_result = asyncio.run(get_repair_result_async(task_id))
+        assert async_result == sync_result
+
+    def test_endpoint_does_not_call_the_sync_facade(self, client, monkeypatch):
+        """The request path stays on the async engine instead of a thread hop."""
+        task_id = _create_completed_task()
+        _insert_repair_plan(task_id)
+
+        def _forbidden(coro):
+            raise AssertionError("request path used the sync thread-pool facade")
+
+        monkeypatch.setattr("app.services.task_manager._run_sync", _forbidden)
+        response = client.get(f"/api/check/{task_id}/repair-plan")
+        assert response.status_code == 200
 
     # --- 7. 409: 已完成任务无修复计划 ---
 

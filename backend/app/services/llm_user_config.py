@@ -2,7 +2,7 @@
 
 SECURITY:
 - Stores the caller-supplied LLM credentials (API key, base URL, model)
-  ONLY in process memory. NEVER persisted to SQLite, disk, or logs.
+  ONLY in process memory. NEVER persisted to PostgreSQL, disk, or logs.
 - Entries are bound to a task_id, cleaned up when the task finishes, and
   pruned by a hard TTL as a safety net for tasks that never complete.
 - A process restart clears everything; no sensitive data survives.

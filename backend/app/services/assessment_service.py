@@ -9,7 +9,7 @@ SECURITY:
 - NEVER executes repository code.
 - NEVER accesses the network.
 - NEVER calls an LLM.
-- Only reads the desensitized result_json / summary_json from SQLite.
+- Only reads the desensitized result_json / summary_json from PostgreSQL.
 - assessment_json output contains NO raw secrets, NO temp paths,
   NO internal exception objects.
 - The persistence boundary (save_assessment_result) applies a SECOND
@@ -121,7 +121,7 @@ class AssessmentInternalError(Exception):
 
 
 class AssessmentPersistError(Exception):
-    """Raised when SQLite assessment persistence fails.
+    """Raised when PostgreSQL assessment persistence fails.
 
     The caller (background_runner) catches this and maps it to the
     fixed error code ASSESSMENT_PERSIST_FAILED.

@@ -11,7 +11,7 @@ GET /api/check/{task_id}/repair-plan:
   P0-6 task without a persisted repair_results row).
 - unknown status: 500 REPAIR_PLAN_INTERNAL_ERROR.
 - Never returns raw secrets, temp paths, or internal exceptions.
-- Full database read and JSON parse via asyncio.to_thread.
+- Full database read and JSON validation run on the request loop (async engine).
 
 The failed check MUST come before any repair_results read. This
 prevents leaking residual repair plans from a partial pipeline where
@@ -19,7 +19,6 @@ generate_and_save_repair_plan persisted the plan but mark_completed
 threw an exception (which would mark the task as failed).
 """
 
-import asyncio
 import uuid
 
 from fastapi import APIRouter, HTTPException, status
@@ -38,14 +37,14 @@ from app.services.repair_policy import (
 )
 from app.services.repair_service import (
     RepairPlanInternalError,
-    get_repair_result,
+    get_repair_result_async,
 )
 from app.services.task_manager import (
     STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_PENDING,
     STATUS_RUNNING,
-    get_task,
+    get_task_async,
 )
 
 router = APIRouter()
@@ -99,7 +98,7 @@ async def get_repair_plan(
     2. pending/running → 409 REPAIR_PLAN_NOT_READY (does NOT read repair_results)
     3. failed → fixed safe empty repair plan (does NOT read repair_results,
        even if a residual record exists from a partial pipeline)
-    4. completed → asyncio.to_thread(get_repair_result)
+    4. completed → await get_repair_result_async
        - repair plan exists → 200 full RepairPlan
        - repair plan missing → 409 REPAIR_PLAN_NOT_AVAILABLE
     5. unknown status → 500 REPAIR_PLAN_INTERNAL_ERROR
@@ -123,8 +122,8 @@ async def get_repair_plan(
             },
         )
 
-    # Get task from database
-    task = get_task(task_id)
+    # Get task from database (request-loop pooled engine, no thread hop)
+    task = await get_task_async(task_id)
     if task is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -152,10 +151,10 @@ async def get_repair_plan(
     if task.status == STATUS_FAILED:
         return _build_safe_empty_repair_plan(task_id)
 
-    # --- Case 4: completed → read repair plan via asyncio.to_thread ---
+    # --- Case 4: completed → read repair plan on the request loop ---
     if task.status == STATUS_COMPLETED:
         try:
-            result = await asyncio.to_thread(get_repair_result, task_id)
+            result = await get_repair_result_async(task_id)
         except RepairPlanInternalError:
             # Corrupted or invalid repair plan JSON — return fixed 500.
             raise HTTPException(

@@ -1,7 +1,7 @@
 """Repair plan engine — deterministic repair plan generation from persisted results.
 
 This module reads ALREADY-PERSISTED, ALREADY-DESENSITIZED scan results
-(P0-5) and assessment results (P0-6) from SQLite and computes a
+(P0-5) and assessment results (P0-6) from PostgreSQL and computes a
 deterministic repair plan.
 
 SECURITY:
@@ -28,9 +28,9 @@ DETERMINISM:
 - Only created_at, updated_at, and task_id may differ between runs.
 
 ASYNC:
-- Database reads/writes and repair plan computation are synchronous.
-- Callers MUST wrap them in asyncio.to_thread() to avoid blocking
-  the FastAPI event loop.
+- The request read path (get_repair_result_async) uses the pooled async engine.
+- Generation, persistence, and legacy reads are synchronous; callers MUST
+  wrap them in asyncio.to_thread() to avoid blocking the FastAPI event loop.
 """
 
 from __future__ import annotations
@@ -92,7 +92,7 @@ class RepairPlanInternalError(Exception):
 
 
 class RepairPlanPersistError(Exception):
-    """Raised when SQLite repair plan persistence fails.
+    """Raised when PostgreSQL repair plan persistence fails.
 
     The caller (background_runner) catches this and maps it to the
     fixed error code REPAIR_PLAN_PERSIST_FAILED.
@@ -427,7 +427,7 @@ def _safe_masked_desc(value: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
-# --- Input boundary: read persisted results from SQLite ---
+# --- Input boundary: read persisted results from PostgreSQL ---
 # ---------------------------------------------------------------------------
 
 def _read_scan_result(task_id: str) -> tuple[dict, dict, str]:
@@ -472,7 +472,7 @@ def _read_scan_result(task_id: str) -> tuple[dict, dict, str]:
 
 def _read_assessment(task_id: str) -> tuple[dict, str, str, str]:
     """Read persisted assessment, updated_at, policy_version, and
-    source_scan_updated_at from SQLite.
+    source_scan_updated_at from PostgreSQL.
 
     Returns:
         (assessment_dict, assessment_updated_at, assessment_policy_version,
@@ -2109,7 +2109,7 @@ def save_repair_result(
 ) -> dict:
     """Persist a repair plan to the repair_results table.
 
-    Uses SQLite native upsert (INSERT ON CONFLICT DO UPDATE):
+    Uses a PostgreSQL upsert (INSERT ON CONFLICT DO UPDATE):
     - created_at is preserved on update (only set on first INSERT).
     - updated_at is always refreshed.
 
@@ -2259,7 +2259,7 @@ def _validate_persisted_repair_plan(
     task_id: str,
     db_columns: dict,
 ) -> dict:
-    """Strictly validate a persisted repair plan read from SQLite.
+    """Strictly validate a persisted repair plan read from PostgreSQL.
 
     Validates ALL top-level fields, summary fields, each repair_group,
     agent_prompt, and JSON/DB column consistency.
@@ -2831,8 +2831,43 @@ def _validate_persisted_repair_plan(
     return result
 
 
+def _read_columns(task_id: str, values: dict) -> dict:
+    """Normalize the authoritative column values the validator compares."""
+    return {
+        "task_id": task_id,
+        "plan_status": values["plan_status"],
+        "total_repair_groups": values["total_repair_groups"],
+        "blocking_repair_groups": values["blocking_repair_groups"],
+        "source_scan_updated_at": _iso_ts(values["source_scan_updated_at"]),
+        "source_assessment_updated_at": _iso_ts(
+            values["source_assessment_updated_at"]
+        ),
+        "source_assessment_policy_version": values[
+            "source_assessment_policy_version"
+        ],
+        "created_at": _iso_ts(values["created_at"]),
+        "updated_at": _iso_ts(values["updated_at"]),
+    }
+
+
+def _validate_repair_read(data: Any, task_id: str, values: dict) -> dict:
+    """Validate a persisted plan against the row columns both paths share."""
+    if not isinstance(data, dict):
+        raise RepairPlanInternalError("Failed to parse repair plan JSON")
+    try:
+        return _validate_persisted_repair_plan(
+            data, task_id, _read_columns(task_id, values)
+        )
+    except RepairPlanInternalError:
+        raise
+    except KeyError as exc:
+        raise RepairPlanInternalError(f"Repair plan missing field: {exc}") from None
+    except Exception:
+        raise RepairPlanInternalError("Failed to validate repair plan")
+
+
 def get_repair_result(task_id: str) -> dict | None:
-    """Read persisted repair plan + validate against real DB columns."""
+    """Sync read of a persisted repair plan (tests and thread-based callers)."""
     from app.services.result_repository import get_repair_plan_sync
 
     init_db()
@@ -2844,8 +2879,6 @@ def get_repair_result(task_id: str) -> dict | None:
         raise RepairPlanInternalError("Failed to parse repair plan JSON")
     if data is None:
         return None
-    if not isinstance(data, dict):
-        raise RepairPlanInternalError("Failed to parse repair plan JSON")
 
     # Authoritative DB column values (not copied from JSON) for consistency checks.
     conn = _get_connection()
@@ -2861,29 +2894,35 @@ def get_repair_result(task_id: str) -> dict | None:
         conn.close()
     if row is None:
         raise RepairPlanInternalError("Repair plan row missing")
-    db_columns = {
-        "task_id": task_id,
+    values = {
         "plan_status": row["plan_status"],
         "total_repair_groups": row["total_repair_groups"],
         "blocking_repair_groups": row["blocking_repair_groups"],
-        "source_scan_updated_at": _iso_ts(row["source_scan_updated_at"]),
-        "source_assessment_updated_at": _iso_ts(
-            row["source_assessment_updated_at"]
-        ),
+        "source_scan_updated_at": row["source_scan_updated_at"],
+        "source_assessment_updated_at": row["source_assessment_updated_at"],
         "source_assessment_policy_version": row[
             "source_assessment_policy_version"
         ],
-        "created_at": _iso_ts(row["created_at"]),
-        "updated_at": _iso_ts(row["updated_at"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
     }
+    return _validate_repair_read(data, task_id, values)
+
+
+async def get_repair_result_async(task_id: str) -> dict | None:
+    """Async read path for request handlers: pooled engine, no thread hop."""
+    from app.services.result_repository import get_repair_plan_with_columns_async
+
     try:
-        return _validate_persisted_repair_plan(data, task_id, db_columns)
+        data, values = await get_repair_plan_with_columns_async(task_id)
     except RepairPlanInternalError:
         raise
-    except KeyError as exc:
-        raise RepairPlanInternalError(f"Repair plan missing field: {exc}") from None
     except Exception:
-        raise RepairPlanInternalError("Failed to validate repair plan")
+        raise RepairPlanInternalError("Failed to parse repair plan JSON")
+    if data is None or values is None:
+        return None
+    return _validate_repair_read(data, task_id, values)
+
 
 def get_repair_plan_available(task_id: str) -> bool:
     """Lightweight check for status polling — True if repair plan exists."""

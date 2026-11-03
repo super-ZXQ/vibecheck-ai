@@ -251,6 +251,39 @@ async def get_repair_plan(session: AsyncSession, task_id: str) -> dict[str, Any]
     return dict(raw)
 
 
+async def get_repair_plan_with_columns(
+    session: AsyncSession, task_id: str
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Return the parsed repair plan plus the authoritative row columns.
+
+    The read-path validator compares the JSON against these columns, so they
+    must come from the row itself — never from the JSON payload.
+    """
+    row = await session.get(RepairResultRow, task_id)
+    if row is None:
+        return None, None
+    raw = row.repair_json
+    if raw is None:
+        return None, None
+    if isinstance(raw, dict):
+        data = dict(raw)
+    elif isinstance(raw, str):
+        data = json.loads(raw)
+    else:
+        data = dict(raw)
+    columns = {
+        "plan_status": row.plan_status,
+        "total_repair_groups": row.total_repair_groups,
+        "blocking_repair_groups": row.blocking_repair_groups,
+        "source_scan_updated_at": row.source_scan_updated_at,
+        "source_assessment_updated_at": row.source_assessment_updated_at,
+        "source_assessment_policy_version": row.source_assessment_policy_version,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }
+    return data, columns
+
+
 async def save_repair_plan(
     session: AsyncSession,
     task_id: str,
