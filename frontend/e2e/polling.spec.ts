@@ -5,13 +5,14 @@
  * 2. queued → completed progress change
  * 3. failed with fixed safe error
  * 8. Network error and retry
- * 9. Poll timeout without waiting 5 minutes
+ * 9. Poll deadline expiry and 继续等待 resume
  * 14. Page unload stops polling
  * 15. No overlapping poll requests
  */
 
 import { expect, test } from "@playwright/test";
 
+import { DEFAULT_POLL_TIMEOUT_MS } from "../lib/polling-config.mjs";
 import {
   API_BASE,
   TEST_TASK_ID,
@@ -184,7 +185,7 @@ test.describe("Network error retry", () => {
     await page.clock.fastForward(2_001);
     await expect.poll(() => callCount).toBeGreaterThanOrEqual(2);
 
-    await page.clock.fastForward(298_000);
+    await page.clock.fastForward(DEFAULT_POLL_TIMEOUT_MS - 2_000);
     await expect(page.locator(".page-title")).toContainText("检测超时");
     const callsAtDeadline = callCount;
 
@@ -194,11 +195,13 @@ test.describe("Network error retry", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Test 9: Poll timeout without waiting 5 minutes
+// Test 9: Poll deadline and 继续等待 resume
 // ---------------------------------------------------------------------------
 
 test.describe("Poll timeout", () => {
-  test("enters timeout state without waiting five minutes", async ({ page }) => {
+  test("expires at the shared deadline and resumes the same task", async ({
+    page,
+  }) => {
     await page.clock.install();
 
     // Mock status to always return pending (never completes)
@@ -215,10 +218,39 @@ test.describe("Poll timeout", () => {
     // Verify polling starts
     await expect(page.locator(".card")).toContainText("排队中", { timeout: 10_000 });
 
-    // Jump past the production timeout. Only the due recursive timer fires.
-    await page.clock.fastForward(300_001);
+    // Jump past the shared production deadline. Only the due timers fire.
+    await page.clock.fastForward(DEFAULT_POLL_TIMEOUT_MS + 1);
     await expect(page.locator(".page-title")).toContainText("检测超时");
-    await expect(page.locator(".error-box")).toContainText("检测超时");
+    await expect(page.locator(".error-box")).toContainText("任务可能仍在后台运行");
+    await expect(page.getByRole("link", { name: "重新检测" })).toBeVisible();
+
+    // The task id is the URL, so resuming polls the same task instead of
+    // throwing away a run that is still alive on the backend.
+    await page.getByRole("button", { name: "继续等待", exact: true }).click();
+    await expect(page.locator(".page-title")).toContainText("检测进行中");
+    await expect(page.locator(".card")).toContainText("排队中");
+
+    // The resumed session gets a fresh deadline, not an already-expired one.
+    await page.clock.fastForward(100_000);
+    await expect(page.locator(".page-title")).toContainText("检测进行中");
+  });
+
+  test("重新检测 from the timeout screen returns to an empty form", async ({
+    page,
+  }) => {
+    await page.clock.install();
+    await page.route(`${API_BASE}/api/check/${TEST_TASK_ID}`, (route) => {
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(mockPendingStatus),
+      });
+    });
+
+    await page.goto(`/check/${TEST_TASK_ID}`);
+    await expect(page.locator(".card")).toContainText("排队中", { timeout: 10_000 });
+    await page.clock.fastForward(DEFAULT_POLL_TIMEOUT_MS + 1);
+
     await page.getByRole("link", { name: "重新检测" }).click();
     await expect(page).toHaveURL("/");
     await expect(page.getByLabel("GitHub 仓库地址")).toHaveValue("");

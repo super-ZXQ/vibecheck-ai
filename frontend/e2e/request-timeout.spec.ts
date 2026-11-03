@@ -2,6 +2,7 @@ import { expect, test } from "@playwright/test";
 import type { Page, Route } from "@playwright/test";
 
 import { NETWORK_ERROR_MESSAGE } from "../lib/error-messages";
+import { DEFAULT_POLL_TIMEOUT_MS } from "../lib/polling-config.mjs";
 import {
   API_BASE,
   TEST_TASK_ID,
@@ -141,7 +142,7 @@ test("the hard deadline aborts the active status request and stops later polls",
   if (!firstStatusRoute) throw new Error("Expected the initial status request");
   await fulfillJson(firstStatusRoute, mockPendingStatus);
 
-  await page.clock.fastForward(298_999);
+  await page.clock.fastForward(DEFAULT_POLL_TIMEOUT_MS - 1_001);
   await expect(page.locator(".page-title")).toHaveText("检测进行中");
   const failuresBeforeDeadline = failedStatusRequests;
 
@@ -190,7 +191,7 @@ test("completion before the hard deadline keeps result loading alive", async ({
   if (!firstStatusRoute) throw new Error("Expected the initial status request");
   await fulfillJson(firstStatusRoute, mockPendingStatus);
 
-  await page.clock.fastForward(290_000);
+  await page.clock.fastForward(DEFAULT_POLL_TIMEOUT_MS - 10_000);
   await expect.poll(() => activeStatusRoute).not.toBeNull();
   await page.clock.fastForward(8_999);
 
@@ -223,7 +224,7 @@ test("failed status clears the hard deadline", async ({ page }) => {
   await expect(page.locator(".page-title")).toHaveText("检测失败");
   const requestsAfterFailure = statusRequests;
 
-  await page.clock.fastForward(300_001);
+  await page.clock.fastForward(DEFAULT_POLL_TIMEOUT_MS + 1);
 
   await expect(page.locator(".page-title")).toHaveText("检测失败");
   expect(statusRequests).toBe(requestsAfterFailure);
@@ -252,7 +253,7 @@ test("an old task deadline cannot stop the replacement task session", async ({
   await expect.poll(() => newTaskRequests).toBe(1);
   const oldRequestsAfterReplacement = oldTaskRequests;
 
-  await page.clock.fastForward(299_000);
+  await page.clock.fastForward(DEFAULT_POLL_TIMEOUT_MS - 1_000);
 
   await expect(page.locator(".page-title")).toHaveText("检测进行中");
   expect(oldTaskRequests).toBe(oldRequestsAfterReplacement);
@@ -313,7 +314,7 @@ test("caller abort on page unload stays silent and sends no later request", asyn
   await expect.poll(() => statusRequests).toBe(1);
 
   await page.goto("/");
-  await page.clock.fastForward(300_001);
+  await page.clock.fastForward(DEFAULT_POLL_TIMEOUT_MS + 1);
 
   await expect(page.locator(".error-box")).toHaveCount(0);
   expect(statusRequests).toBe(1);

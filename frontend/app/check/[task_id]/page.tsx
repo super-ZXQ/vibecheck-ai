@@ -176,9 +176,18 @@ export default function CheckPage() {
     return (
       <main className="container">
         <h1 className="page-title">检测超时</h1>
-        <ErrorState message="检测超时，请稍后重试。" />
+        <ErrorState message="已停止获取进度，任务可能仍在后台运行。可继续等待，或稍后重新打开本页查看结果。" />
         <div className="page-header-actions">
-          <Link href="/" className="btn btn-primary">
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={() => {
+              startPolling(taskId);
+            }}
+          >
+            继续等待
+          </button>
+          <Link href="/" className="btn btn-secondary">
             重新检测
           </Link>
           <Link href="/" className="btn btn-secondary">

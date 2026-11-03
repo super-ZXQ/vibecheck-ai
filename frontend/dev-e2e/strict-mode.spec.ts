@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 
+import { DEFAULT_POLL_TIMEOUT_MS } from "../lib/polling-config.mjs";
 import {
   API_BASE,
   TEST_TASK_ID,
@@ -139,7 +140,7 @@ test("Strict Mode replay leaves one effective hard deadline", async ({
   await page.goto(`/check/${TEST_TASK_ID}`);
   await expect.poll(() => statusRequests).toBeGreaterThanOrEqual(1);
 
-  await page.clock.fastForward(299_000);
+  await page.clock.fastForward(DEFAULT_POLL_TIMEOUT_MS - 1_000);
   await expect(page.locator(".page-title")).toHaveText("检测进行中");
 
   await page.clock.fastForward(1_000);

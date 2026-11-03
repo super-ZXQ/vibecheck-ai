@@ -27,6 +27,10 @@ import {
   getErrorMessage,
   NETWORK_ERROR_MESSAGE,
 } from "@/lib/error-messages";
+import {
+  DEFAULT_POLL_INTERVAL_MS,
+  DEFAULT_POLL_TIMEOUT_MS,
+} from "@/lib/polling-config.mjs";
 import type {
   AssessmentResult,
   LLMAnalysisResult,
@@ -34,9 +38,6 @@ import type {
   ScanResult,
   TaskStatusResponse,
 } from "@/lib/types";
-
-const DEFAULT_POLL_INTERVAL_MS = 2000;
-const DEFAULT_POLL_TIMEOUT_MS = 300_000;
 
 export type UIState =
   | "idle"
