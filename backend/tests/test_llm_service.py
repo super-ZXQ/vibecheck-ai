@@ -381,6 +381,9 @@ class TestLLMAPICall:
             def __exit__(self, *args):
                 return False
 
+            def geturl(self):
+                return "https://api.deepseek.com/chat/completions"
+
             def read(self):
                 return json.dumps(
                     {"choices": [{"message": {"content": "ok"}}]}

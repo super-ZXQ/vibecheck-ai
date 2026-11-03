@@ -1346,19 +1346,9 @@ def get_assessment_score_verdict(
     return get_assessment_score_verdict_sync(task_id)
 
 
-def get_assessment_result(task_id: str) -> dict[str, Any] | None:
-    """Read persisted assessment via SQLAlchemy result repository."""
-    from app.services.result_repository import get_assessment_sync
-
-    try:
-        init_db()
-        result = get_assessment_sync(task_id)
-    except AssessmentInternalError:
-        raise
-    except Exception:
-        raise AssessmentInternalError(
-            "Failed to read assessment from database"
-        )
+def _validate_persisted_assessment(
+    result: Any, task_id: str
+) -> dict[str, Any] | None:
     if result is None:
         return None
     if not isinstance(result, dict):
@@ -1379,6 +1369,35 @@ def get_assessment_result(task_id: str) -> dict[str, Any] | None:
         raise AssessmentInternalError("Assessment verdict invalid")
     _normalize_score_breakdown(result.get("score_breakdown", []))
     return result
+
+
+def get_assessment_result(task_id: str) -> dict[str, Any] | None:
+    """Read persisted assessment via SQLAlchemy result repository."""
+    from app.services.result_repository import get_assessment_sync
+
+    try:
+        init_db()
+        result = get_assessment_sync(task_id)
+    except AssessmentInternalError:
+        raise
+    except Exception:
+        raise AssessmentInternalError(
+            "Failed to read assessment from database"
+        )
+    return _validate_persisted_assessment(result, task_id)
+
+
+async def get_assessment_result_async(task_id: str) -> dict[str, Any] | None:
+    """Awaitable variant for request handlers, avoiding the sync thread-pool hop."""
+    from app.services.result_repository import get_assessment_async
+
+    try:
+        result = await get_assessment_async(task_id)
+    except AssessmentInternalError:
+        raise
+    except Exception:
+        raise AssessmentInternalError("Failed to read assessment from database")
+    return _validate_persisted_assessment(result, task_id)
 
 
 # ---------------------------------------------------------------------------

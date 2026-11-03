@@ -16,9 +16,13 @@ THREADING:
 
 from __future__ import annotations
 
+import ipaddress
 import logging
+import re
+import socket
 import threading
 import time
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +33,22 @@ _USER_CONFIG_TTL_SECONDS = 4 * 3600
 _MAX_API_KEY_CHARS = 1000
 _MAX_BASE_URL_CHARS = 500
 _MAX_MODEL_CHARS = 200
+
+# A public API endpoint is at least two labels with an alphabetic top-level
+# label. This also rejects decimal/hex octet encodings such as 2130706433 and
+# 0x7f.0.0.1, and dotless container names such as "postgres".
+_HOSTNAME_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+_HOSTNAME_RE = re.compile(rf"(?:{_HOSTNAME_LABEL}\.)+[a-z]{{2,63}}")
+
+# RFC 6762 / RFC 6761 names that never identify a public service.
+_RESERVED_HOST_SUFFIXES = (
+    ".local",
+    ".localhost",
+    ".internal",
+    ".cluster.local",
+    ".home.arpa",
+    ".onion",
+)
 
 _LOCK = threading.Lock()
 _STORE: dict[str, dict] = {}
@@ -47,20 +67,68 @@ def _prune_locked() -> None:
 
 
 def _valid_base_url(raw: str) -> bool:
-    """A user-supplied base URL must be http(s) with no embedded credentials.
+    """A user-supplied base URL must be a public HTTPS API endpoint.
 
-    Rejects javascript:, file:, credentials (user:pass@), fragments, and
-    anything longer than the limit. Non-HTTP schemes would fail the
-    urllib request anyway, but we fail fast and drop the entry.
+    The caller controls this URL and the worker fetches it from inside the
+    deployment network, so it is an SSRF surface: an operator's own
+    ``llm_base_url`` may point anywhere, but a browser-supplied header may not.
+
+    Enforced here (deterministic, no DNS): HTTPS only, no embedded
+    credentials, a real dotted hostname, and no address in a non-global range.
+    Obfuscated forms (``2130706433``, ``0x7f.0.0.1``) fall out of the hostname
+    shape check. Names that *resolve* to an internal address are handled at
+    request time by :func:`is_public_endpoint`.
     """
     if len(raw) > _MAX_BASE_URL_CHARS:
         return False
-    lowered = raw.lower()
-    if not (lowered.startswith(("https://", "http://"))):
+    if "@" in raw:
+        # Embedded credentials are forbidden (defense in depth: the key itself
+        # is sent via the Authorization header, never in the URL).
         return False
-    # Embedded credentials are forbidden (defense in depth: the key itself
-    # is sent via the Authorization header, never in the URL).
-    return "@" not in raw
+    if not raw.lower().startswith("https://"):
+        return False
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return False
+    host = parsed.hostname
+    if not host or not _HOSTNAME_RE.fullmatch(host):
+        return False
+    return not host.endswith(_RESERVED_HOST_SUFFIXES)
+
+
+def is_public_endpoint(raw: str) -> bool:
+    """Resolve a validated base URL and require every address to be global.
+
+    Guards against a public hostname pointing at loopback or the link-local
+    metadata address. Returns False on resolution failure — an endpoint we
+    cannot place is an endpoint we do not call.
+    """
+    try:
+        parsed = urlsplit(raw)
+        host = parsed.hostname
+        if not host:
+            return False
+        try:
+            literal = ipaddress.ip_address(host)
+        except ValueError:
+            literal = None
+        if literal is not None:
+            return literal.is_global
+        records = socket.getaddrinfo(host, parsed.port or 443)
+    except (OSError, ValueError):
+        return False
+    if not records:
+        return False
+    for record in records:
+        address = record[4][0]
+        try:
+            resolved = ipaddress.ip_address(address)
+        except ValueError:
+            return False
+        if not resolved.is_global:
+            return False
+    return True
 
 
 def store_user_config(

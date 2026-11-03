@@ -116,7 +116,7 @@ class TestStoreBasics:
         assert llm_user_config.count_user_configs() == 0
 
     def test_get_private_key_not_exposed(self):
-        llm_user_config.store_user_config("task-1", "k", "https://b", "m")
+        llm_user_config.store_user_config("task-1", "k", "https://b.example.com", "m")
         entry = llm_user_config.get_user_config("task-1")
         assert "_created" not in entry
 
@@ -146,6 +146,104 @@ class TestStoreValidation:
             "task-1", "k", "https://" + "a" * 600, "m"
         )
         assert llm_user_config.get_user_config("task-1") is None
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            # Cleartext would ship the bearer token unencrypted and lets a
+            # plain host/port reach internal services.
+            "http://api.example.com/v1",
+            # Loopback and link-local metadata, as IP literals.
+            "https://127.0.0.1:8000/v1",
+            "https://169.254.169.254/latest/meta-data",
+            "https://[::1]/v1",
+            "https://10.0.0.5/v1",
+            # Obfuscated encodings of 127.0.0.1.
+            "https://2130706433/v1",
+            "https://0x7f.0.0.1/v1",
+            # Dotless container/service names on the docker network.
+            "https://postgres:5432/v1",
+            "https://localhost:6379/v1",
+            # Reserved special-use suffixes.
+            "https://redis.internal/v1",
+            "https://api.local/v1",
+            "https://metadata.google.internal/v1",
+        ],
+    )
+    def test_rejects_internal_and_non_https_base_url(self, base_url):
+        """A header-supplied base URL is an SSRF surface, not a preference.
+
+        The worker issues the request from inside the deployment network with
+        the caller's bearer key attached, so anything that can name an internal
+        host must be dropped before the task runs.
+        """
+        llm_user_config.store_user_config("task-1", "k", base_url, "m")
+        assert llm_user_config.get_user_config("task-1") is None
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "https://api.openai.com/v1",
+            "https://api.deepseek.com",
+            "https://LLM.Example.COM/v1/",
+        ],
+    )
+    def test_accepts_public_https_base_url(self, base_url):
+        llm_user_config.store_user_config("task-1", "k", base_url, "m")
+        assert llm_user_config.get_user_config("task-1")["base_url"] == base_url
+
+
+class TestPublicEndpointResolution:
+    """DNS-time check for names that point at non-global addresses."""
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://127.0.0.1/v1/chat/completions",
+            "https://169.254.169.254/v1/chat/completions",
+            "https://[::1]/v1/chat/completions",
+            "https://10.20.30.40/v1/chat/completions",
+        ],
+    )
+    def test_rejects_non_global_ip_literals(self, url):
+        assert llm_user_config.is_public_endpoint(url) is False
+
+    def test_accepts_publicly_resolved_name(self, monkeypatch):
+        monkeypatch.setattr(
+            llm_user_config.socket,
+            "getaddrinfo",
+            lambda host, port: [(2, 1, 6, "", ("93.184.216.34", 443))],
+        )
+        assert llm_user_config.is_public_endpoint("https://llm.example.com/v1")
+
+    def test_rejects_name_resolving_to_loopback(self, monkeypatch):
+        """DNS rebinding style: public name, private answer."""
+        monkeypatch.setattr(
+            llm_user_config.socket,
+            "getaddrinfo",
+            lambda host, port: [(2, 1, 6, "", ("127.0.0.1", 443))],
+        )
+        assert not llm_user_config.is_public_endpoint("https://evil.example.com/v1")
+
+    def test_rejects_when_any_answer_is_private(self, monkeypatch):
+        monkeypatch.setattr(
+            llm_user_config.socket,
+            "getaddrinfo",
+            lambda host, port: [
+                (2, 1, 6, "", ("93.184.216.34", 443)),
+                (2, 1, 6, "", ("192.168.1.1", 443)),
+            ],
+        )
+        assert not llm_user_config.is_public_endpoint("https://evil.example.com/v1")
+
+    def test_rejects_unresolvable_name(self, monkeypatch):
+        import socket as _socket
+
+        def raise_gaierror(host, port):
+            raise _socket.gaierror("named used for node does not resolve")
+
+        monkeypatch.setattr(llm_user_config.socket, "getaddrinfo", raise_gaierror)
+        assert not llm_user_config.is_public_endpoint("https://gone.example/v1")
 
     def test_rejects_oversized_api_key(self):
         llm_user_config.store_user_config(
@@ -308,11 +406,17 @@ class TestResolveConfig:
 
 
 class FakeLLMResponse:
+    def __init__(self, url: str):
+        self._url = url
+
     def __enter__(self):
         return self
 
     def __exit__(self, *args):
         return False
+
+    def geturl(self) -> str:
+        return self._url
 
     def read(self):
         return (
@@ -330,9 +434,12 @@ class TestCallLlmApiUserConfig:
             captured["url"] = req.full_url
             captured["auth"] = req.get_header("Authorization")
             captured["body"] = json.loads(req.data.decode("utf-8"))
-            return FakeLLMResponse()
+            return FakeLLMResponse(req.full_url)
 
         monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+        monkeypatch.setattr(
+            "app.services.llm_service.is_public_endpoint", lambda url: True
+        )
         # Server config is stale; only the user config is set.
         monkeypatch.setattr("app.core.config.settings.llm_enabled", False)
         result = _call_llm_api(
@@ -348,13 +455,87 @@ class TestCallLlmApiUserConfig:
         assert captured["auth"] == "Bearer user-key"
         assert captured["body"]["model"] == "user-model"
 
+    def test_user_base_url_rejected_when_not_public(self, monkeypatch):
+        """The DNS-time guard must stop the request, not just warn."""
+        called = []
+
+        def fake_urlopen(req, timeout=None):
+            called.append(req.full_url)
+            return FakeLLMResponse(req.full_url)
+
+        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+        monkeypatch.setattr(
+            "app.services.llm_service.is_public_endpoint", lambda url: False
+        )
+        monkeypatch.setattr("app.core.config.settings.llm_enabled", False)
+        result = _call_llm_api(
+            "prompt",
+            user_config={
+                "api_key": "user-key",
+                "base_url": "https://rebinding.example.com/v1",
+                "model": "user-model",
+            },
+        )
+        assert result is None
+        assert called == []
+
+    def test_server_base_url_is_not_subject_to_user_guard(self, monkeypatch):
+        """Operators may run a private LLM gateway; only headers are policed."""
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            return FakeLLMResponse(req.full_url)
+
+        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+        def guard_must_not_run(url: str) -> bool:
+            raise AssertionError("public-endpoint guard ran for a server URL")
+
+        monkeypatch.setattr(
+            "app.services.llm_service.is_public_endpoint", guard_must_not_run
+        )
+        monkeypatch.setattr("app.core.config.settings.llm_enabled", True)
+        monkeypatch.setattr(
+            "app.core.config.settings.llm_base_url", "http://llm.internal/v1"
+        )
+        monkeypatch.setattr("app.core.config.settings.llm_api_key", "srv-key")
+        monkeypatch.setattr("app.core.config.settings.llm_model", "srv-model")
+        result = _call_llm_api("prompt", user_config=None)
+        assert result is not None
+        assert captured["url"] == "http://llm.internal/v1/chat/completions"
+
+    def test_redirect_to_other_host_is_discarded(self, monkeypatch):
+        """urllib follows redirects; a body from another host is not returned."""
+
+        class RedirectingResponse(FakeLLMResponse):
+            def geturl(self):
+                return "https://169.254.169.254/latest/meta-data"
+
+        monkeypatch.setattr(
+            "app.services.llm_service.is_public_endpoint", lambda url: True
+        )
+        monkeypatch.setattr(
+            "urllib.request.urlopen",
+            lambda req, timeout=None: RedirectingResponse(req.full_url),
+        )
+        monkeypatch.setattr("app.core.config.settings.llm_enabled", False)
+        result = _call_llm_api(
+            "prompt",
+            user_config={
+                "api_key": "user-key",
+                "base_url": "https://redirecting.example.com/v1",
+                "model": "user-model",
+            },
+        )
+        assert result is None
+
     def test_partial_user_config_does_not_override(self, monkeypatch):
         captured = {}
 
         def fake_urlopen(request, timeout=60):
             captured["url"] = request.full_url
             captured["auth"] = request.get_header("Authorization")
-            return FakeLLMResponse()
+            return FakeLLMResponse(request.full_url)
 
         monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
         monkeypatch.setattr("app.core.config.settings.llm_enabled", True)

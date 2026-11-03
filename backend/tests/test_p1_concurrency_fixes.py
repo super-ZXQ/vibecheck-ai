@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -20,6 +24,8 @@ from app.services.task_manager import (
     get_pending_count,
     get_task,
     mark_completed,
+    mark_dead,
+    mark_failed,
     recover_expired_tasks,
     request_cancel,
     touch_heartbeat,
@@ -187,11 +193,36 @@ class TestRuntimeReaper:
         assert get_task(task.id).status == "running"
 
     @pytest.mark.asyncio
-    async def test_dispatcher_loop_contains_reaper_hook(self, test_db, monkeypatch):
-        # Ensure dispatcher module references recover_expired_tasks
-        import inspect
-        src = inspect.getsource(background_runner._dispatcher_loop)
-        assert "recover_expired_tasks" in src
+    async def test_dispatcher_loop_runs_the_lease_reaper(self, test_db, monkeypatch):
+        """The reaper must fire from inside the dispatcher, not only at startup."""
+        calls: list[float] = []
+
+        async def counting_reaper():
+            calls.append(time.monotonic())
+            return {"requeued": 0, "dead": 0}
+
+        async def fake_worker(task_id, claim_token=None):
+            return None
+
+        monkeypatch.setattr(
+            background_runner, "recover_expired_tasks_async", counting_reaper
+        )
+        monkeypatch.setattr(background_runner, "_run_claimed_task", fake_worker)
+        monkeypatch.setattr(background_runner, "_stopping", False)
+        monkeypatch.setattr(settings, "lease_reaper_seconds", 1)
+        monkeypatch.setattr(settings, "dispatcher_poll_seconds", 0.05)
+
+        dispatcher = asyncio.create_task(background_runner._dispatcher_loop())
+        try:
+            deadline = time.monotonic() + 5
+            while len(calls) < 2 and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+        finally:
+            dispatcher.cancel()
+            await asyncio.gather(dispatcher, return_exceptions=True)
+
+        assert len(calls) >= 2, "dispatcher never re-ran the lease reaper"
+        assert calls[1] - calls[0] < 2.0, "reaper ignored LEASE_REAPER_SECONDS"
 
 
 class TestCleanupBoundary:
@@ -213,22 +244,49 @@ class TestCleanupBoundary:
     def test_cleanup_rejects_traversal(self, test_db, monkeypatch):
         monkeypatch.setattr(settings, "app_env", "production")
         assert background_runner._cleanup_task_dir("t", Path("/")) is False
-        assert background_runner._cleanup_task_dir(
-            "t", Path(settings.tmp_dir) / ".." / "escape"
-        ) is False or True  # resolve may land outside → False
+        # `..` escapes settings.tmp_dir, so resolve() lands outside the root.
+        escaping = Path(settings.tmp_dir) / ".." / "escape"
+        assert escaping.resolve().parent != Path(settings.tmp_dir).resolve()
+        assert background_runner._cleanup_task_dir("t", escaping) is False
         # Explicit outside path after resolve
         outside = Path(settings.tmp_dir).resolve().parent / "other-app"
         outside.mkdir(parents=True, exist_ok=True)
         assert background_runner._cleanup_task_dir("t", outside) is False
 
-    def test_cleanup_failure_metric_no_path_leak(self, test_db, monkeypatch, caplog):
+    def test_cleanup_failure_metric_no_path_leak(
+        self, test_db, monkeypatch, caplog
+    ):
         monkeypatch.setattr(settings, "app_env", "production")
         secret_path = Path(settings.tmp_dir).parent / "sensitive-name"
-        # don't create; just refuse
         ok = background_runner._cleanup_task_dir("t", secret_path)
         assert ok is False
-        # logs must not include full absolute path of parent trees ideally
-        # (type-only / generic messages by design)
+
+        # A delete that raises must not leak the path it was given either.
+        secret_dir = Path(settings.tmp_dir) / "task-another-sensitive-name"
+        secret_dir.mkdir(parents=True, exist_ok=True)
+
+        def explode(dest):
+            raise OSError("disk full")
+
+        with patch(
+            "app.services.background_runner.cleanup_temp_dir", side_effect=explode
+        ):
+            assert background_runner._cleanup_task_dir("t", secret_dir) is False
+
+        with caplog.at_level(logging.ERROR, logger="app.services.background_runner"):
+            background_runner._cleanup_task_dir("t", secret_path)
+
+        records = [
+            r for r in caplog.records
+            if r.name == "app.services.background_runner"
+        ]
+        assert records, "cleanup refusals are expected to log"
+        for record in records:
+            message = record.getMessage()
+            assert "sensitive-name" not in message
+            assert "sensitive" not in message
+            assert str(secret_path) not in message
+        assert secret_dir.exists()  # refused delete left it for the TTL reaper
 
 
 class TestStaleWorkerAfterRecovery:
@@ -258,3 +316,49 @@ class TestStaleWorkerAfterRecovery:
         assert mark_completed(task.id, 1, 1, "x", worker_id="old-token") is False
         # New token can
         assert mark_completed(task.id, 1, 1, "x", worker_id="new-token") is True
+
+    @pytest.mark.asyncio
+    async def test_zombie_worker_cannot_write_in_requeue_window(
+        self, test_db, monkeypatch
+    ):
+        """Between reaper requeue and the next claim worker_id is NULL.
+
+        A stale worker must not be able to finalize a task it no longer owns
+        just because the ownership column was cleared — that would let it
+        overwrite the state of whatever claims the task next.
+        """
+        monkeypatch.setattr(settings, "app_env", "test")
+        monkeypatch.setattr(settings, "max_task_attempts", 3)
+        task = task_manager.create_task("https://github.com/u/window", "u", "window")
+        assert claim_next_pending("zombie-token") is not None
+
+        past = (utc_now() - timedelta(seconds=999)).isoformat()
+        conn = database._get_connection()
+        try:
+            conn.execute(
+                "UPDATE tasks SET lease_expires_at=? WHERE id=?", (past, task.id)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        assert recover_expired_tasks()["requeued"] == 1
+        # No new claimant yet — the row is pending with worker_id cleared.
+        reloaded = task_manager.get_task(task.id)
+        assert reloaded.status == "pending" and reloaded.worker_id is None
+
+        assert (
+            mark_completed(task.id, 1, 1, "x", worker_id="zombie-token") is False
+        )
+        assert (
+            mark_failed(
+                task.id, "INTERNAL_ERROR", "zombie", worker_id="zombie-token"
+            )
+            is False
+        )
+        assert (
+            mark_dead(task.id, "DEAD_TASK", worker_id="zombie-token") is False
+        )
+        # The task is untouched by the zombie and still claimable.
+        assert task_manager.get_task(task.id).status == "pending"
+        assert claim_next_pending("next-token") is not None

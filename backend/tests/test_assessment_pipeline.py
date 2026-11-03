@@ -267,12 +267,12 @@ class TestAssessmentPipeline:
 
         # mock mark_completed 来跟踪是否被调用
         mark_completed_called = False
-        original_mark_completed = task_manager.mark_completed
+        original_mark_completed = task_manager.mark_completed_async
 
-        def tracking_mark_completed(*args, **kwargs):
+        async def tracking_mark_completed(*args, **kwargs):
             nonlocal mark_completed_called
             mark_completed_called = True
-            return original_mark_completed(*args, **kwargs)
+            return await original_mark_completed(*args, **kwargs)
 
         with patch(
             "app.services.background_runner.download_tarball",
@@ -287,7 +287,7 @@ class TestAssessmentPipeline:
             "app.services.background_runner.run_assessment",
             side_effect=Exception("Assessment computation failed"),
         ), patch(
-            "app.services.background_runner.mark_completed",
+            "app.services.background_runner.mark_completed_async",
             side_effect=tracking_mark_completed,
         ):
             _run_pipeline(task.id)
@@ -414,7 +414,7 @@ class TestAssessmentPipeline:
             "app.services.background_runner.scan_directory",
             return_value=scan_result,
         ), patch(
-            "app.services.background_runner.mark_completed",
+            "app.services.background_runner.mark_completed_async",
             side_effect=RuntimeError("DB error during mark_completed"),
         ):
             _run_pipeline(task.id)

@@ -85,6 +85,18 @@ def normalize_repo_url(repo_url: str) -> str:
     return url.lower()
 
 
+def _admission_scope(submitter_key: str | None) -> str:
+    """Coalesce-scope suffix: owned keys stay separate, keyless share."""
+    return submitter_key if submitter_key else "public"
+
+
+def _same_submitter_filter(submitter_key: str | None):
+    """Rows belonging to this submitter, or to no submitter at all."""
+    if submitter_key:
+        return TaskRow.submitter_key == submitter_key
+    return TaskRow.submitter_key.is_(None)
+
+
 def build_deduplication_key(
     repo_url: str,
     resolved_commit_sha: str | None,
@@ -130,6 +142,7 @@ class TaskRecord:
     deduplication_key: str | None = None
     reused_from_task_id: str | None = None
     cancelled_at: datetime | str | None = None
+    submitter_key: str | None = None
 
     @classmethod
     def from_row(cls, row: TaskRow) -> TaskRecord:
@@ -161,6 +174,7 @@ class TaskRecord:
             deduplication_key=row.deduplication_key,
             reused_from_task_id=row.reused_from_task_id,
             cancelled_at=row.cancelled_at,
+            submitter_key=row.submitter_key,
         )
 
     @property
@@ -177,7 +191,7 @@ class TaskRecord:
     def is_cancel_requested(self) -> bool:
         return self.cancelled_at is not None or self.status == STATUS_CANCELLED
 
-    def to_response(self) -> dict:
+    def _base_response(self) -> dict:
         resp = {
             "task_id": self.id,
             "status": self.api_status,
@@ -202,11 +216,20 @@ class TaskRecord:
             if self.status == STATUS_DEAD and not self.error_code:
                 resp["error_code"] = DEAD_TASK
                 resp["error_message"] = get_error_message(DEAD_TASK)
+        return resp
 
+    async def to_response_async(self) -> dict:
+        resp = self._base_response()
         if self.api_status == STATUS_COMPLETED:
+            from app.db.repositories.results import load_status_enrichment
 
-            enrichment = load_status_enrichment_sync(self.id)
-            resp.update(enrichment)
+            resp.update(await load_status_enrichment(self.id))
+        return resp
+
+    def to_response(self) -> dict:
+        resp = self._base_response()
+        if self.api_status == STATUS_COMPLETED:
+            resp.update(load_status_enrichment_sync(self.id))
         return resp
 
 
@@ -243,14 +266,22 @@ async def admit_repo_task(
     *,
     scanner_version: str | None = None,
     max_attempts: int | None = None,
+    submitter_key: str | None = None,
 ) -> tuple[TaskRecord, bool]:
-    """Atomic coalesce-or-create for public repository tasks."""
+    """Atomic coalesce-or-create for public repository tasks.
+
+    Coalescing is scoped to the submitter: an owned key never adopts another
+    browser's in-flight task, so one visitor cannot read or cancel it. Clients
+    that send no key keep sharing one task per repository (cost control).
+    """
     version = scanner_version or SCANNER_VERSION
     normalized = normalize_repo_url(repo_url)
     now = utc_now()
 
     # Coalesce key for active GitHub tasks before commit SHA is known.
-    coalesce_key = f"{normalized}|active|{version}"
+    # The owner scope keeps concurrent identical submissions separate per
+    # browser while still merging repeats from the same browser.
+    coalesce_key = f"{normalized}|active|{version}|{_admission_scope(submitter_key)}"
     result = await session.execute(
         select(TaskRow).where(
             TaskRow.deduplication_key == coalesce_key,
@@ -260,11 +291,12 @@ async def admit_repo_task(
     existing = result.scalars().first()
     if existing is not None:
         return TaskRecord.from_row(existing), False
-    # Fallback: URL normalize match among active tasks
+    # Fallback: URL normalize match among this submitter's active tasks
     result = await session.execute(
         select(TaskRow).where(
             TaskRow.status.in_((STATUS_PENDING, STATUS_RUNNING)),
             TaskRow.scanner_version == version,
+            _same_submitter_filter(submitter_key),
         )
     )
     for row in result.scalars():
@@ -299,6 +331,7 @@ async def admit_repo_task(
         max_attempts=max_attempts or settings.max_task_attempts,
         scanner_version=version,
         deduplication_key=coalesce_key,
+        submitter_key=submitter_key,
     )
     try:
         session.add(row)
@@ -326,6 +359,7 @@ async def admit_upload_task(
     repo_name: str,
     *,
     max_attempts: int | None = None,
+    submitter_key: str | None = None,
 ) -> TaskRecord:
     now = utc_now()
     try:
@@ -351,6 +385,7 @@ async def admit_upload_task(
         attempt_count=0,
         max_attempts=max_attempts or settings.max_task_attempts,
         scanner_version=SCANNER_VERSION,
+        submitter_key=submitter_key,
     )
     session.add(row)
     await session.flush()
@@ -503,18 +538,14 @@ async def mark_completed(
         return False
     if row.status in TERMINAL_STATUSES:
         return False
-    if (
-        worker_id is not None
-        and row.worker_id not in (None, worker_id)
-        and row.worker_id != worker_id
-    ):
-        return False
     conditions = [
         TaskRow.id == task_id,
         TaskRow.status.not_in(TERMINAL_STATUSES),
         TaskRow.cancelled_at.is_(None),
     ]
-    if worker_id is not None and row.worker_id is not None:
+    # A claim token fences the write: ownership must still hold, and a task
+    # the reaper requeued (worker_id NULL) no longer belongs to its old worker.
+    if worker_id is not None:
         conditions.append(TaskRow.worker_id == worker_id)
     values: dict[str, Any] = {
         "status": STATUS_COMPLETED,
@@ -530,6 +561,13 @@ async def mark_completed(
     }
     if reused_from_task_id:
         values["reused_from_task_id"] = reused_from_task_id
+    # Completion is the moment the row leaves uq_tasks_active_dedup, so the
+    # shared commit-level key becomes safe to publish — and that key is what
+    # lets another visitor's task reuse this scan instead of re-downloading.
+    if row.resolved_commit_sha:
+        values["deduplication_key"] = build_deduplication_key(
+            row.repo_url, row.resolved_commit_sha, row.scanner_version
+        )
     result = await session.execute(update(TaskRow).where(*conditions).values(**values))
     changed = result.rowcount == 1
     if changed:
@@ -552,14 +590,12 @@ async def mark_failed(
         return False
     if row.status in TERMINAL_STATUSES:
         return False
-    if worker_id is not None and row.worker_id not in (None, worker_id):
-        return False
     conditions = [
         TaskRow.id == task_id,
         TaskRow.status.not_in(TERMINAL_STATUSES),
         TaskRow.cancelled_at.is_(None),
     ]
-    if worker_id is not None and row.worker_id is not None:
+    if worker_id is not None:
         conditions.append(TaskRow.worker_id == worker_id)
     category = failure_category or category_for_error_code(error_code)
     result = await session.execute(
@@ -595,8 +631,6 @@ async def mark_dead(
     row = await session.get(TaskRow, task_id)
     if row is None or row.cancelled_at is not None or row.status in TERMINAL_STATUSES:
         return False
-    if worker_id is not None and row.worker_id not in (None, worker_id):
-        return False
     code = error_code or DEAD_TASK
     category = failure_category or category_for_error_code(code)
     conditions = [
@@ -604,7 +638,7 @@ async def mark_dead(
         TaskRow.status.in_((STATUS_PENDING, STATUS_RUNNING)),
         TaskRow.cancelled_at.is_(None),
     ]
-    if worker_id is not None and row.worker_id is not None:
+    if worker_id is not None:
         conditions.append(TaskRow.worker_id == worker_id)
     result = await session.execute(
         update(TaskRow)
@@ -773,17 +807,21 @@ async def set_resolved_commit_sha(
     row = await session.get(TaskRow, task_id)
     if row is None:
         return
-    key = build_deduplication_key(
-        row.repo_url, commit_sha, row.scanner_version or SCANNER_VERSION
-    )
-    await session.execute(
-        update(TaskRow)
-        .where(TaskRow.id == task_id)
-        .values(
-            resolved_commit_sha=commit_sha.strip().lower(),
-            deduplication_key=key,
-            updated_at=utc_now(),
+    # The commit-level key is shared across submitters, so it can only be
+    # adopted once the row leaves the active set (see mark_completed); writing
+    # it onto an active row would collide with another owner's in-flight scan
+    # of the same commit under uq_tasks_active_dedup. A sha that arrives after
+    # completion still has to become discoverable, so publish on either order.
+    values: dict[str, Any] = {
+        "resolved_commit_sha": commit_sha.strip().lower(),
+        "updated_at": utc_now(),
+    }
+    if row.status == STATUS_COMPLETED:
+        values["deduplication_key"] = build_deduplication_key(
+            row.repo_url, values["resolved_commit_sha"], row.scanner_version
         )
+    await session.execute(
+        update(TaskRow).where(TaskRow.id == task_id).values(**values)
     )
 
 

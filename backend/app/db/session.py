@@ -1,12 +1,17 @@
 """Async SQLAlchemy engine/session factory (SQLAlchemy 2 + asyncpg).
 
-Engine is created once and managed by the FastAPI lifespan.
+The application engine is created once on the application event loop and
+managed by the FastAPI lifespan. Any other loop that reaches the database
+(usually a sync facade running in asyncio.to_thread) gets its own unpooled
+engine, because asyncpg connections cannot be shared between loops.
 Never logs DATABASE_URL credentials.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import weakref
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -23,6 +28,10 @@ logger = logging.getLogger(__name__)
 
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
+_engine_loop: asyncio.AbstractEventLoop | None = None
+_foreign: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, tuple[AsyncEngine, async_sessionmaker[AsyncSession]]
+] = weakref.WeakKeyDictionary()
 
 
 def _database_url() -> str:
@@ -41,49 +50,82 @@ def _database_url() -> str:
     return url
 
 
-def get_engine() -> AsyncEngine:
-    global _engine, _session_factory
-    if _engine is None:
-        from sqlalchemy.pool import NullPool
+def _build(*, pooled: bool) -> tuple[AsyncEngine, async_sessionmaker[AsyncSession]]:
+    from sqlalchemy.pool import NullPool
 
-        url = _database_url()
-        kwargs: dict = {
-            "echo": False,
-        }
+    url = _database_url()
+    kwargs: dict = {"echo": False}
+    if pooled and settings.app_env != "test" and not url.startswith("sqlite"):
         # Production/demo pool settings — env-overridable, modest defaults.
-        if settings.app_env != "test" and not url.startswith("sqlite"):
-            kwargs.update(
-                {
-                    "pool_pre_ping": True,
-                    "pool_size": settings.db_pool_size,
-                    "max_overflow": settings.db_max_overflow,
-                    "pool_recycle": settings.db_pool_recycle_seconds,
-                }
-            )
-        else:
-            # Tests: no cross-event-loop pooled connections.
-            kwargs["poolclass"] = NullPool
-        _engine = create_async_engine(url, **kwargs)
-        _session_factory = async_sessionmaker(
-            _engine,
-            expire_on_commit=False,
-            class_=AsyncSession,
+        kwargs.update(
+            {
+                "pool_pre_ping": True,
+                "pool_size": settings.db_pool_size,
+                "max_overflow": settings.db_max_overflow,
+                "pool_recycle": settings.db_pool_recycle_seconds,
+            }
         )
-    return _engine
+    else:
+        # Tests, SQLite, and foreign loops: no cross-event-loop pooled
+        # connections.
+        kwargs["poolclass"] = NullPool
+    engine = create_async_engine(url, **kwargs)
+    return engine, async_sessionmaker(
+        engine, expire_on_commit=False, class_=AsyncSession
+    )
+
+
+def _running_loop() -> asyncio.AbstractEventLoop | None:
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+
+
+def _current_bundle() -> tuple[AsyncEngine, async_sessionmaker[AsyncSession]]:
+    """Return the engine/session pair bound to the calling event loop."""
+    global _engine, _session_factory, _engine_loop
+
+    loop = _running_loop()
+    if _engine is None:
+        _engine, _session_factory = _build(pooled=True)
+        _engine_loop = loop
+    elif _engine_loop is None and loop is not None:
+        # Created outside a loop: the first loop to use it owns it.
+        _engine_loop = loop
+    if loop is None or _engine_loop is None or loop is _engine_loop:
+        assert _engine is not None and _session_factory is not None
+        return _engine, _session_factory
+
+    # A different loop is asking for a connection. asyncpg binds each
+    # connection (and every Future it awaits) to the loop that opened it, so
+    # checking a pooled connection out here raises "attached to a different
+    # loop" — and leaves the pool holding a connection nobody can use.
+    bundle = _foreign.get(loop)
+    if bundle is None:
+        bundle = _build(pooled=False)
+        _foreign[loop] = bundle
+    return bundle
+
+
+def get_engine() -> AsyncEngine:
+    return _current_bundle()[0]
 
 
 def get_session_factory() -> async_sessionmaker[AsyncSession]:
-    get_engine()
-    assert _session_factory is not None
-    return _session_factory
+    return _current_bundle()[1]
 
 
 async def dispose_engine() -> None:
-    global _engine, _session_factory
+    global _engine, _session_factory, _engine_loop
     if _engine is not None:
         await _engine.dispose()
     _engine = None
     _session_factory = None
+    _engine_loop = None
+    for engine, _factory in list(_foreign.values()):
+        await engine.dispose()
+    _foreign.clear()
 
 
 @asynccontextmanager
@@ -120,4 +162,6 @@ async def check_database_ready() -> None:
         row = result.first()
         count = int(row[0]) if row else 0
         if count < 5:
-            raise RuntimeError("database schema is not initialized")
+            raise RuntimeError(
+                "database schema is not initialized — run `alembic upgrade head`"
+            )

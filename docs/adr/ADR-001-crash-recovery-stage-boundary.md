@@ -25,7 +25,7 @@ calls; blindly skipping stages can serve mismatched assessment/scan pairs.
 
 - At most one download to resolve SHA when a completed twin may exist.
 - Deterministic assessment/repair policies remain consistent with persisted scan.
-- Operators understand single-instance + SQLite WAL limits from README.
+- Operators understand single-instance + PostgreSQL queue limits from README.
 
 ## Alternatives considered
 

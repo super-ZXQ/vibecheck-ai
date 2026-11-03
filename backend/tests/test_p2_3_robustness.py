@@ -7,6 +7,7 @@
 """
 
 import os
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -149,21 +150,44 @@ class TestStateMachineValidation:
 class TestCleanupResidualTempFiles:
 
     def test_removes_stale_files(self, test_db, tmp_path):
-        """清理残留临时文件（必须写入 settings.tmp_dir）。”"""
+        """清理残留临时文件（必须写入 settings.tmp_dir）。"""
         from app.core.config import settings
 
         tmp_dir = Path(settings.tmp_dir)
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
         # Create stale files under the configured tmp root
-        (tmp_dir / "download-abc.tar.gz").write_bytes(b"stale")
-        (tmp_dir / "task-xyz").mkdir(exist_ok=True)
-        (tmp_dir / "task-xyz" / "file.txt").write_text("stale")
+        stale = tmp_dir / "download-abc.tar.gz"
+        stale.write_bytes(b"stale")
+        task_dir = tmp_dir / "task-xyz"
+        task_dir.mkdir(exist_ok=True)
+        (task_dir / "file.txt").write_text("stale")
+        # Age both entries past the TTL — cleanup only removes untouched ones.
+        old = time.time() - settings.temp_file_ttl_seconds - 60
+        os.utime(task_dir, (old, old))
+        os.utime(stale, (old, old))
 
         removed = cleanup_residual_temp_files()
         assert removed >= 2
         assert not (tmp_dir / "download-abc.tar.gz").exists()
         assert not (tmp_dir / "task-xyz").exists()
+
+    def test_keeps_in_use_files_within_ttl(self, test_db, tmp_path):
+        """A freshly written entry belongs to a live task — startup cleanup in
+        another worker must not remove it."""
+        from app.core.config import settings
+
+        tmp_dir = Path(settings.tmp_dir)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        live = tmp_dir / "task-live"
+        live.mkdir(exist_ok=True)
+        (live / "secret.txt").write_text("in use")
+        fresh = tmp_dir / "download-live.tar.gz"
+        fresh.write_bytes(b"in use")
+
+        assert cleanup_residual_temp_files() == 0
+        assert live.is_dir() and fresh.exists()
+        assert (live / "secret.txt").read_text() == "in use"
 
     def test_empty_dir_returns_zero(self, test_db, tmp_path):
         """空目录返回 0。"""

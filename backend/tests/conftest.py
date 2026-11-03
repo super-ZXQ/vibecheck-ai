@@ -42,6 +42,8 @@ def _dispose_engine_quiet() -> None:
     engine = session_mod._engine
     session_mod._engine = None
     session_mod._session_factory = None
+    session_mod._engine_loop = None
+    session_mod._foreign.clear()
     if engine is None:
         return
     try:

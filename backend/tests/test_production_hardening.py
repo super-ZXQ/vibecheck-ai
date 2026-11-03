@@ -97,6 +97,38 @@ class TestStrictProductionConfiguration:
                 database_url="sqlite:////data/vibecheck.db",
             )
 
+    @pytest.mark.parametrize(
+        "database_url",
+        [
+            # The docker-compose development credential.
+            "postgresql+asyncpg://vibecheck:vibecheck@postgres.example:5432/vibecheck",
+            # The placeholder shipped in production.env.example.
+            "postgresql+asyncpg://vibecheck:change-me@postgres.example:5432/vibecheck",
+            # Percent-encoded must not slip past the comparison.
+            "postgresql+asyncpg://vibecheck:change%2Dme@postgres.example:5432/vibecheck",
+        ],
+    )
+    def test_production_rejects_placeholder_database_password(self, database_url):
+        """Presence of credentials is not the same as a real secret.
+
+        The validator previously accepted the shipped development pair, so an
+        operator who copied the example file and only set
+        PRODUCTION_CONFIG_CONFIRMED would expose a known-password database.
+        """
+        with pytest.raises(ValidationError, match="placeholder password"):
+            make_production_settings(database_url=database_url)
+
+    def test_development_may_keep_the_compose_credential(self):
+        """The compose default stays usable outside production."""
+        configured = Settings(
+            _env_file=None,
+            app_env="development",
+            database_url=(
+                "postgresql+asyncpg://vibecheck:vibecheck@127.0.0.1:5432/vibecheck"
+            ),
+        )
+        assert configured.database_url.endswith("vibecheck")
+
     def test_development_may_use_non_production_urls(self):
         configured = Settings(
             _env_file=None,
@@ -367,3 +399,57 @@ class TestReadiness:
         body = response.json()
         assert body["status"] == "not_ready"
         assert "connection refused" not in response.text
+
+
+class TestSchemaAuthority:
+    """Alembic owns the production schema — create_all must not compete."""
+
+    async def test_production_startup_verifies_instead_of_creating(
+        self, monkeypatch, test_db
+    ):
+        from app.core.config import settings
+        from app.db import database
+
+        calls: list[str] = []
+
+        async def fake_create_all() -> None:
+            calls.append("create_all")
+
+        async def fake_ready() -> None:
+            calls.append("verify")
+
+        monkeypatch.setattr(database, "_create_all_async", fake_create_all)
+        monkeypatch.setattr(database, "_async_check_ready", fake_ready)
+        monkeypatch.setattr(settings, "app_env", "production")
+        database.reset_initialized()
+        try:
+            await database.init_db_async()
+        finally:
+            database.reset_initialized()
+
+        assert calls == ["verify"]
+
+    async def test_non_production_startup_creates_schema(
+        self, monkeypatch, test_db
+    ):
+        from app.core.config import settings
+        from app.db import database
+
+        calls: list[str] = []
+
+        async def fake_create_all() -> None:
+            calls.append("create_all")
+
+        async def fake_ready() -> None:
+            calls.append("verify")
+
+        monkeypatch.setattr(database, "_create_all_async", fake_create_all)
+        monkeypatch.setattr(database, "_async_check_ready", fake_ready)
+        monkeypatch.setattr(settings, "app_env", "development")
+        database.reset_initialized()
+        try:
+            await database.init_db_async()
+            assert calls == ["create_all"]
+        finally:
+            database.reset_initialized()
+            database.init_db()

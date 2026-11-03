@@ -2,7 +2,7 @@
 
 POST /api/check:
 - Validates repo URL via parse_repo_url.
-- Creates a pending task in SQLite.
+- Creates a pending task in PostgreSQL.
 - Triggers background processing (download + extract + scan).
 - Returns task_id, status, and check_url.
 
@@ -45,9 +45,17 @@ GET /api/check/{task_id}/llm-analysis (P1-4):
 - completed, analysis MISSING: 200 safe empty (LLM analysis is
   non-blocking; a task can complete without it).
 - Never returns raw secrets, temp paths, or internal exceptions.
+
+Task ownership (all task-scoped routes above, plus /cancel):
+- A browser sends X-Submitter-Key, an opaque value it generates and stores
+  locally. The task records it, and every later read of that task requires
+  the same value.
+- A request with a different or missing key gets the same 404 as an unknown
+  task id, so a wrong key never confirms the task exists.
+- Submissions with no key record no owner and stay reachable by task id
+  alone; the header is optional by design (API clients may opt out).
 """
 
-import asyncio
 import logging
 import uuid
 
@@ -69,12 +77,17 @@ from app.core.error_codes import (
 from app.core.github import GitHubDownloadError, parse_repo_url
 from app.core.safe_extract import cleanup_temp_dir, prepare_extract_dest
 from app.core.scanner_version import SCANNER_VERSION
+from app.core.task_access import (
+    SubmitterKeyHeader,
+    ensure_task_access,
+    submitter_key_for_create,
+)
 from app.services.background_runner import trigger_queue_processing
-from app.services.llm_service import get_llm_analysis
+from app.services.llm_service import get_llm_analysis_async
 from app.services.llm_user_config import store_user_config
 from app.services.scan_result_service import (
     SCHEMA_VERSION,
-    get_scan_result,
+    get_scan_result_async,
 )
 from app.services.task_manager import (
     STATUS_COMPLETED,
@@ -84,8 +97,8 @@ from app.services.task_manager import (
     QueueCapacityError,
     admit_repo_task_async,
     admit_upload_task_async,
-    get_task,
-    request_cancel,
+    get_task_async,
+    request_cancel_async,
 )
 from app.services.upload_service import (
     LOCAL_UPLOAD_PREFIX,
@@ -172,13 +185,16 @@ async def create_check(
     x_llm_api_key: str | None = Header(default=None, alias="X-LLM-API-KEY"),
     x_llm_base_url: str | None = Header(default=None, alias="X-LLM-BASE-URL"),
     x_llm_model: str | None = Header(default=None, alias="X-LLM-MODEL"),
+    x_submitter_key: SubmitterKeyHeader = None,
 ):
     """Create a new project check task.
 
     - Validates the repo URL.
     - Checks if the queue is full (429 QUEUE_FULL).
     - Running coalescing: same normalized repo + scanner_version that is
-      already running/pending returns the existing task_id (no second scan).
+      already running/pending returns the existing task_id (no second scan) —
+      but only within the same X-Submitter-Key, so one browser never inherits
+      another visitor's task.
     - Creates a pending task and starts/ensures the bounded dispatcher.
     - Optional X-LLM-* headers bind in-memory credentials only.
     """
@@ -193,12 +209,15 @@ async def create_check(
             },
         )
 
+    submitter_key = submitter_key_for_create(x_submitter_key)
+
     try:
         task, created = await admit_repo_task_async(
             repo_info.url,
             repo_info.owner,
             repo_info.repo,
             scanner_version=SCANNER_VERSION,
+            submitter_key=submitter_key,
         )
     except QueueCapacityError:
         raise HTTPException(
@@ -245,6 +264,7 @@ async def create_upload_check(
     x_llm_api_key: str | None = Header(default=None, alias="X-LLM-API-KEY"),
     x_llm_base_url: str | None = Header(default=None, alias="X-LLM-BASE-URL"),
     x_llm_model: str | None = Header(default=None, alias="X-LLM-MODEL"),
+    x_submitter_key: SubmitterKeyHeader = None,
 ):
     """Create a new project check task from a local upload.
 
@@ -259,7 +279,11 @@ async def create_upload_check(
     upload never creates a task.
 
     Optional X-LLM-* headers work exactly as on POST /api/check.
+    A valid X-Submitter-Key makes the task readable only by that browser;
+    uploads always carry private source, so the key is recorded when given.
     """
+    submitter_key = submitter_key_for_create(x_submitter_key)
+
     # Capacity is enforced atomically in admit_upload_task after staging.
     if not file:
         raise HTTPException(
@@ -309,6 +333,7 @@ async def create_upload_check(
             repo_url=f"{LOCAL_UPLOAD_PREFIX}{uuid.uuid4().hex}",
             owner="local",
             repo_name="上传项目",
+            submitter_key=submitter_key,
         )
         staged = upload_source_dir(task.id)
         dest_root.rename(staged)
@@ -354,13 +379,14 @@ class CancelResponse(BaseModel):
     response_model=CancelResponse,
     status_code=status.HTTP_200_OK,
 )
-async def cancel_check(task_id: str):
+async def cancel_check(task_id: str, x_submitter_key: SubmitterKeyHeader = None):
     """Cancel a queued or running task. Idempotent for terminal tasks.
 
     - queued/pending → cancelled (immediate)
     - running → cancel requested; worker stops between stages; terminal cancelled
     - completed/failed/dead/cancelled → returns current status (idempotent)
     - missing task → 404
+    - task owned by another submitter key → 404 (same answer as missing)
     """
     try:
         uuid.UUID(task_id)
@@ -373,7 +399,7 @@ async def cancel_check(task_id: str):
             },
         )
 
-    task = get_task(task_id)
+    task = await get_task_async(task_id)
     if task is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -382,6 +408,7 @@ async def cancel_check(task_id: str):
                 "error_message": "任务不存在。",
             },
         )
+    ensure_task_access(task, x_submitter_key)
 
     # Signal in-process worker first, then persist cancel state.
     try:
@@ -391,8 +418,8 @@ async def cancel_check(task_id: str):
     except Exception:
         pass
 
-    resulting = await asyncio.to_thread(request_cancel, task_id)
-    final = get_task(task_id)
+    resulting = await request_cancel_async(task_id)
+    final = await get_task_async(task_id)
     final_status = final.api_status if final else resulting
     cancelled = bool(
         final and final.status == "cancelled"
@@ -414,11 +441,14 @@ async def cancel_check(task_id: str):
 
 
 @router.get("/api/check/{task_id}", response_model=TaskStatusResponse)
-async def get_check_status(task_id: str):
+async def get_check_status(
+    task_id: str, x_submitter_key: SubmitterKeyHeader = None
+):
     """Get the status of a check task.
 
     - Invalid UUID format returns 422.
     - Non-existent task returns 404.
+    - Task owned by another submitter key returns the same 404.
     - Completed tasks include scan_summary and report_url.
     - Does NOT inline full findings (use /result endpoint).
     """
@@ -435,7 +465,7 @@ async def get_check_status(task_id: str):
         )
 
     # Get task from database
-    task = get_task(task_id)
+    task = await get_task_async(task_id)
     if task is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -444,17 +474,14 @@ async def get_check_status(task_id: str):
                 "error_message": "任务不存在。",
             },
         )
+    ensure_task_access(task, x_submitter_key)
 
-    # to_response() calls get_scan_summary which does synchronous DB
-    # access. Wrap in asyncio.to_thread so the event loop is not blocked
-    # by SQLite reads (summary_json is lightweight, but the DB call
-    # itself should still not run in the event loop thread).
-    response_data = await asyncio.to_thread(task.to_response)
+    response_data = await task.to_response_async()
     return TaskStatusResponse(**response_data)
 
 
 @router.get("/api/check/{task_id}/result")
-async def get_check_result(task_id: str):
+async def get_check_result(task_id: str, x_submitter_key: SubmitterKeyHeader = None):
     """Get the full persisted scan result for a completed task.
 
     Strict state-ordered branching:
@@ -462,7 +489,7 @@ async def get_check_result(task_id: str):
     2. pending/running → 409 SCAN_RESULT_NOT_READY (does NOT read scan_results)
     3. failed → fixed safe empty response (does NOT read scan_results,
        even if a residual record exists from a partial pipeline)
-    4. completed → asyncio.to_thread(get_scan_result)
+    4. completed → get_scan_result_async()
        - result exists → 200 full result
        - result missing → 500 SCAN_RESULT_MISSING
     5. unknown status → 500 INTERNAL_ERROR (never returns success empty)
@@ -487,7 +514,7 @@ async def get_check_result(task_id: str):
         )
 
     # Get task from database
-    task = get_task(task_id)
+    task = await get_task_async(task_id)
     if task is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -496,6 +523,7 @@ async def get_check_result(task_id: str):
                 "error_message": "任务不存在。",
             },
         )
+    ensure_task_access(task, x_submitter_key)
 
     # --- Case 2: pending/running → 409 (does NOT read scan_results) ---
     if task.status in (STATUS_PENDING, STATUS_RUNNING):
@@ -513,9 +541,9 @@ async def get_check_result(task_id: str):
     if task.status == STATUS_FAILED:
         return _SAFE_EMPTY_RESULT
 
-    # --- Case 4: completed → read result via asyncio.to_thread ---
+    # --- Case 4: completed → read persisted result ---
     if task.status == STATUS_COMPLETED:
-        result = await asyncio.to_thread(get_scan_result, task_id)
+        result = await get_scan_result_async(task_id)
         if result is not None:
             return result
         # Result missing — legacy task or data integrity issue.
@@ -553,14 +581,16 @@ _SAFE_EMPTY_LLM_ANALYSIS: dict = {
 
 
 @router.get("/api/check/{task_id}/llm-analysis")
-async def get_llm_analysis_result(task_id: str):
+async def get_llm_analysis_result(
+    task_id: str, x_submitter_key: SubmitterKeyHeader = None
+):
     """Get the full persisted LLM analysis for a completed task.
 
     State-ordered branching:
     1. task not found → 404
     2. pending/running → 409 LLM_ANALYSIS_NOT_READY
     3. failed → fixed safe empty response (200)
-    4. completed → asyncio.to_thread(get_llm_analysis)
+    4. completed → get_llm_analysis_async()
        - analysis exists → 200 full analysis
        - analysis MISSING → 200 safe empty (LLM analysis is non-blocking)
     5. unknown status → 500 INTERNAL_ERROR
@@ -582,7 +612,7 @@ async def get_llm_analysis_result(task_id: str):
         )
 
     # Get task from database
-    task = get_task(task_id)
+    task = await get_task_async(task_id)
     if task is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -591,6 +621,7 @@ async def get_llm_analysis_result(task_id: str):
                 "error_message": "任务不存在。",
             },
         )
+    ensure_task_access(task, x_submitter_key)
 
     # --- Case 2: pending/running → 409 ---
     if task.status in (STATUS_PENDING, STATUS_RUNNING):
@@ -608,7 +639,7 @@ async def get_llm_analysis_result(task_id: str):
 
     # --- Case 4: completed → read analysis ---
     if task.status == STATUS_COMPLETED:
-        analysis = await asyncio.to_thread(get_llm_analysis, task_id)
+        analysis = await get_llm_analysis_async(task_id)
         if analysis is not None:
             return analysis
         # Analysis missing — non-blocking, return safe empty.

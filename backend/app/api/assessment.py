@@ -11,7 +11,7 @@ GET /api/check/{task_id}/assessment:
   P0-5 task without a persisted assessment_results row).
 - unknown status: 500 ASSESSMENT_INTERNAL_ERROR.
 - Never returns raw secrets, temp paths, or internal exceptions.
-- Full database read and JSON parse via asyncio.to_thread.
+- Full database read and JSON parse are awaited on the request loop.
 
 The failed check MUST come before any assessment_results read. This
 prevents leaking residual assessments from a partial pipeline where
@@ -19,7 +19,6 @@ run_assessment persisted the assessment but mark_completed threw an
 exception (which would mark the task as failed).
 """
 
-import asyncio
 import uuid
 
 from fastapi import APIRouter, HTTPException, status
@@ -30,6 +29,7 @@ from app.core.error_codes import (
     ASSESSMENT_NOT_READY,
     get_error_message,
 )
+from app.core.task_access import SubmitterKeyHeader, ensure_task_access
 from app.services.assessment_policy import (
     ASSESSMENT_SCHEMA_VERSION,
     ASSESSMENT_SCOPE,
@@ -37,14 +37,14 @@ from app.services.assessment_policy import (
 )
 from app.services.assessment_service import (
     AssessmentInternalError,
-    get_assessment_result,
+    get_assessment_result_async,
 )
 from app.services.task_manager import (
     STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_PENDING,
     STATUS_RUNNING,
-    get_task,
+    get_task_async,
 )
 
 router = APIRouter()
@@ -93,15 +93,17 @@ def _build_safe_empty_assessment(task_id: str) -> dict:
 
 
 @router.get("/api/check/{task_id}/assessment")
-async def get_assessment(task_id: str):
+async def get_assessment(
+    task_id: str, x_submitter_key: SubmitterKeyHeader = None
+):
     """Get the full persisted security assessment for a completed task.
 
     Strict state-ordered branching:
-    1. task not found → 404
+    1. task not found (or owned by another submitter key) → 404
     2. pending/running → 409 ASSESSMENT_NOT_READY (does NOT read assessment_results)
     3. failed → fixed safe empty assessment (does NOT read assessment_results,
        even if a residual record exists from a partial pipeline)
-    4. completed → asyncio.to_thread(get_assessment_result)
+    4. completed → get_assessment_result_async()
        - assessment exists → 200 full AssessmentResult
        - assessment missing → 409 ASSESSMENT_NOT_AVAILABLE
     5. unknown status → 500 ASSESSMENT_INTERNAL_ERROR
@@ -125,7 +127,7 @@ async def get_assessment(task_id: str):
         )
 
     # Get task from database
-    task = get_task(task_id)
+    task = await get_task_async(task_id)
     if task is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -134,6 +136,7 @@ async def get_assessment(task_id: str):
                 "error_message": "任务不存在。",
             },
         )
+    ensure_task_access(task, x_submitter_key)
 
     # --- Case 2: pending/running → 409 (does NOT read assessment_results) ---
     if task.status in (STATUS_PENDING, STATUS_RUNNING):
@@ -151,10 +154,10 @@ async def get_assessment(task_id: str):
     if task.status == STATUS_FAILED:
         return _build_safe_empty_assessment(task_id)
 
-    # --- Case 4: completed → read assessment via asyncio.to_thread ---
+    # --- Case 4: completed → read assessment ---
     if task.status == STATUS_COMPLETED:
         try:
-            result = await asyncio.to_thread(get_assessment_result, task_id)
+            result = await get_assessment_result_async(task_id)
         except AssessmentInternalError:
             # Corrupted or invalid assessment JSON — return fixed 500.
             raise HTTPException(

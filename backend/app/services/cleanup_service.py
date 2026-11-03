@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import time
 from datetime import timezone
 from pathlib import Path
 
@@ -39,6 +40,10 @@ def cleanup_residual_temp_files() -> int:
     - Download files (download-*.tar.gz)
     - Extraction directories (task-*/)
 
+    Only entries untouched for temp_file_ttl_seconds are removed. Every worker
+    shares this tmp root, so an unconditional sweep would delete the download
+    and extract directories another worker is using right now.
+
     Returns the number of items removed.
     """
     tmp_root = Path(settings.tmp_dir)
@@ -52,7 +57,9 @@ def cleanup_residual_temp_files() -> int:
         logger.warning("Could not resolve tmp_dir: %s", settings.tmp_dir)
         return 0
 
+    cutoff = time.time() - settings.temp_file_ttl_seconds
     removed = 0
+    skipped = 0
     for entry in root_resolved.iterdir():
         try:
             entry_resolved = entry.resolve()
@@ -69,6 +76,15 @@ def cleanup_residual_temp_files() -> int:
             continue
 
         try:
+            if entry.stat().st_mtime > cutoff:
+                skipped += 1
+                continue
+        except OSError:
+            # Unstatable entry — leave it alone rather than delete live data.
+            skipped += 1
+            continue
+
+        try:
             if entry.is_dir():
                 shutil.rmtree(entry, onerror=_onerror_log)
                 removed += 1
@@ -80,6 +96,8 @@ def cleanup_residual_temp_files() -> int:
 
     if removed > 0:
         logger.info("Startup cleanup: removed %d stale temp item(s)", removed)
+    if skipped > 0:
+        logger.info("Startup cleanup: kept %d in-use temp item(s)", skipped)
     return removed
 
 

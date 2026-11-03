@@ -126,6 +126,8 @@ def create_app(app_settings: Settings = settings) -> FastAPI:
             "X-LLM-API-KEY",
             "X-LLM-BASE-URL",
             "X-LLM-MODEL",
+            # Task ownership key; without it browsers cannot send the header.
+            "X-Submitter-Key",
         ],
     )
     api.add_middleware(

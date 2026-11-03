@@ -53,11 +53,21 @@ async def _create_all_async() -> None:
 
 
 async def init_db_async() -> None:
-    """Create schema on the *current* event loop (production lifespan)."""
+    """Bind the engine to the *current* event loop (production lifespan).
+
+    Alembic owns the production schema. Running create_all alongside it gives
+    two schema authorities: whichever starts first wins, and a later
+    ``alembic upgrade head`` then fails on tables create_all already made.
+    Production therefore only verifies the schema and fails fast if migrations
+    were not applied.
+    """
     global _initialized
     if _initialized:
         return
-    await _create_all_async()
+    if settings.app_env == "production":
+        await _async_check_ready()
+    else:
+        await _create_all_async()
     _initialized = True
 
 

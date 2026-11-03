@@ -55,7 +55,7 @@ Recorded from backend suite on this machine (no external traffic):
 | Recovery requeue | expired lease → pending | `TestLeaseRecovery` |
 | Dedup counter | incremented on reuse | `TestDeduplication` |
 | Queue full | HTTP 429 QUEUE_FULL | `TestQueueFullAPI` |
-| BYOK not in DB bytes | secret absent from sqlite file | `TestBYOKSecurity` |
+| BYOK not in DB bytes | secret absent from database rows | `TestBYOKSecurity` |
 
 ### Locust (optional)
 

@@ -18,8 +18,9 @@ NON-BLOCKING CONTRACT:
 - Assessment scoring (P0-6) is completely independent and unaffected.
 
 ASYNC:
-- Database reads/writes and LLM HTTP calls are synchronous.
-- Callers MUST wrap in asyncio.to_thread().
+- generate_and_save_llm_analysis() is synchronous (DB writes and LLM HTTP
+  calls). Callers MUST wrap it in asyncio.to_thread().
+- get_llm_analysis_async() is awaitable and is what request handlers use.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ import logging
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlsplit
 
 from app.core.config import settings
 from app.core.security.desensitize import mask_untrusted_text
@@ -37,6 +39,7 @@ from app.services.llm_fallback_templates import (
     GENERIC_FALLBACK,
     get_fallback_template,
 )
+from app.services.llm_user_config import is_public_endpoint
 
 logger = logging.getLogger(__name__)
 
@@ -204,6 +207,18 @@ def _resolve_llm_config(user_config: dict | None) -> tuple[bool, str, str, str]:
     )
 
 
+def _base_url_is_user_supplied(user_config: dict | None, base_url: str) -> bool:
+    """True when the winning base URL came from a request header.
+
+    Server-side ``llm_base_url`` is operator-trusted and may be a private
+    gateway; a header-supplied one is attacker-controlled and must not be able
+    to reach it.
+    """
+    if not user_config or not base_url:
+        return False
+    return (user_config.get("base_url") or "").strip() == base_url
+
+
 def _normalize_llm_endpoint(raw: str) -> str:
     """Normalize a base URL to a full /chat/completions endpoint.
 
@@ -243,6 +258,16 @@ def _call_llm_api(
         logger.warning("LLM enabled but llm_model not configured")
         return None
 
+    # A browser-supplied base URL makes this an SSRF surface inside the
+    # deployment network, so it is re-checked against live DNS here. The
+    # operator's own llm_base_url is trusted and may point at a private
+    # gateway.
+    endpoint = _normalize_llm_endpoint(base_url)
+    if _base_url_is_user_supplied(user_config, base_url):
+        if not is_public_endpoint(endpoint):
+            logger.warning("User LLM base URL did not resolve to a public host")
+            return None
+
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
@@ -258,7 +283,7 @@ def _call_llm_api(
     }).encode("utf-8")
 
     last_error: Exception | None = None
-    endpoint = _normalize_llm_endpoint(base_url)
+    request_host = urlsplit(endpoint).hostname
     for attempt in range(settings.llm_max_retries + 1):
         try:
             req = urllib.request.Request(
@@ -270,6 +295,12 @@ def _call_llm_api(
             with urllib.request.urlopen(
                 req, timeout=settings.llm_timeout
             ) as resp:
+                # urllib follows redirects. A host that redirects into an
+                # internal address must not have its body returned.
+                final_host = urlsplit(resp.geturl()).hostname
+                if final_host != request_host:
+                    logger.warning("LLM endpoint redirected to a different host")
+                    return None
                 response_data = json.loads(resp.read().decode("utf-8"))
                 # OpenAI-compatible response format.
                 choices = response_data.get("choices", [])
@@ -657,6 +688,13 @@ def get_llm_analysis(task_id: str) -> dict | None:
 
     init_db()
     return get_llm_analysis_sync(task_id)
+
+
+async def get_llm_analysis_async(task_id: str) -> dict | None:
+    """Awaitable variant for request handlers, avoiding the sync thread-pool hop."""
+    from app.services.result_repository import get_llm_analysis_async as _load
+
+    return await _load(task_id)
 
 
 def get_llm_analysis_summary(task_id: str) -> dict | None:

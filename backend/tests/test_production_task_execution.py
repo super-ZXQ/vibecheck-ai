@@ -228,7 +228,7 @@ class TestCancelAPI:
             worker = asyncio.create_task(runner())
             await asyncio.wait_for(started.wait(), timeout=2)
             task_manager.request_cancel(task.id)
-            background_runner.cancel_task_locally(task.id)
+            await background_runner.cancel_task_locally(task.id)
             await asyncio.wait_for(worker, timeout=3)
 
         rec = task_manager.get_task(task.id)
@@ -647,6 +647,60 @@ class TestEventLoopNotBlocked:
         # Event loop remained responsive: poll iterations finished while scan ran.
         assert len(latencies) == 8
         assert max(latencies) < 0.55  # PG-backed poll remains well under stage timeout
+
+    @pytest.mark.asyncio
+    async def test_temp_cleanup_runs_off_the_loop(self, test_db, monkeypatch, tmp_path):
+        """The recursive temp delete must not occupy the event loop.
+
+        An extracted tree can hold thousands of files; deleting it inline would
+        stall every in-flight request for the length of the rmtree.
+        """
+        monkeypatch.setattr(settings, "app_env", "test")
+        extract = _mock_extract(tmp_path)
+        task = task_manager.create_task(
+            "https://github.com/u/cleanup-loop", "u", "cleanup-loop"
+        )
+
+        loop_thread = threading.get_ident()
+        cleanup_calls: list[tuple[int, str]] = []
+
+        def slow_cleanup(dest):
+            cleanup_calls.append((threading.get_ident(), str(dest)))
+            time.sleep(0.3)
+
+        async def probe(samples: list[float]) -> None:
+            deadline = time.perf_counter() + 0.6
+            while time.perf_counter() < deadline:
+                t0 = time.perf_counter()
+                await asyncio.sleep(0.02)
+                samples.append(time.perf_counter() - t0)
+
+        def mock_extract(tarball_bytes, tmp_root=None):
+            return extract
+
+        samples: list[float] = []
+        with patch(
+            "app.services.background_runner.download_tarball",
+            return_value=_mock_download(tmp_path),
+        ), patch(
+            "app.services.background_runner.safe_extract_to_temp",
+            side_effect=mock_extract,
+        ), patch(
+            "app.services.background_runner.cleanup_temp_dir",
+            side_effect=slow_cleanup,
+        ):
+            worker = asyncio.create_task(background_runner._process_task(task.id))
+            prober = asyncio.create_task(probe(samples))
+            await worker
+            await prober
+
+        assert cleanup_calls, "temp cleanup never ran"
+        assert cleanup_calls[0][1] == extract.dest_dir
+        assert cleanup_calls[0][0] != loop_thread, "rmtree ran on the event loop thread"
+        assert samples, "probe produced no samples"
+        assert max(samples) < 0.1, (
+            f"event loop stalled up to {max(samples):.3f}s during temp cleanup"
+        )
 
 
 class TestCleanupAndCancelResources:

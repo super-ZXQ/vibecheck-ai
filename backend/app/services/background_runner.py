@@ -2,17 +2,20 @@
 
 Concurrency model:
 - Dispatcher loop continuously fills free execution slots (max_running_tasks).
-- Claiming uses claim_next_pending() with SQLite BEGIN IMMEDIATE.
-- asyncio.Semaphore + active-task set bound concurrency.
-- Blocking work (SQLite, extract, scan, cleanup) runs via asyncio.to_thread.
+- Claiming awaits claim_next_pending_async(), which locks the row with
+  SELECT ... FOR UPDATE SKIP LOCKED on PostgreSQL.
+- Status, lease and cancel writes are awaited on the event loop; they never
+  hop to a throwaway event loop, which would hand the production connection
+  pool a connection bound to a closed loop.
+- CPU/IO-bound work (extract, scan, cleanup) still runs via asyncio.to_thread.
 - Heartbeat extends task leases while work is in flight.
 - Cancel is cooperative: workers check cancellation between stages.
-- Crash recovery: recover_expired_tasks() re-queues expired leases.
+- Crash recovery: recover_expired_tasks_async() re-queues expired leases.
 
 Honest capability statement (README):
-This is **single-instance bounded concurrency** on SQLite WAL — not a
-distributed queue. Python locks reduce contention; DB transactions are the
-correctness boundary for claim/recover.
+This is **single-instance bounded concurrency** on PostgreSQL — not a
+distributed queue. The per-claim token fences status writes; DB transactions
+are the correctness boundary for claim/recover.
 
 Pipeline stages:
   download → extract → scan → persist → assess → repair → llm → completed
@@ -110,21 +113,20 @@ from app.services.task_manager import (
     STAGE_SCANNING,
     STATUS_PENDING,
     STATUS_RUNNING,
-    claim_next_pending,
-    fail_or_retry,
-    find_completed_by_repo_sha,
-    get_task,
-    has_claimable_pending,
-    is_cancel_requested,
-    is_queue_full,
+    claim_next_pending_async,
+    fail_or_retry_async,
+    find_completed_by_repo_sha_async,
+    get_task_async,
+    has_claimable_pending_async,
+    is_cancel_requested_async,
     make_worker_id,
-    mark_cancelled,
-    mark_completed,
-    mark_running,
-    recover_expired_tasks,
-    refresh_queue_metrics,
-    set_resolved_commit_sha,
-    touch_heartbeat,
+    mark_cancelled_async,
+    mark_completed_async,
+    mark_running_async,
+    recover_expired_tasks_async,
+    refresh_queue_metrics_async,
+    set_resolved_commit_sha_async,
+    touch_heartbeat_async,
 )
 from app.services.upload_service import LOCAL_UPLOAD_PREFIX, upload_source_dir
 
@@ -135,6 +137,7 @@ _lock = asyncio.Lock()
 _is_processing = False  # legacy flag (kept for reset_runner_state compatibility)
 _dispatcher_task: asyncio.Task | None = None
 _active: set[asyncio.Task] = set()
+_background_tasks: set[asyncio.Task] = set()
 _stopping = False
 _worker_id: str | None = None
 _cancel_events: dict[str, asyncio.Event] = {}
@@ -294,7 +297,7 @@ async def _heartbeat_loop(
         except TimeoutError:
             pass
         try:
-            ok = await asyncio.to_thread(touch_heartbeat, task_id, claim_token)
+            ok = await touch_heartbeat_async(task_id, claim_token)
             if not ok and claim_token is not None:
                 # Lost ownership — stop renewing; pipeline fencing will halt work.
                 return
@@ -302,31 +305,31 @@ async def _heartbeat_loop(
             logger.warning("Heartbeat update failed for task %s", task_id)
 
 
-def _check_cancelled(task_id: str) -> bool:
+async def _check_cancelled(task_id: str) -> bool:
     cancel_event = _get_cancel_event(task_id)
     if cancel_event.is_set():
         return True
     try:
-        return is_cancel_requested(task_id)
+        return await is_cancel_requested_async(task_id)
     except Exception:
         return False
 
 
-def _ensure_owned(task_id: str, claim_token: str | None) -> None:
+async def _ensure_owned(task_id: str, claim_token: str | None) -> None:
     """Raise OwnershipLost when the claim token no longer owns the task."""
     if claim_token is None:
         return
-    task = get_task(task_id)
+    task = await get_task_async(task_id)
     if task is None:
         raise OwnershipLost("task missing")
     if task.is_terminal or task.worker_id != claim_token:
         raise OwnershipLost("claim token fenced")
 
 
-def _mark_running_owned(
+async def _mark_running_owned(
     task_id: str, stage: str, progress: int, claim_token: str | None
 ) -> None:
-    ok = mark_running(task_id, stage, progress, worker_id=claim_token)
+    ok = await mark_running_async(task_id, stage, progress, worker_id=claim_token)
     if not ok:
         raise OwnershipLost("mark_running fenced")
 
@@ -339,23 +342,23 @@ async def _download_and_extract(
     download_result = None
     extract_dest = None
 
-    _mark_running_owned(task_id, STAGE_DOWNLOADING, 10, claim_token)
-    if _check_cancelled(task_id):
-        mark_cancelled(task_id)
+    await _mark_running_owned(task_id, STAGE_DOWNLOADING, 10, claim_token)
+    if await _check_cancelled(task_id):
+        await mark_cancelled_async(task_id)
         return None, None, None
 
     try:
         download_result = await download_tarball(repo_url)
     except GitHubDownloadError as e:
         error_code, safe_msg, category = _map_download_error(e)
-        fail_or_retry(
+        await fail_or_retry_async(
             task_id, error_code, safe_msg,
             failure_category=category, worker_id=claim_token,
         )
         return download_result, None, None
     except OSError as e:
         if getattr(e, "errno", None) == 28:  # ENOSPC
-            fail_or_retry(
+            await fail_or_retry_async(
                 task_id,
                 TEMP_STORAGE_EXHAUSTED,
                 get_error_message(TEMP_STORAGE_EXHAUSTED),
@@ -363,7 +366,7 @@ async def _download_and_extract(
                 worker_id=claim_token,
             )
         else:
-            fail_or_retry(
+            await fail_or_retry_async(
                 task_id, DOWNLOAD_FAILED, get_error_message(DOWNLOAD_FAILED),
                 failure_category=GITHUB_TEMPORARY_ERROR,
                 worker_id=claim_token,
@@ -372,36 +375,36 @@ async def _download_and_extract(
 
     if download_result and download_result.commit_sha:
         try:
-            _ensure_owned(task_id, claim_token)
-            set_resolved_commit_sha(task_id, download_result.commit_sha)
+            await _ensure_owned(task_id, claim_token)
+            await set_resolved_commit_sha_async(task_id, download_result.commit_sha)
         except OwnershipLost:
             cleanup_download(download_result.temp_file)
             return None, None, None
         except Exception:
             logger.warning("Failed to persist commit SHA for task")
 
-    if _check_cancelled(task_id):
+    if await _check_cancelled(task_id):
         if download_result is not None:
             cleanup_download(download_result.temp_file)
-        mark_cancelled(task_id)
+        await mark_cancelled_async(task_id)
         return None, None, None
 
     # Dedup after SHA resolution: reuse completed result for same commit.
-    task = get_task(task_id)
+    task = await get_task_async(task_id)
     if task is not None and download_result is not None and download_result.commit_sha:
-        existing = find_completed_by_repo_sha(
+        existing = await find_completed_by_repo_sha_async(
             task.repo_url, download_result.commit_sha, task.scanner_version
         )
         if existing is not None and existing.id != task_id:
-            from app.services.task_manager import complete_as_reused
-            ok = await asyncio.to_thread(complete_as_reused, task_id, existing)
+            from app.services.task_manager import complete_as_reused_async
+            ok = await complete_as_reused_async(task_id, existing)
             cleanup_download(download_result.temp_file)
             if ok:
                 logger.info("Task deduplicated to completed result")
                 return None, None, None
             # Fall through to full scan if copy failed.
 
-    _mark_running_owned(task_id, STAGE_EXTRACTING, 50, claim_token)
+    await _mark_running_owned(task_id, STAGE_EXTRACTING, 50, claim_token)
     try:
         tarball_bytes = await asyncio.to_thread(
             download_result.temp_file.read_bytes
@@ -411,7 +414,7 @@ async def _download_and_extract(
             "Failed to read downloaded archive for task %s: %s",
             task_id, type(e).__name__,
         )
-        fail_or_retry(
+        await fail_or_retry_async(
             task_id, DOWNLOAD_FAILED, get_error_message(DOWNLOAD_FAILED),
             failure_category=GITHUB_TEMPORARY_ERROR,
             worker_id=claim_token,
@@ -453,7 +456,7 @@ async def _download_and_extract(
         except Exception:
             pass
         await asyncio.sleep(0.2)
-        fail_or_retry(
+        await fail_or_retry_async(
             task_id, EXTRACT_TIMEOUT, get_error_message(EXTRACT_TIMEOUT),
             failure_category="INTERNAL_TRANSIENT",
             worker_id=claim_token,
@@ -461,21 +464,21 @@ async def _download_and_extract(
         return download_result, None, None
     except ExtractionError as e:
         error_code, safe_msg, category = _map_extraction_error(e)
-        fail_or_retry(
+        await fail_or_retry_async(
             task_id, error_code, safe_msg,
             failure_category=category, worker_id=claim_token,
         )
         return download_result, None, None
     except OSError as e:
         if getattr(e, "errno", None) == 28:
-            fail_or_retry(
+            await fail_or_retry_async(
                 task_id, TEMP_STORAGE_EXHAUSTED,
                 get_error_message(TEMP_STORAGE_EXHAUSTED),
                 failure_category=CAT_TEMP_STORAGE,
                 worker_id=claim_token,
             )
         else:
-            fail_or_retry(
+            await fail_or_retry_async(
                 task_id, INTERNAL_ERROR, get_error_message(INTERNAL_ERROR),
                 worker_id=claim_token,
             )
@@ -484,7 +487,7 @@ async def _download_and_extract(
         logger.error(
             "Extraction failed for task %s: %s", task_id, type(e).__name__
         )
-        fail_or_retry(
+        await fail_or_retry_async(
             task_id, INTERNAL_ERROR, get_error_message(INTERNAL_ERROR),
             failure_category="INTERNAL_TRANSIENT",
             worker_id=claim_token,
@@ -495,7 +498,7 @@ async def _download_and_extract(
 async def _process_task(task_id: str, claim_token: str | None = None) -> None:
     """Process a single claimed task through the pipeline.
 
-    ``claim_token`` is the fencing token written by claim_next_pending().
+    ``claim_token`` is the fencing token written by claim_next_pending_async().
     When omitted (legacy tests), ownership is inferred from the DB row.
     """
     download_result: DownloadResult | None = None
@@ -506,7 +509,7 @@ async def _process_task(task_id: str, claim_token: str | None = None) -> None:
     started = time.monotonic()
 
     try:
-        task = get_task(task_id)
+        task = await get_task_async(task_id)
         if task is None:
             logger.error("Task %s not found", task_id)
             return
@@ -518,20 +521,20 @@ async def _process_task(task_id: str, claim_token: str | None = None) -> None:
         if claim_token is not None and task.worker_id not in (None, claim_token):
             # Stale worker after recovery/re-claim.
             return
-        if _check_cancelled(task_id):
-            mark_cancelled(task_id)
+        if await _check_cancelled(task_id):
+            await mark_cancelled_async(task_id)
             return
 
         is_upload = task.repo_url.startswith(LOCAL_UPLOAD_PREFIX)
 
         if is_upload:
-            _mark_running_owned(task_id, STAGE_EXTRACTING, 50, claim_token)
+            await _mark_running_owned(task_id, STAGE_EXTRACTING, 50, claim_token)
             data_dir = upload_source_dir(task_id)
             if not data_dir.is_dir():
                 logger.error(
                     "Upload source directory missing for task %s", task_id
                 )
-                fail_or_retry(
+                await fail_or_retry_async(
                     task_id, INTERNAL_ERROR, get_error_message(INTERNAL_ERROR),
                     worker_id=claim_token,
                 )
@@ -546,13 +549,13 @@ async def _process_task(task_id: str, claim_token: str | None = None) -> None:
                 # Failed, cancelled, deduplicated, or fenced — stop pipeline.
                 return
 
-        if _check_cancelled(task_id):
-            mark_cancelled(task_id)
+        if await _check_cancelled(task_id):
+            await mark_cancelled_async(task_id)
             return
-        _ensure_owned(task_id, claim_token)
+        await _ensure_owned(task_id, claim_token)
 
         # --- Stage 3: Scan ---
-        _mark_running_owned(task_id, STAGE_SCANNING, 80, claim_token)
+        await _mark_running_owned(task_id, STAGE_SCANNING, 80, claim_token)
         scan_started = time.monotonic()
         try:
             scan_result = await asyncio.wait_for(
@@ -566,7 +569,7 @@ async def _process_task(task_id: str, claim_token: str | None = None) -> None:
             )
         except TimeoutError:
             logger.error("Scan timed out for task %s", task_id)
-            fail_or_retry(
+            await fail_or_retry_async(
                 task_id, SCAN_TIMEOUT, get_error_message(SCAN_TIMEOUT),
                 failure_category="SCAN_TIMEOUT",
                 worker_id=claim_token,
@@ -576,7 +579,7 @@ async def _process_task(task_id: str, claim_token: str | None = None) -> None:
             logger.error(
                 "Scan failed for task %s: %s", task_id, type(e).__name__
             )
-            fail_or_retry(
+            await fail_or_retry_async(
                 task_id, SCAN_INTERNAL_ERROR,
                 get_error_message(SCAN_INTERNAL_ERROR),
                 failure_category="INTERNAL_TRANSIENT",
@@ -584,14 +587,14 @@ async def _process_task(task_id: str, claim_token: str | None = None) -> None:
             )
             return
 
-        if _check_cancelled(task_id):
-            mark_cancelled(task_id)
+        if await _check_cancelled(task_id):
+            await mark_cancelled_async(task_id)
             return
-        _ensure_owned(task_id, claim_token)
+        await _ensure_owned(task_id, claim_token)
 
         # --- Stage 4: Persist scan result ---
         try:
-            _ensure_owned(task_id, claim_token)
+            await _ensure_owned(task_id, claim_token)
             await asyncio.to_thread(save_scan_result, task_id, scan_result)
         except OwnershipLost:
             return
@@ -600,7 +603,7 @@ async def _process_task(task_id: str, claim_token: str | None = None) -> None:
                 "Scan result too large for task %s: %s",
                 task_id, type(e).__name__,
             )
-            fail_or_retry(
+            await fail_or_retry_async(
                 task_id, SCAN_RESULT_TOO_LARGE,
                 get_error_message(SCAN_RESULT_TOO_LARGE),
                 failure_category="INTERNAL_PERMANENT",
@@ -612,7 +615,7 @@ async def _process_task(task_id: str, claim_token: str | None = None) -> None:
                 "Scan result persistence failed for task %s: %s",
                 task_id, type(e).__name__,
             )
-            fail_or_retry(
+            await fail_or_retry_async(
                 task_id, SCAN_RESULT_PERSIST_FAILED,
                 get_error_message(SCAN_RESULT_PERSIST_FAILED),
                 failure_category="INTERNAL_TRANSIENT",
@@ -620,16 +623,16 @@ async def _process_task(task_id: str, claim_token: str | None = None) -> None:
             )
             return
 
-        if _check_cancelled(task_id):
-            mark_cancelled(task_id)
+        if await _check_cancelled(task_id):
+            await mark_cancelled_async(task_id)
             return
-        _ensure_owned(task_id, claim_token)
+        await _ensure_owned(task_id, claim_token)
 
         # --- Stage 5: Assess ---
-        _mark_running_owned(task_id, STAGE_ASSESSING, 90, claim_token)
+        await _mark_running_owned(task_id, STAGE_ASSESSING, 90, claim_token)
         assess_started = time.monotonic()
         try:
-            _ensure_owned(task_id, claim_token)
+            await _ensure_owned(task_id, claim_token)
             await asyncio.wait_for(
                 asyncio.to_thread(run_assessment, task_id),
                 timeout=settings.assess_timeout,
@@ -642,7 +645,7 @@ async def _process_task(task_id: str, claim_token: str | None = None) -> None:
         except OwnershipLost:
             return
         except TimeoutError:
-            fail_or_retry(
+            await fail_or_retry_async(
                 task_id, ASSESSMENT_TIMEOUT,
                 get_error_message(ASSESSMENT_TIMEOUT),
                 failure_category="INTERNAL_TRANSIENT",
@@ -654,7 +657,7 @@ async def _process_task(task_id: str, claim_token: str | None = None) -> None:
                 "Assessment result too large for task %s: %s",
                 task_id, type(e).__name__,
             )
-            fail_or_retry(
+            await fail_or_retry_async(
                 task_id, ASSESSMENT_RESULT_TOO_LARGE,
                 get_error_message(ASSESSMENT_RESULT_TOO_LARGE),
                 failure_category="INTERNAL_PERMANENT",
@@ -666,7 +669,7 @@ async def _process_task(task_id: str, claim_token: str | None = None) -> None:
                 "Assessment internal error for task %s: %s",
                 task_id, type(e).__name__,
             )
-            fail_or_retry(
+            await fail_or_retry_async(
                 task_id, ASSESSMENT_INTERNAL_ERROR,
                 get_error_message(ASSESSMENT_INTERNAL_ERROR),
                 failure_category="INTERNAL_TRANSIENT",
@@ -678,7 +681,7 @@ async def _process_task(task_id: str, claim_token: str | None = None) -> None:
                 "Assessment persistence failed for task %s: %s",
                 task_id, type(e).__name__,
             )
-            fail_or_retry(
+            await fail_or_retry_async(
                 task_id, ASSESSMENT_PERSIST_FAILED,
                 get_error_message(ASSESSMENT_PERSIST_FAILED),
                 failure_category="INTERNAL_TRANSIENT",
@@ -690,7 +693,7 @@ async def _process_task(task_id: str, claim_token: str | None = None) -> None:
                 "Assessment failed for task %s: %s",
                 task_id, type(e).__name__,
             )
-            fail_or_retry(
+            await fail_or_retry_async(
                 task_id, ASSESSMENT_INTERNAL_ERROR,
                 get_error_message(ASSESSMENT_INTERNAL_ERROR),
                 failure_category="INTERNAL_TRANSIENT",
@@ -698,15 +701,15 @@ async def _process_task(task_id: str, claim_token: str | None = None) -> None:
             )
             return
 
-        if _check_cancelled(task_id):
-            mark_cancelled(task_id)
+        if await _check_cancelled(task_id):
+            await mark_cancelled_async(task_id)
             return
-        _ensure_owned(task_id, claim_token)
+        await _ensure_owned(task_id, claim_token)
 
         # --- Stage 6: Repair plan ---
-        _mark_running_owned(task_id, STAGE_REPAIRING, 95, claim_token)
+        await _mark_running_owned(task_id, STAGE_REPAIRING, 95, claim_token)
         try:
-            _ensure_owned(task_id, claim_token)
+            await _ensure_owned(task_id, claim_token)
             await asyncio.wait_for(
                 asyncio.to_thread(generate_and_save_repair_plan, task_id),
                 timeout=settings.repair_plan_timeout,
@@ -714,7 +717,7 @@ async def _process_task(task_id: str, claim_token: str | None = None) -> None:
         except OwnershipLost:
             return
         except TimeoutError:
-            fail_or_retry(
+            await fail_or_retry_async(
                 task_id, REPAIR_PLAN_TIMEOUT,
                 get_error_message(REPAIR_PLAN_TIMEOUT),
                 failure_category="INTERNAL_TRANSIENT",
@@ -726,7 +729,7 @@ async def _process_task(task_id: str, claim_token: str | None = None) -> None:
                 "Repair plan too large for task %s: %s",
                 task_id, type(e).__name__,
             )
-            fail_or_retry(
+            await fail_or_retry_async(
                 task_id, REPAIR_PLAN_TOO_LARGE,
                 get_error_message(REPAIR_PLAN_TOO_LARGE),
                 failure_category="INTERNAL_PERMANENT",
@@ -738,7 +741,7 @@ async def _process_task(task_id: str, claim_token: str | None = None) -> None:
                 "Repair plan internal error for task %s: %s",
                 task_id, type(e).__name__,
             )
-            fail_or_retry(
+            await fail_or_retry_async(
                 task_id, REPAIR_PLAN_INTERNAL_ERROR,
                 get_error_message(REPAIR_PLAN_INTERNAL_ERROR),
                 failure_category="INTERNAL_TRANSIENT",
@@ -750,7 +753,7 @@ async def _process_task(task_id: str, claim_token: str | None = None) -> None:
                 "Repair plan persistence failed for task %s: %s",
                 task_id, type(e).__name__,
             )
-            fail_or_retry(
+            await fail_or_retry_async(
                 task_id, REPAIR_PLAN_PERSIST_FAILED,
                 get_error_message(REPAIR_PLAN_PERSIST_FAILED),
                 failure_category="INTERNAL_TRANSIENT",
@@ -762,7 +765,7 @@ async def _process_task(task_id: str, claim_token: str | None = None) -> None:
                 "Repair plan failed for task %s: %s",
                 task_id, type(e).__name__,
             )
-            fail_or_retry(
+            await fail_or_retry_async(
                 task_id, REPAIR_PLAN_INTERNAL_ERROR,
                 get_error_message(REPAIR_PLAN_INTERNAL_ERROR),
                 failure_category="INTERNAL_TRANSIENT",
@@ -770,13 +773,13 @@ async def _process_task(task_id: str, claim_token: str | None = None) -> None:
             )
             return
 
-        if _check_cancelled(task_id):
-            mark_cancelled(task_id)
+        if await _check_cancelled(task_id):
+            await mark_cancelled_async(task_id)
             return
-        _ensure_owned(task_id, claim_token)
+        await _ensure_owned(task_id, claim_token)
 
         # --- Stage 7: LLM analysis (NON-BLOCKING) ---
-        _mark_running_owned(task_id, STAGE_ANALYZING, 97, claim_token)
+        await _mark_running_owned(task_id, STAGE_ANALYZING, 97, claim_token)
         user_llm_config = get_user_config(task_id)
         try:
             await asyncio.wait_for(
@@ -799,13 +802,13 @@ async def _process_task(task_id: str, claim_token: str | None = None) -> None:
         finally:
             pop_user_config(task_id)
 
-        if _check_cancelled(task_id):
-            mark_cancelled(task_id)
+        if await _check_cancelled(task_id):
+            await mark_cancelled_async(task_id)
             return
-        _ensure_owned(task_id, claim_token)
+        await _ensure_owned(task_id, claim_token)
 
         # --- Stage 8: Complete ---
-        completed = mark_completed(
+        completed = await mark_completed_async(
             task_id,
             file_count=extract_result.file_count if extract_result else 0,
             total_size=extract_result.total_size if extract_result else 0,
@@ -824,7 +827,7 @@ async def _process_task(task_id: str, claim_token: str | None = None) -> None:
         logger.info("Worker lost ownership for task %s; stopping", task_id)
     except Exception as e:
         logger.error("Unexpected error in task %s: %s", task_id, type(e).__name__)
-        fail_or_retry(
+        await fail_or_retry_async(
             task_id, INTERNAL_ERROR, get_error_message(INTERNAL_ERROR),
             failure_category="INTERNAL_TRANSIENT",
             worker_id=claim_token,
@@ -842,8 +845,19 @@ async def _process_task(task_id: str, claim_token: str | None = None) -> None:
                 cleanup_failed = True
                 metrics_mod.inc_counter("vibecheck_cleanup_failures_total")
 
-        if extract_dest is not None and not _cleanup_task_dir(task_id, extract_dest):
-            cleanup_failed = True
+        if extract_dest is not None:
+            # Recursive temp cleanup can outlast any request budget, so it must
+            # not run on the event loop. The shield keeps a shutdown cancel from
+            # abandoning the delete — the worker thread finishes it either way.
+            cleanup = asyncio.shield(
+                asyncio.to_thread(_cleanup_task_dir, task_id, extract_dest)
+            )
+            try:
+                cleaned = await cleanup
+            except asyncio.CancelledError:
+                cleaned = False
+            if not cleaned:
+                cleanup_failed = True
 
         if cleanup_failed:
             logger.warning(
@@ -877,7 +891,7 @@ async def _dispatcher_loop() -> None:
     try:
         while not _stopping:
             try:
-                await asyncio.to_thread(refresh_queue_metrics)
+                await refresh_queue_metrics_async()
             except Exception:
                 pass
 
@@ -889,7 +903,7 @@ async def _dispatcher_loop() -> None:
             if now_m - last_reaper >= reaper_every:
                 last_reaper = now_m
                 try:
-                    await asyncio.to_thread(recover_expired_tasks)
+                    await recover_expired_tasks_async()
                 except Exception as e:
                     logger.error("Lease reaper failed: %s", type(e).__name__)
 
@@ -900,13 +914,11 @@ async def _dispatcher_loop() -> None:
 
             claimed = None
             claim_token = None
-            if has_claimable_pending():
+            if await has_claimable_pending_async():
                 try:
                     # Unique claim token per claim — never reuse process id.
                     claim_token = make_worker_id("claim")
-                    claimed = await asyncio.to_thread(
-                        claim_next_pending, claim_token
-                    )
+                    claimed = await claim_next_pending_async(claim_token)
                     if claimed is None:
                         claim_token = None
                 except Exception as e:
@@ -952,16 +964,24 @@ def _on_worker_done(
     )
     # Safe failure path when possible; otherwise lease reaper recovers.
     if task_id:
-        try:
-            fail_or_retry(
-                task_id,
-                INTERNAL_ERROR,
-                get_error_message(INTERNAL_ERROR),
-                failure_category="INTERNAL_TRANSIENT",
-                worker_id=claim_token,
-            )
-        except Exception:
-            logger.error("Safe-fail after worker exception also failed")
+        # Done callbacks run on the event loop, so the safe-fail is scheduled
+        # rather than awaited here.
+        bg = asyncio.create_task(_safe_fail(task_id, claim_token))
+        _background_tasks.add(bg)
+        bg.add_done_callback(_background_tasks.discard)
+
+
+async def _safe_fail(task_id: str, claim_token: str | None) -> None:
+    try:
+        await fail_or_retry_async(
+            task_id,
+            INTERNAL_ERROR,
+            get_error_message(INTERNAL_ERROR),
+            failure_category="INTERNAL_TRANSIENT",
+            worker_id=claim_token,
+        )
+    except Exception:
+        logger.error("Safe-fail after worker exception also failed")
 
 
 async def start_dispatcher() -> None:
@@ -1011,7 +1031,7 @@ async def trigger_queue_processing() -> None:
         try:
             while True:
                 token = make_worker_id("inline")
-                claimed = claim_next_pending(token)
+                claimed = await claim_next_pending_async(token)
                 if claimed is None:
                     break
                 await _process_task(claimed.id, token)
@@ -1020,7 +1040,7 @@ async def trigger_queue_processing() -> None:
         finally:
             _is_processing = False
             try:
-                refresh_queue_metrics()
+                await refresh_queue_metrics_async()
             except Exception:
                 pass
         return
@@ -1034,7 +1054,7 @@ async def drain_pending_tasks(max_tasks: int = 100) -> int:
     processed = 0
     while processed < max_tasks:
         token = make_worker_id("drain")
-        claimed = claim_next_pending(token)
+        claimed = await claim_next_pending_async(token)
         if claimed is None:
             break
         await _process_task(claimed.id, token)
@@ -1054,10 +1074,10 @@ def reset_runner_state() -> None:
         _dispatcher_task = None
 
 
-def cancel_task_locally(task_id: str) -> None:
+async def cancel_task_locally(task_id: str) -> None:
     """Signal cooperative cancel to a worker in this process."""
     _get_cancel_event(task_id).set()
-    mark_cancelled(task_id)
+    await mark_cancelled_async(task_id)
 
 
 def active_task_count() -> int:
@@ -1074,7 +1094,6 @@ __all__ = [
     "cancel_task_locally",
     "dispatcher_running",
     "drain_pending_tasks",
-    "is_queue_full",
     "reset_runner_state",
     "start_dispatcher",
     "stop_dispatcher",

@@ -6,9 +6,15 @@ on:
   pull_request:
     branches: [main]
 
+# One run per ref; a newer push to the same PR replaces the in-flight run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   backend-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     services:
       postgres:

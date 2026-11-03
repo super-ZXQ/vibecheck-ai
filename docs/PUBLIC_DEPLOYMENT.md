@@ -4,8 +4,9 @@
 
 VibeCheck production mode is:
 
-- **Single-instance bounded concurrency** (default `MAX_RUNNING_TASKS=2`)
-- **SQLite WAL** persistence — not a distributed queue
+- **Single-instance bounded concurrency** (default `MAX_RUNNING_TASKS=2`,
+  one uvicorn worker — see "Task execution knobs")
+- **PostgreSQL 16** persistence — not a distributed queue, no broker
 - Safe input handling + reliable background tasks as the engineering core
 - **Not** LangGraph / RAG / Text-to-SQL / Kafka / Kubernetes
 
@@ -13,14 +14,49 @@ Load and fault numbers in docs come from **local synthetic** experiments and
 **mocked** GitHub/LLM failures — not live business traffic — unless a future
 deployment record says otherwise.
 
+## Schema migration
+
+Alembic owns the production schema. Startup does not create tables in
+`production`; it verifies them and refuses to serve if migrations were not
+applied. Apply migrations before starting the backend:
+
+```
+docker compose -f docker-compose.production.yml up -d postgres
+docker compose -f docker-compose.production.yml run --rm backend alembic upgrade head
+docker compose -f docker-compose.production.yml up -d backend frontend
+```
+
+`/api/ready` returns 503 with `"database schema is not initialized — run
+`alembic upgrade head`"` in the server log until step 2 has run.
+
 ## Required production config
 
 See `production.env.example`. Backend refuses to start in `production` when:
 
 - `PRODUCTION_CONFIG_CONFIRMED` is not true
-- Database path is not a SQLite `.db` under `/data`
+- `DATABASE_URL` is not a PostgreSQL `asyncpg` URL
+- `DATABASE_URL` still uses the development `vibecheck:vibecheck` credentials
 - Trusted hosts omit `127.0.0.1` or contain `*`
 - CORS uses wildcard
+
+## Database connections
+
+The application engine is created once on the FastAPI lifespan event loop and
+pools connections (`DB_POOL_SIZE=5`, `DB_MAX_OVERFLOW=10`,
+`DB_POOL_RECYCLE_SECONDS=1800`; disabled under `APP_ENV=test`).
+
+asyncpg binds every connection to the loop that opened it, so a second event
+loop cannot check one out of that pool. `app/db/session.py` therefore gives any
+foreign loop its own **unpooled** engine instead of handing it a poisoned
+connection. Sync facades called from `asyncio.to_thread` land on that per-loop
+engine: correct, but uncached. Keep request and worker paths on the `*_async`
+functions so they stay on the pooled engine.
+
+| Env | Default | Meaning |
+| --- | --- | --- |
+| `DB_POOL_SIZE` | 5 | Persistent pooled connections on the app loop |
+| `DB_MAX_OVERFLOW` | 10 | Extra connections allowed above the pool |
+| `DB_POOL_RECYCLE_SECONDS` | 1800 | Recycle age, survives DB restarts |
 
 ## Task execution knobs
 
@@ -51,6 +87,24 @@ See `production.env.example`. Backend refuses to start in `production` when:
 User LLM keys are process-memory only. After restart they are gone; scan
 results remain valid; LLM stage falls back to templates with `source=fallback`.
 
+## Task ownership header
+
+`X-Submitter-Key` is the second browser-held header. The frontend generates an
+anonymous 32-character key once, stores it in localStorage, and sends it on
+every task request; the backend records it on the task and requires the same
+value to read or cancel it. `allow_headers` in `app/main.py` must keep it or
+browsers cannot send it across origins.
+
+- Migration `0002_submitter_key` adds one nullable column; no backfill and no
+  downtime. Tasks created before the upgrade stay reachable by task id, which
+  matters only until the retention window passes.
+- Requests with a wrong or absent key get the same `404 TASK_NOT_FOUND` as an
+  unknown task, so the check does not confirm existence.
+- A submission without the header records no owner and remains reachable by
+  task id alone — an intentional opt-out for API clients, not for the site.
+- The key is never stored server-side beyond that column, never returned, and
+  not an identity: clearing browser data drops access to that browser's tasks.
+
 ## Restart behavior
 
 Crash-safe: expired leases re-queue; pending tasks stay pending. Operators
@@ -64,6 +118,8 @@ HTTPS origins and append public hostnames to `TRUSTED_HOSTS`. Keep
 
 ## What we still do not provide
 
+- Accounts: task ownership is per browser, not per person, and cannot be
+  recovered if the browser's localStorage is cleared
 - Horizontal scale-out of the task queue
 - Exactly-once external side effects across multiple replicas
 - Real production traffic SLOs

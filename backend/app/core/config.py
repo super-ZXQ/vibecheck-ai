@@ -5,10 +5,17 @@ and NEVER hardcoded. This module is the single source of truth for all limits.
 """
 
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
+
+# Credentials that only ever exist as development defaults or documented
+# placeholders. A production URL carrying one means the operator copied the
+# example file without changing it.
+_PLACEHOLDER_DB_PASSWORDS = frozenset(
+    {"vibecheck", "change-me", "changeme", "postgres", "password"}
+)
 
 
 def validate_production_database_url(database_url: str) -> None:
@@ -31,6 +38,15 @@ def validate_production_database_url(database_url: str) -> None:
     if "://" in database_url and "@" not in database_url:
         # Allow trust/peer sockets only if explicitly intentional — require user.
         raise ValueError("production database_url must include user credentials")
+
+    # Presence of credentials is not enough: the shipped development pair and
+    # the placeholder in production.env.example both satisfy "has a password".
+    password = unquote(parsed.password or "")
+    if password in _PLACEHOLDER_DB_PASSWORDS:
+        raise ValueError(
+            "production database_url must not use a placeholder password "
+            f"({', '.join(sorted(_PLACEHOLDER_DB_PASSWORDS))})"
+        )
 
 
 class Settings(BaseSettings):
@@ -171,10 +187,17 @@ class Settings(BaseSettings):
 
     # --- Temp directory ---
     tmp_dir: str = "/tmp/vibecheck"  # isolated temp root
+    # Startup cleanup only removes entries older than this. Every worker uses
+    # the same shared tmp root, so a shorter TTL would let one worker's startup
+    # delete another worker's in-flight download/extract directories.
+    temp_file_ttl_seconds: int = Field(default=3600, ge=60)
 
     # --- Database ---
     # Production/runtime default is PostgreSQL via asyncpg.
     # SQLite is reserved for isolated unit tests only (not production).
+    # This is the docker-compose development credential; the production
+    # validator rejects it, so it can never be the secret a real deployment
+    # silently inherits.
     database_url: str = "postgresql+asyncpg://vibecheck:vibecheck@127.0.0.1:5432/vibecheck"
     db_pool_size: int = Field(default=5, ge=1, le=50)
     db_max_overflow: int = Field(default=10, ge=0, le=100)
@@ -202,6 +225,29 @@ class Settings(BaseSettings):
         if v > int(lease):
             raise ValueError("lease_reaper_seconds must be <= task_lease_seconds")
         return v
+
+    @model_validator(mode="after")
+    def _temp_ttl_exceeds_task_lifetime(self) -> "Settings":
+        """A temp entry must outlive the task that owns it.
+
+        Worst case a live task holds a download/extract directory for the sum
+        of every stage timeout plus one full lease; cleanup older than that can
+        delete another worker's in-flight data.
+        """
+        live_bound = (
+            self.download_timeout
+            + self.extract_timeout
+            + self.scan_timeout
+            + self.assess_timeout
+            + self.repair_plan_timeout
+            + self.llm_analysis_timeout
+            + self.task_lease_seconds
+        )
+        if self.temp_file_ttl_seconds <= live_bound:
+            raise ValueError(
+                f"temp_file_ttl_seconds must exceed {live_bound}s of task lifetime"
+            )
+        return self
 
     # --- Report expiry (P2-3) ---
     # Completed/failed tasks older than this are eligible for cleanup.

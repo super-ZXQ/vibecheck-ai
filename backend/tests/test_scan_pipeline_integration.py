@@ -254,11 +254,13 @@ class TestPipelineIntegration:
 
         # Track stage updates
         stage_updates = []
-        original_mark_running = task_manager.mark_running
+        original_mark_running = task_manager.mark_running_async
 
-        def tracking_mark_running(task_id, stage, progress, worker_id=None):
+        async def tracking_mark_running(task_id, stage, progress, worker_id=None):
             stage_updates.append((stage, progress))
-            return original_mark_running(task_id, stage, progress, worker_id=worker_id)
+            return await original_mark_running(
+                task_id, stage, progress, worker_id=worker_id
+            )
 
         with patch(
             "app.services.background_runner.download_tarball",
@@ -267,7 +269,7 @@ class TestPipelineIntegration:
             "app.services.background_runner.safe_extract_to_temp",
             return_value=extract_result,
         ), patch(
-            "app.services.background_runner.mark_running",
+            "app.services.background_runner.mark_running_async",
             side_effect=tracking_mark_running,
         ):
             await background_runner._process_task(task.id)

@@ -4,8 +4,8 @@ Covers the five test categories required by the P0-5 review:
 
 1. Lightweight summary read — get_scan_summary reads only summary_json,
    never parsing full result_json for new records.
-2. Result endpoint event loop — asyncio.to_thread keeps the event loop
-   responsive during up to 8 MB SQLite reads.
+2. Result endpoint concurrency — the persisted-result read is awaited on
+   the request loop, so concurrent polls overlap instead of serialising.
 3. Failed + residual result — failed tasks never return residual
    scan_results, even when save succeeded but mark_completed threw.
 4. Config boundaries — Field(ge=1) rejects 0 and -1; defensive
@@ -16,7 +16,6 @@ Covers the five test categories required by the P0-5 review:
 
 import asyncio
 import json
-import threading
 from pathlib import Path
 from unittest.mock import patch
 
@@ -42,6 +41,7 @@ from app.services import background_runner, task_manager
 from app.services.scan_result_service import (
     SCHEMA_VERSION,
     get_scan_result,
+    get_scan_result_async,
     get_scan_summary,
     save_scan_result,
 )
@@ -288,70 +288,62 @@ class TestLightweightSummaryRead:
 # ============================================================
 
 class TestResultEndpointEventLoop:
-    """Verify the result endpoint uses asyncio.to_thread and doesn't block.
+    """Verify concurrent result reads overlap instead of serialising.
 
-    monkeypatches get_scan_result to block on a threading.Event while
-    running in a thread. The asyncio event loop must remain responsive
-    to other concurrent tasks during this period.
+    The awaited loader is replaced with a coroutine that parks until two
+    readers are in flight. A sync facade (or a thread hop that pins the
+    request) cannot overlap, so the gather would hit the timeout.
     """
 
     @pytest.mark.asyncio
-    async def test_event_loop_responsive_during_result_read(self, test_db):
-        """While get_scan_result blocks in a thread, event loop stays responsive."""
+    async def test_concurrent_result_reads_overlap(self, test_db):
+        """Two in-flight result reads must run concurrently."""
         from app.api.check import get_check_result
 
-        task = task_manager.create_task(
-            "https://github.com/testuser/testrepo", "testuser", "testrepo"
-        )
-        result = ScanResult(
-            findings=(), notices=(), skipped_files=(),
-            scan_errors=(), total_files_scanned=1, total_lines_scanned=10,
-        )
-        save_scan_result(task.id, result)
-        task_manager.mark_completed(task.id, 1, 10, "test-repo")
+        task_ids = []
+        for index in range(2):
+            task = task_manager.create_task(
+                f"https://github.com/testuser/testrepo{index}",
+                "testuser",
+                f"testrepo{index}",
+            )
+            result = ScanResult(
+                findings=(), notices=(), skipped_files=(),
+                scan_errors=(), total_files_scanned=1, total_lines_scanned=10,
+            )
+            save_scan_result(task.id, result)
+            task_manager.mark_completed(task.id, 1, 10, "test-repo")
+            task_ids.append(task.id)
 
-        read_event = threading.Event()
-        read_started = threading.Event()
-        loop_was_responsive = False
+        in_flight = 0
+        max_in_flight = 0
+        release = asyncio.Event()
 
-        original_get_result = get_scan_result
-
-        def blocking_get_result(tid):
-            read_started.set()
-            read_event.wait(timeout=5)
-            return original_get_result(tid)
-
-        async def check_responsiveness():
-            nonlocal loop_was_responsive
-            await asyncio.sleep(0.05)
-            loop_was_responsive = True
+        async def overlapping_load(task_id: str):
+            nonlocal in_flight, max_in_flight
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            if in_flight >= 2:
+                release.set()
+            await release.wait()
+            in_flight -= 1
+            return await get_scan_result_async(task_id)
 
         with patch(
-            "app.api.check.get_scan_result",
-            side_effect=blocking_get_result,
+            "app.api.check.get_scan_result_async",
+            new=overlapping_load,
         ):
-            # Start the result request in the background
-            result_task = asyncio.create_task(get_check_result(task.id))
-
-            # Wait for get_scan_result to start in the thread
-            for _ in range(200):
-                if read_started.is_set():
-                    break
-                await asyncio.sleep(0.01)
-            assert read_started.is_set(), "get_scan_result did not start"
-
-            # While blocked in thread, verify event loop is responsive
-            await check_responsiveness()
-            assert loop_was_responsive, (
-                "Event loop was blocked during result read — "
-                "asyncio.to_thread was not used"
+            responses = await asyncio.wait_for(
+                asyncio.gather(
+                    *(get_check_result(task_id) for task_id in task_ids)
+                ),
+                timeout=5,
             )
 
-            # Release the blocked thread
-            read_event.set()
-
-            # Wait for the result
-            response = await result_task
+        assert max_in_flight == 2, (
+            "Result reads serialised — the endpoint is not awaiting its DB read"
+        )
+        for response in responses:
             assert response is not None
             assert "findings" in response
             assert "summary" in response
@@ -437,7 +429,7 @@ class TestFailedWithResidualResult:
             "app.services.background_runner.safe_extract_to_temp",
             return_value=extract_result,
         ), patch(
-            "app.services.background_runner.mark_completed",
+            "app.services.background_runner.mark_completed_async",
             side_effect=RuntimeError("simulated mark_completed failure"),
         ):
             await background_runner._process_task(task.id)

@@ -30,6 +30,7 @@ from app.core.error_codes import (
     REPAIR_PLAN_NOT_READY,
     get_error_message,
 )
+from app.core.task_access import SubmitterKeyHeader, ensure_task_access
 from app.services.repair_policy import (
     POLICY_VERSION,
     REPAIR_SCHEMA_VERSION,
@@ -88,11 +89,13 @@ def _build_safe_empty_repair_plan(task_id: str) -> dict:
 
 
 @router.get("/api/check/{task_id}/repair-plan")
-async def get_repair_plan(task_id: str):
+async def get_repair_plan(
+    task_id: str, x_submitter_key: SubmitterKeyHeader = None
+):
     """Get the full persisted repair plan for a completed task.
 
     Strict state-ordered branching:
-    1. task not found → 404
+    1. task not found (or owned by another submitter key) → 404
     2. pending/running → 409 REPAIR_PLAN_NOT_READY (does NOT read repair_results)
     3. failed → fixed safe empty repair plan (does NOT read repair_results,
        even if a residual record exists from a partial pipeline)
@@ -130,6 +133,7 @@ async def get_repair_plan(task_id: str):
                 "error_message": "任务不存在。",
             },
         )
+    ensure_task_access(task, x_submitter_key)
 
     # --- Case 2: pending/running → 409 (does NOT read repair_results) ---
     if task.status in (STATUS_PENDING, STATUS_RUNNING):

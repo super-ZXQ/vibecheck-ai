@@ -585,6 +585,16 @@ def get_scan_result(task_id: str) -> dict | None:
     return normalize_scan_result_dimensions(parsed)
 
 
+async def get_scan_result_async(task_id: str) -> dict | None:
+    """Awaitable variant for request handlers, avoiding the sync thread-pool hop."""
+    from app.services.result_repository import get_scan_result_async as _load
+
+    parsed = await _load(task_id)
+    if parsed is None:
+        return None
+    return normalize_scan_result_dimensions(parsed)
+
+
 def get_scan_summary(task_id: str) -> dict | None:
     """Get only the summary portion of a persisted scan result."""
     from app.services.result_repository import get_scan_summary_sync

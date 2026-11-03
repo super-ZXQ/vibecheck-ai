@@ -439,7 +439,7 @@ class TestRepairPipeline:
             "app.services.background_runner.scan_directory",
             return_value=scan_result,
         ), patch(
-            "app.services.background_runner.mark_completed",
+            "app.services.background_runner.mark_completed_async",
             side_effect=RuntimeError("DB error during mark_completed"),
         ):
             _run_pipeline(task.id)
@@ -568,7 +568,7 @@ class TestRepairPipeline:
             "app.services.background_runner.scan_directory",
             return_value=scan3,
         ), patch(
-            "app.services.background_runner.mark_completed",
+            "app.services.background_runner.mark_completed_async",
             side_effect=RuntimeError("mark_completed failed"),
         ), patch(
             "app.services.background_runner.cleanup_download",

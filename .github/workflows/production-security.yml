@@ -6,9 +6,15 @@ on:
   pull_request:
     branches: [main]
 
+# One run per ref; a newer push to the same PR replaces the in-flight run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   python-dependency-audit:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout code
@@ -30,6 +36,7 @@ jobs:
 
   production-containers:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: python-dependency-audit
     env:
       NEXT_PUBLIC_API_BASE_URL: http://localhost:8000

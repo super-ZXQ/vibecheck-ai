@@ -50,6 +50,7 @@ async def admit_repo_task_async(
     *,
     scanner_version: str | None = None,
     max_attempts: int | None = None,
+    submitter_key: str | None = None,
 ) -> tuple[TaskRecord, bool]:
     """Async admission wrapper for API routes."""
     factory = get_session_factory()
@@ -62,6 +63,7 @@ async def admit_repo_task_async(
                 repo_name,
                 scanner_version=scanner_version,
                 max_attempts=max_attempts,
+                submitter_key=submitter_key,
             )
             await session.commit()
             return task, created
@@ -77,6 +79,7 @@ def admit_repo_task(
     *,
     scanner_version: str | None = None,
     max_attempts: int | None = None,
+    submitter_key: str | None = None,
 ) -> tuple[TaskRecord, bool]:
     """Sync facade for tests/scripts."""
     return _run_sync(
@@ -86,6 +89,7 @@ def admit_repo_task(
             repo_name,
             scanner_version=scanner_version,
             max_attempts=max_attempts,
+            submitter_key=submitter_key,
         )
     )
 
@@ -96,12 +100,18 @@ async def admit_upload_task_async(
     repo_name: str,
     *,
     max_attempts: int | None = None,
+    submitter_key: str | None = None,
 ) -> TaskRecord:
     factory = get_session_factory()
     async with factory() as session:
         try:
             task = await task_repo.admit_upload_task(
-                session, repo_url, owner, repo_name, max_attempts=max_attempts
+                session,
+                repo_url,
+                owner,
+                repo_name,
+                max_attempts=max_attempts,
+                submitter_key=submitter_key,
             )
             await session.commit()
             return task
@@ -116,10 +126,15 @@ def admit_upload_task(
     repo_name: str,
     *,
     max_attempts: int | None = None,
+    submitter_key: str | None = None,
 ) -> TaskRecord:
     return _run_sync(
         admit_upload_task_async(
-            repo_url, owner, repo_name, max_attempts=max_attempts
+            repo_url,
+            owner,
+            repo_name,
+            max_attempts=max_attempts,
+            submitter_key=submitter_key,
         )
     )
 
@@ -177,15 +192,6 @@ def _run_sync(coro: Coroutine[Any, Any, T]) -> T:
         return pool.submit(asyncio.run, coro).result()  # type: ignore[arg-type]
 
 
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)  # type: ignore[arg-type]
-    # Already inside an event loop: run in a worker thread with its own loop.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, coro).result()  # type: ignore[arg-type]
-
-
 async def _with_session(fn, *args, **kwargs):
     factory = get_session_factory()
     async with factory() as session:
@@ -208,6 +214,7 @@ async def create_task_async(
     *,
     scanner_version: str | None = None,
     max_attempts: int | None = None,
+    submitter_key: str | None = None,
 ) -> TaskRecord:
     import uuid as _uuid
 
@@ -231,6 +238,7 @@ async def create_task_async(
             attempt_count=0,
             max_attempts=max_attempts or settings.max_task_attempts,
             scanner_version=version,
+            submitter_key=submitter_key,
         )
         session.add(row)
         await session.commit()
@@ -335,6 +343,30 @@ async def touch_heartbeat_async(task_id: str, worker_id: str | None = None) -> b
     return await _with_session(task_repo.touch_heartbeat, task_id, worker_id)
 
 
+async def mark_cancelled_async(task_id: str) -> bool:
+    return await _with_session(task_repo.mark_cancelled, task_id)
+
+
+async def is_cancel_requested_async(task_id: str) -> bool:
+    return await _with_session(task_repo.is_cancel_requested, task_id)
+
+
+async def has_claimable_pending_async() -> bool:
+    return await _with_session(task_repo.has_claimable_pending)
+
+
+async def set_resolved_commit_sha_async(task_id: str, commit_sha: str | None) -> None:
+    await _with_session(task_repo.set_resolved_commit_sha, task_id, commit_sha)
+
+
+async def find_completed_by_repo_sha_async(
+    repo_url: str, commit_sha: str | None, scanner_version: str | None = None
+):
+    return await _with_session(
+        task_repo.find_completed_by_repo_sha, repo_url, commit_sha, scanner_version
+    )
+
+
 async def complete_as_reused_async(
     new_task_id: str, source_task: TaskRecord
 ) -> bool:
@@ -378,6 +410,7 @@ def create_task(
     *,
     scanner_version: str | None = None,
     max_attempts: int | None = None,
+    submitter_key: str | None = None,
 ) -> TaskRecord:
     return _run_sync(
         create_task_async(
@@ -386,6 +419,7 @@ def create_task(
             repo_name,
             scanner_version=scanner_version,
             max_attempts=max_attempts,
+            submitter_key=submitter_key,
         )
     )
 

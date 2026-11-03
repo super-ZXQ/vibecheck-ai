@@ -102,7 +102,7 @@ def render_prometheus() -> str:
         )
 
         known_gauges = {
-            "vibecheck_queue_depth": "Pending tasks in SQLite queue",
+            "vibecheck_queue_depth": "Pending tasks in the PostgreSQL queue",
             "vibecheck_active_tasks": "Tasks currently running",
             "vibecheck_temp_bytes": "Approximate bytes used under tmp_dir",
             "vibecheck_llm_keys_in_memory": "BYOK credentials currently in memory (count only)",

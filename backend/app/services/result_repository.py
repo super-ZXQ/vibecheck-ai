@@ -52,6 +52,10 @@ def get_scan_result_sync(task_id: str) -> dict[str, Any] | None:
     return _run(_with_session(result_repo.get_scan_result, task_id))
 
 
+async def get_scan_result_async(task_id: str) -> dict[str, Any] | None:
+    return await _with_session(result_repo.get_scan_result, task_id)
+
+
 def get_scan_summary_sync(task_id: str) -> dict[str, Any] | None:
     return _run(_with_session(result_repo.get_scan_summary, task_id))
 
@@ -75,6 +79,10 @@ def save_assessment_sync(task_id: str, payload: dict[str, Any]) -> None:
 
 def get_assessment_sync(task_id: str) -> dict[str, Any] | None:
     return _run(_with_session(result_repo.get_assessment, task_id))
+
+
+async def get_assessment_async(task_id: str) -> dict[str, Any] | None:
+    return await _with_session(result_repo.get_assessment, task_id)
 
 
 def get_assessment_score_verdict_sync(task_id: str) -> tuple[int, str] | None:
@@ -133,6 +141,10 @@ def save_llm_analysis_sync(task_id: str, payload: dict[str, Any]) -> None:
 
 def get_llm_analysis_sync(task_id: str) -> dict[str, Any] | None:
     return _run(_with_session(result_repo.get_llm_analysis, task_id))
+
+
+async def get_llm_analysis_async(task_id: str) -> dict[str, Any] | None:
+    return await _with_session(result_repo.get_llm_analysis, task_id)
 
 
 def get_llm_analysis_available_sync(task_id: str) -> bool:
