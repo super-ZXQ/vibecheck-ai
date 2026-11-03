@@ -22,6 +22,10 @@ from app.api.assessment import router as assessment_router
 from app.api.check import router as check_router
 from app.api.repair import router as repair_router
 from app.core.config import Settings, settings
+from app.core.rate_limit import (
+    SubmissionRateLimitMiddleware,
+    build_submission_limiter,
+)
 from app.core.security_headers import SecurityHeadersMiddleware
 from app.db.database import init_db_async
 from app.db.session import check_database_ready, dispose_engine
@@ -115,6 +119,17 @@ def create_app(app_settings: Settings = settings) -> FastAPI:
         lifespan=lifespan,
     )
 
+    limiter = (
+        build_submission_limiter(app_settings)
+        if app_settings.rate_limit_enabled and app_settings.app_env != "test"
+        else None
+    )
+    api.state.rate_limiter = limiter
+    api.state.rate_limit_enabled = limiter is not None
+
+    # Added first so it stays inside CORS: a 429 must still carry the
+    # cross-origin headers the browser needs before it can read the body.
+    api.add_middleware(SubmissionRateLimitMiddleware)
     api.add_middleware(
         CORSMiddleware,
         allow_origins=app_settings.cors_allowed_origins,

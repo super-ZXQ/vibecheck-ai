@@ -207,6 +207,16 @@ class Settings(BaseSettings):
     max_pending_tasks: int = 5  # max pending tasks in queue
     max_running_tasks: int = Field(default=2, ge=1, le=32)  # bounded concurrency
 
+    # --- Submission rate limiting (token buckets) ---
+    # Only POST /api/check and POST /api/check/upload are limited; status
+    # polling stays untouched. The IP bucket is the anchor a caller cannot
+    # mint, while the submitter key bucket adds per-browser friction.
+    rate_limit_enabled: bool = True
+    rate_limit_ip_per_minute: int = Field(default=10, ge=1, le=1000)
+    rate_limit_ip_burst: int = Field(default=5, ge=1, le=200)
+    rate_limit_submitter_per_minute: int = Field(default=3, ge=1, le=1000)
+    rate_limit_submitter_burst: int = Field(default=2, ge=1, le=200)
+
     # --- Task lease / retry ---
     task_lease_seconds: int = Field(default=120, ge=10)
     task_heartbeat_seconds: int = Field(default=20, ge=1)

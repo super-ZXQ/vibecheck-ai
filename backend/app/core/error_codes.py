@@ -38,6 +38,9 @@ INVALID_SUBMITTER_KEY = "INVALID_SUBMITTER_KEY"
 # --- Queue errors ---
 QUEUE_FULL = "QUEUE_FULL"
 
+# --- Request throttling ---
+RATE_LIMITED = "RATE_LIMITED"
+
 # --- Scan errors (P0-5) ---
 SCAN_INTERNAL_ERROR = "SCAN_INTERNAL_ERROR"
 SCAN_RESULT_PERSIST_FAILED = "SCAN_RESULT_PERSIST_FAILED"
@@ -103,6 +106,7 @@ _ERROR_MESSAGES = {
     INVALID_UPLOAD: "上传文件格式无效或包含不安全内容，请选择有效的压缩包或文件夹。",
     INVALID_SUBMITTER_KEY: "提交者标识格式无效，需为 16-64 位字母、数字、下划线或短横线。",
     QUEUE_FULL: "检测队列已满，请稍后重试。",
+    RATE_LIMITED: "提交过于频繁，请稍后重试。",
     SCAN_INTERNAL_ERROR: "扫描过程中发生内部错误，请稍后重试。",
     SCAN_RESULT_PERSIST_FAILED: "扫描结果保存失败，请稍后重试。",
     SCAN_RESULT_NOT_READY: "扫描结果尚未生成，请稍后重试。",

@@ -37,6 +37,7 @@ const ERROR_MESSAGES: Record<string, string> = {
 
   // Queue errors
   QUEUE_FULL: "检测队列已满，请稍后重试。",
+  RATE_LIMITED: "提交过于频繁，请稍后重试。",
 
   // Scan errors (P0-5)
   SCAN_INTERNAL_ERROR: "扫描过程中发生内部错误，请稍后重试。",

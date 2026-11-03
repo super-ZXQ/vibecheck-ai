@@ -86,6 +86,8 @@ Retry / Recovery / Cancel / Dedup
 | `TASK_LEASE_SECONDS` / `TASK_HEARTBEAT_SECONDS` | lease / 心跳 |
 | `MAX_TASK_ATTEMPTS` | 3 |
 | `LEASE_REAPER_SECONDS` | 30，运行期 lease 回收 |
+| `RATE_LIMIT_IP_PER_MINUTE` / `RATE_LIMIT_IP_BURST` | 10 / 5，单 IP 令牌桶，超限返回 `429 RATE_LIMITED` |
+| `RATE_LIMIT_SUBMITTER_PER_MINUTE` / `RATE_LIMIT_SUBMITTER_BURST` | 3 / 2，单浏览器归属键令牌桶 |
 
 开发 compose 会启动 PostgreSQL healthcheck；backend `depends_on: service_healthy`。
 迁移：`cd backend && alembic upgrade head`。

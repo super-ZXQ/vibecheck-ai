@@ -105,6 +105,30 @@ test.describe("Queue full error", () => {
   });
 });
 
+test.describe("Rate limited error", () => {
+  test("displays the throttle message for a 429 RATE_LIMITED", async ({ page }) => {
+    await page.route(`${API_BASE}/api/check`, (route) => {
+      route.fulfill({
+        status: 429,
+        contentType: "application/json",
+        body: JSON.stringify({
+          detail: {
+            error_code: "RATE_LIMITED",
+            error_message: "这段响应内容不应显示。",
+          },
+        }),
+      });
+    });
+
+    await page.goto("/");
+    await page.fill('input[aria-label="GitHub 仓库地址"]', "https://github.com/owner/repo");
+    await page.click('button[type="submit"]');
+
+    await expect(page.locator(".error-box")).toContainText("提交过于频繁");
+    await expect(page.locator(".error-box")).not.toContainText("这段响应内容");
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Test 12: Malicious raw error content not rendered
 // ---------------------------------------------------------------------------

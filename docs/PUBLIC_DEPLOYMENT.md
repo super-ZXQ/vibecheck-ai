@@ -70,6 +70,32 @@ functions so they stay on the pooled engine.
 | `RETRY_BASE_SECONDS` | 2 | Backoff base |
 | `RETRY_MAX_SECONDS` | 60 | Backoff cap |
 
+## Submission rate limits
+
+`POST /api/check` and `POST /api/check/upload` share two token buckets: one per
+client IP (the anchor a caller cannot mint) and one per `X-Submitter-Key` (one
+browser's friction). Both must allow the request; otherwise the response is
+`429 RATE_LIMITED` with a `Retry-After` header. Status polling is a GET and is
+never throttled.
+
+| Env | Default | Meaning |
+| --- | --- | --- |
+| `RATE_LIMIT_ENABLED` | true | Set false to disable both buckets |
+| `RATE_LIMIT_IP_PER_MINUTE` | 10 | Sustained submissions per client IP |
+| `RATE_LIMIT_IP_BURST` | 5 | Initial burst per client IP |
+| `RATE_LIMIT_SUBMITTER_PER_MINUTE` | 3 | Sustained submissions per submitter key |
+| `RATE_LIMIT_SUBMITTER_BURST` | 2 | Initial burst per submitter key |
+
+Buckets live in process memory, which matches the single-uvicorn-worker model:
+there is one shared budget, and a restart resets it.
+
+The IP bucket reads `request.client.host`. Behind the TLS proxy described below,
+that is the proxy address unless uvicorn trusts the proxy's forwarding header.
+Set `FORWARDED_ALLOW_IPS` to the proxy address (uvicorn's default is
+`127.0.0.1`, which matches the shipped loopback bind). Without it every visitor
+shares one bucket and normal traffic throttles itself. Never set it to `*`:
+clients could then spoof `X-Forwarded-For` and bypass the per-IP limit.
+
 ## Endpoints
 
 | Endpoint | Notes |
