@@ -10,6 +10,9 @@
  * - AbortError never surfaces internal details.
  * - API responses are NEVER written to console, localStorage, sessionStorage,
  *   or IndexedDB.
+ * - Every task request carries X-Submitter-Key, an anonymous key this browser
+ *   generates and stores itself (lib/submitter-key.mjs). It is never received
+ *   from the server, logged, or included in exports.
  * - NEXT_PUBLIC_API_BASE_URL must be set. Missing → ApiConfigError at call
  *   time (not at module import time). No localhost fallback.
  */
@@ -35,6 +38,7 @@ import {
   throwAbortOutcome,
 } from "./api-abort.mjs";
 import { buildLLMHeaders } from "./llm-config";
+import { buildSubmitterHeaders } from "./submitter-key.mjs";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -142,8 +146,13 @@ async function apiFetch<T>(path: string, options: FetchOptions): Promise<T> {
               Accept: "application/json",
               // Per-user LLM config (only fields the user filled in).
               ...buildLLMHeaders(),
+              // Anonymous task ownership key.
+              ...buildSubmitterHeaders(),
             }
-          : { Accept: "application/json" },
+          : {
+              Accept: "application/json",
+              ...buildSubmitterHeaders(),
+            },
       signal: internalSignal,
     };
 
@@ -286,7 +295,7 @@ export async function submitUpload(
         body: formData,
         cache: "no-store" as RequestCache,
         // Per-user LLM config (only fields the user filled in).
-        headers: buildLLMHeaders(),
+        headers: { ...buildLLMHeaders(), ...buildSubmitterHeaders() },
         signal: internalSignal,
       });
     } catch {
