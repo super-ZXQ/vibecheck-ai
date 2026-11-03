@@ -143,6 +143,18 @@ class TestBoundedConcurrency:
             for i in range(6)
         ]
 
+        async def current_statuses() -> list[str]:
+            # Async reads on this loop: the sync facade would start a thread,
+            # a fresh event loop and an unpooled engine per status check, which
+            # leaks connections under the polling loop on a slow CI box.
+            records = await asyncio.gather(
+                *(task_manager.get_task_async(t.id) for t in tasks)
+            )
+            return [
+                record.status if record is not None else "missing"
+                for record in records
+            ]
+
         with patch(
             "app.services.background_runner.download_tarball",
             side_effect=slow_download,
@@ -153,7 +165,7 @@ class TestBoundedConcurrency:
             await background_runner.start_dispatcher()
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
-                statuses = [task_manager.get_task(t.id).status for t in tasks]
+                statuses = await current_statuses()
                 if all(s in ("completed", "failed", "dead") for s in statuses):
                     break
                 await asyncio.sleep(0.05)
@@ -166,7 +178,7 @@ class TestBoundedConcurrency:
 
         assert max_seen <= 2
         assert max_seen >= 1
-        finals = [task_manager.get_task(t.id).status for t in tasks]
+        finals = await current_statuses()
         assert all(s == "completed" for s in finals), finals
 
 
