@@ -70,6 +70,8 @@ export interface TaskStatusResponse {
   repair_plan_url: string | null;
   llm_analysis_available: boolean | null;
   llm_analysis_url: string | null;
+  quality_report_available: boolean | null;
+  quality_report_url: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +259,84 @@ export interface LLMAnalysisResult {
   total_fallback: number;
   source: string;
   items: LLMAnalysisItem[];
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/check/{task_id}/quality-report
+// ---------------------------------------------------------------------------
+
+export type QualityBlockStatus =
+  | "completed"
+  | "partial"
+  | "not_completed"
+  | "not_applicable";
+
+export interface QualityEvidence {
+  method: string;
+  detail: string;
+  file_path: string | null;
+  line_start: number | null;
+  line_end: number | null;
+  snippet: string;
+}
+
+export interface QualityItem {
+  item_id: string;
+  dimension: string;
+  category: string;
+  conclusion: string;
+  confidence: string; // "high" | "medium" | "low"
+  severity: string; // "P0" | "P1" | "P2" | "P3"
+  title: string;
+  impact: string;
+  suggestion: string;
+  fixability: string; // "auto_fix" | "diff_only" | "report_only"
+  manual_decision_required: boolean;
+  limitation: string;
+  rule_id: string;
+  evidence: QualityEvidence[];
+  details: Record<string, unknown>;
+}
+
+export interface QualityBlock {
+  dimension: string;
+  label: string;
+  status: QualityBlockStatus;
+  reason_code: string | null;
+  reason_message: string;
+  conclusion: {
+    headline?: string;
+    counts?: Record<string, number>;
+  };
+  evidence: QualityEvidence[];
+  items: QualityItem[];
+  fixable_item_ids: string[];
+  manual_confirm_item_ids: string[];
+  verification: Record<string, unknown>;
+  coverage: Record<string, unknown>;
+  details: Record<string, unknown>;
+  truncated: boolean;
+  truncation_reason: string;
+}
+
+export interface QualitySummary {
+  total_items: number;
+  manual_decision_items: number;
+  fixable_items: number;
+  auto_fixable_items: number;
+  blocks_completed: number;
+  blocks_not_completed: number;
+}
+
+export interface QualityReport {
+  schema_version: number;
+  task_id: string;
+  generated_at: string;
+  scanner_version: string;
+  overall_status: string;
+  summary: QualitySummary;
+  blocks: Record<string, QualityBlock>;
+  limitations: string[];
 }
 
 // ---------------------------------------------------------------------------

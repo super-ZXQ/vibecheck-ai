@@ -1,8 +1,33 @@
 FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
 
+# Pinned Node runtime used only to spawn the frontend dead-code analyzer.
+# The tarball checksum is verified before extraction, so a compromised mirror
+# cannot substitute a different runtime.
+ARG NODE_VERSION=20.18.3
+ARG NODE_SHA256_X64=595bcc9a28e6d1ee5fc7277b5c3cb029275b98ec0524e162a0c566c992a7ee5c
+ARG NODE_SHA256_ARM64=c03412ab9c0ed30468e4d03e56d2e35c5ae761a98deb16727c7af2fe5be34700
+ARG TARGETARCH
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    NODE_VERSION=${NODE_VERSION}
+
+RUN set -eux; \
+    case "${TARGETARCH:-amd64}" in \
+        amd64) node_arch=x64; node_hash="${NODE_SHA256_X64}" ;; \
+        arm64) node_arch=arm64; node_hash="${NODE_SHA256_ARM64}" ;; \
+        *) echo "unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl xz-utils; \
+    curl -fsSLo /tmp/node.tar.xz \
+        "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${node_arch}.tar.xz"; \
+    echo "${node_hash}  /tmp/node.tar.xz" | sha256sum -c -; \
+    tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1; \
+    rm -f /tmp/node.tar.xz; \
+    apt-get purge -y --auto-remove curl xz-utils; \
+    rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --gid 10001 vibecheck \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin vibecheck
@@ -16,6 +41,14 @@ RUN python -m pip install --no-cache-dir -r requirements.production.txt
 COPY --chown=10001:10001 app ./app
 COPY --chown=10001:10001 alembic.ini ./alembic.ini
 COPY --chown=10001:10001 migrations ./migrations
+
+# Lockfile-only install (no repo scripts, no arbitrary package resolution).
+RUN cd /app/app/quality/analyzers/frontend_analyzer \
+    && npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
+    && chown -R 10001:10001 node_modules \
+    && npm cache clean --force \
+    && rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
+
 RUN mkdir -p /data /tmp/vibecheck \
     && chown -R 10001:10001 /data /tmp/vibecheck
 

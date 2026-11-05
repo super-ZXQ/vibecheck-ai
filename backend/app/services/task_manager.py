@@ -146,10 +146,12 @@ STAGE_DOWNLOADING = "downloading"
 STAGE_EXTRACTING = "extracting"
 STAGE_REPAIRING = "repairing"
 STAGE_SCANNING = "scanning"
+STAGE_QUALITY_CHECKS = "quality_checks"
 STAGE_FINISHED = "finished"
 
 # Re-export constants used across the codebase.
 __all__ = [
+    "STAGE_QUALITY_CHECKS",
     "STAGE_QUEUED",
     "STATUS_CANCELLED",
     "STATUS_COMPLETED",

@@ -124,6 +124,7 @@ def cleanup_expired_tasks() -> int:
     from app.db.models import (
         AssessmentResultRow,
         LlmAnalysisResultRow,
+        QualityCheckResultRow,
         RepairResultRow,
         ScanResultRow,
         TaskRow,
@@ -146,6 +147,7 @@ def cleanup_expired_tasks() -> int:
                 return 0
             for model in (
                 LlmAnalysisResultRow,
+                QualityCheckResultRow,
                 RepairResultRow,
                 AssessmentResultRow,
                 ScanResultRow,

@@ -146,6 +146,8 @@ export default function CheckPage() {
           repairPlanStatus={hook.repairPlanStatus}
           llmAnalysis={hook.llmAnalysis}
           llmAnalysisStatus={hook.llmAnalysisStatus}
+          qualityReport={hook.qualityReport}
+          qualityReportStatus={hook.qualityReportStatus}
           renderRepairPlan={(plan) => <RepairPlan plan={plan} />}
         />
       </main>

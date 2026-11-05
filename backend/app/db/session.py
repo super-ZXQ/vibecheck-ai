@@ -154,14 +154,15 @@ async def check_database_ready() -> None:
                 WHERE table_schema = 'public'
                   AND table_name IN (
                     'tasks', 'scan_results', 'assessment_results',
-                    'repair_results', 'llm_analysis_results'
+                    'repair_results', 'llm_analysis_results',
+                    'quality_check_results'
                   )
                 """
             )
         )
         row = result.first()
         count = int(row[0]) if row else 0
-        if count < 5:
+        if count < 6:
             raise RuntimeError(
                 "database schema is not initialized — run `alembic upgrade head`"
             )

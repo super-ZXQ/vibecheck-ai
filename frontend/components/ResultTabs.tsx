@@ -16,17 +16,19 @@ import { useState } from "react";
 
 import { AssessmentDetails } from "@/components/AssessmentDetails";
 import LLMAnalysis from "@/components/LLMAnalysis";
+import { QualityReport as QualityReportView } from "@/components/QualityReport";
 import { RepairPlan as RepairPlanView } from "@/components/RepairPlan";
 import { ScanResults } from "@/components/ScanResults";
 import type {
   AssessmentResult,
   LLMAnalysisResult,
+  QualityReport,
   RepairPlan,
   ScanResult,
 } from "@/lib/types";
 import type { ResultTabStatus } from "@/hooks/use-check-task";
 
-type TabKey = "scan" | "assessment" | "repair" | "llm";
+type TabKey = "scan" | "assessment" | "repair" | "llm" | "quality";
 
 interface ResultTabsProps {
   scanResult: ScanResult | null;
@@ -37,6 +39,8 @@ interface ResultTabsProps {
   repairPlanStatus: ResultTabStatus;
   llmAnalysis: LLMAnalysisResult | null;
   llmAnalysisStatus: ResultTabStatus;
+  qualityReport: QualityReport | null;
+  qualityReportStatus: ResultTabStatus;
   /** Optional render override for the repair plan tab. */
   renderRepairPlan?: (plan: RepairPlan) => React.ReactNode;
 }
@@ -46,6 +50,7 @@ const TAB_LABELS: Record<TabKey, string> = {
   assessment: "安全评估",
   repair: "修复计划",
   llm: "AI 分析",
+  quality: "质量检查",
 };
 
 const TAB_ICONS: Record<TabKey, React.ReactNode> = {
@@ -112,6 +117,22 @@ const TAB_ICONS: Record<TabKey, React.ReactNode> = {
       />
     </svg>
   ),
+  quality: (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path
+        d="M9 4h6a2 2 0 012 2v13a1 1 0 01-1.5.9L12 18l-3.5 1.9A1 1 0 017 19V6a2 2 0 012-2z"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M9.5 9.5h5M9.5 13h3.5"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+      />
+    </svg>
+  ),
 };
 
 export function ResultTabs({
@@ -123,6 +144,8 @@ export function ResultTabs({
   repairPlanStatus,
   llmAnalysis,
   llmAnalysisStatus,
+  qualityReport,
+  qualityReportStatus,
   renderRepairPlan,
 }: ResultTabsProps) {
   const [activeTab, setActiveTab] = useState<TabKey>("scan");
@@ -186,6 +209,14 @@ export function ResultTabs({
             )}
           />
         )}
+
+        {activeTab === "quality" && (
+          <TabContent
+            status={qualityReportStatus}
+            data={qualityReport}
+            renderContent={(data) => <QualityReportView report={data} />}
+          />
+        )}
       </div>
     </div>
   );
@@ -198,7 +229,9 @@ export function ResultTabs({
           ? assessmentStatus
           : key === "repair"
             ? repairPlanStatus
-            : llmAnalysisStatus;
+            : key === "llm"
+              ? llmAnalysisStatus
+              : qualityReportStatus;
     if (status === "available") return " ✓";
     if (status === "unavailable") return " −";
     return " !";

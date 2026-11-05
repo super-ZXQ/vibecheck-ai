@@ -28,6 +28,7 @@ TASK_ENDPOINTS = [
     ("/assessment", 409),
     ("/repair-plan", 409),
     ("/llm-analysis", 409),
+    ("/quality-report", 409),
 ]
 
 
@@ -358,7 +359,7 @@ class TestEndpointCoverage:
                     yield route
 
         scoped = [route for route in walk(app.routes) if "{task_id}" in route.path]
-        assert len(scoped) == 6, [route.path for route in scoped]
+        assert len(scoped) == 7, [route.path for route in scoped]
         unguarded = [
             f"{sorted(route.methods)} {route.path}"
             for route in scoped

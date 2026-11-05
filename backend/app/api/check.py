@@ -14,6 +14,8 @@ GET /api/check/{task_id}:
   security_verdict, and assessment_url (P0-6).
 - Completed tasks with a persisted LLM analysis include
   llm_analysis_available and llm_analysis_url (P1-4).
+- Completed tasks with a persisted quality report include
+  quality_report_available and quality_report_url.
 - Completed tasks WITHOUT a persisted result (legacy) have
   scan_summary=None and report_url=None.
 - Completed tasks WITHOUT a persisted assessment (legacy P0-5) have
@@ -46,6 +48,17 @@ GET /api/check/{task_id}/llm-analysis (P1-4):
   non-blocking; a task can complete without it).
 - Never returns raw secrets, temp paths, or internal exceptions.
 
+GET /api/check/{task_id}/quality-report:
+- Returns the default-on, non-scoring quality report for a completed task.
+- Task not found / wrong submitter key: 404 (byte-identical bodies).
+- pending/running: 409 QUALITY_REPORT_NOT_READY.
+- failed/cancelled: 409 QUALITY_REPORT_NOT_AVAILABLE (residual rows are
+  never returned).
+- completed without a persisted report (legacy task): 409
+  QUALITY_REPORT_NOT_AVAILABLE.
+- unreadable/corrupted report: 500 QUALITY_REPORT_INTERNAL_ERROR.
+- Quality conclusions never feed the security score or verdict.
+
 Task ownership (all task-scoped routes above, plus /cancel):
 - A browser sends X-Submitter-Key, an opaque value it generates and stores
   locally. The task records it, and every later read of that task requires
@@ -68,6 +81,9 @@ from app.core.error_codes import (
     INTERNAL_ERROR,
     INVALID_UPLOAD,
     LLM_ANALYSIS_NOT_READY,
+    QUALITY_REPORT_INTERNAL_ERROR,
+    QUALITY_REPORT_NOT_AVAILABLE,
+    QUALITY_REPORT_NOT_READY,
     QUEUE_FULL,
     SCAN_RESULT_MISSING,
     SCAN_RESULT_NOT_READY,
@@ -85,6 +101,10 @@ from app.core.task_access import (
 from app.services.background_runner import trigger_queue_processing
 from app.services.llm_service import get_llm_analysis_async
 from app.services.llm_user_config import store_user_config
+from app.services.quality_service import (
+    QualityReportInternalError,
+    get_quality_report_async,
+)
 from app.services.scan_result_service import (
     SCHEMA_VERSION,
     get_scan_result_async,
@@ -145,6 +165,8 @@ class TaskStatusResponse(BaseModel):
     repair_plan_url: str | None = None
     llm_analysis_available: bool | None = None
     llm_analysis_url: str | None = None
+    quality_report_available: bool | None = None
+    quality_report_url: str | None = None
 
 
 # --- Fixed safe empty response for failed tasks without results ---
@@ -651,5 +673,100 @@ async def get_llm_analysis_result(
         detail={
             "error_code": INTERNAL_ERROR,
             "error_message": get_error_message(INTERNAL_ERROR),
+        },
+    )
+
+
+@router.get("/api/check/{task_id}/quality-report")
+async def get_quality_report_result(
+    task_id: str, x_submitter_key: SubmitterKeyHeader = None
+):
+    """Get the persisted default-on quality report for a completed task.
+
+    State-ordered branching:
+    1. invalid UUID → 422
+    2. task not found / owned by another submitter key → 404
+       (byte-identical bodies, so a wrong key never confirms existence)
+    3. pending/running → 409 QUALITY_REPORT_NOT_READY
+    4. failed/cancelled → 409 QUALITY_REPORT_NOT_AVAILABLE
+       (a residual row from a partial pipeline is never returned)
+    5. completed → get_quality_report_async()
+       - report exists → 200 report
+       - report missing (legacy task) → 409 QUALITY_REPORT_NOT_AVAILABLE
+    6. unreadable/corrupted report → 500 QUALITY_REPORT_INTERNAL_ERROR
+    7. unknown status → 500 QUALITY_REPORT_INTERNAL_ERROR
+
+    The quality report is non-scoring: its conclusions never feed the
+    security score or verdict. Missing reports are an explicit 409, never
+    an empty success payload.
+    """
+    try:
+        uuid.UUID(task_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "error_code": "INVALID_TASK_ID",
+                "error_message": "任务ID格式无效。",
+            },
+        )
+
+    task = await get_task_async(task_id)
+    if task is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error_code": "TASK_NOT_FOUND",
+                "error_message": "任务不存在。",
+            },
+        )
+    ensure_task_access(task, x_submitter_key)
+
+    if task.status in (STATUS_PENDING, STATUS_RUNNING):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error_code": QUALITY_REPORT_NOT_READY,
+                "error_message": get_error_message(QUALITY_REPORT_NOT_READY),
+            },
+        )
+
+    if task.status == STATUS_FAILED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error_code": QUALITY_REPORT_NOT_AVAILABLE,
+                "error_message": get_error_message(QUALITY_REPORT_NOT_AVAILABLE),
+            },
+        )
+
+    if task.status == STATUS_COMPLETED:
+        try:
+            report = await get_quality_report_async(task_id)
+        except QualityReportInternalError:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "error_code": QUALITY_REPORT_INTERNAL_ERROR,
+                    "error_message": get_error_message(
+                        QUALITY_REPORT_INTERNAL_ERROR
+                    ),
+                },
+            )
+        if report is not None:
+            return report
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error_code": QUALITY_REPORT_NOT_AVAILABLE,
+                "error_message": get_error_message(QUALITY_REPORT_NOT_AVAILABLE),
+            },
+        )
+
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail={
+            "error_code": QUALITY_REPORT_INTERNAL_ERROR,
+            "error_message": get_error_message(QUALITY_REPORT_INTERNAL_ERROR),
         },
     )

@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import (
     AssessmentResultRow,
     LlmAnalysisResultRow,
+    QualityCheckResultRow,
     RepairResultRow,
     ScanResultRow,
 )
@@ -410,6 +411,27 @@ async def save_llm_analysis(
     await session.flush()
 
 
+async def get_quality_report_available(
+    session: AsyncSession, task_id: str
+) -> bool:
+    row = await session.get(QualityCheckResultRow, task_id)
+    return row is not None
+
+
+async def get_quality_report(
+    session: AsyncSession, task_id: str
+) -> dict[str, Any] | None:
+    row = await session.get(QualityCheckResultRow, task_id)
+    if row is None:
+        return None
+    raw = row.quality_json
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str):
+        return json.loads(raw)  # may raise; caller maps to a clean 500
+    return None
+
+
 async def load_status_enrichment(task_id: str) -> dict[str, Any]:
     """Lightweight polling enrichment (uses a short-lived session)."""
     from app.db.session import get_session_factory
@@ -429,6 +451,8 @@ async def load_status_enrichment(task_id: str) -> dict[str, Any]:
             "repair_plan_url": None,
             "llm_analysis_available": False,
             "llm_analysis_url": None,
+            "quality_report_available": False,
+            "quality_report_url": None,
         }
         summary = await get_scan_summary(session, task_id)
         out["scan_summary"] = summary
@@ -444,6 +468,9 @@ async def load_status_enrichment(task_id: str) -> dict[str, Any]:
         if await get_llm_analysis_available(session, task_id):
             out["llm_analysis_available"] = True
             out["llm_analysis_url"] = f"/api/check/{task_id}/llm-analysis"
+        if await get_quality_report_available(session, task_id):
+            out["quality_report_available"] = True
+            out["quality_report_url"] = f"/api/check/{task_id}/quality-report"
         return out
 
 
@@ -519,6 +546,23 @@ async def copy_task_results(
                 total_fallback=src_llm.total_fallback,
                 source=src_llm.source,
                 source_scan_updated_at=src_llm.source_scan_updated_at,
+                created_at=_as_dt(now),
+                updated_at=_as_dt(now),
+            )
+        )
+    src_quality = await session.get(QualityCheckResultRow, source_task_id)
+    if src_quality is not None:
+        session.add(
+            QualityCheckResultRow(
+                task_id=dest_task_id,
+                schema_version=src_quality.schema_version,
+                overall_status=src_quality.overall_status,
+                block_statuses_json=src_quality.block_statuses_json,
+                quality_json=src_quality.quality_json,
+                total_items=src_quality.total_items,
+                manual_items=src_quality.manual_items,
+                fixable_items=src_quality.fixable_items,
+                source_scan_updated_at=src_quality.source_scan_updated_at,
                 created_at=_as_dt(now),
                 updated_at=_as_dt(now),
             )

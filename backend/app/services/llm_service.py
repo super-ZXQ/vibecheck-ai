@@ -235,6 +235,9 @@ def _normalize_llm_endpoint(raw: str) -> str:
 def _call_llm_api(
     prompt: str,
     user_config: dict | None = None,
+    *,
+    max_attempts: int | None = None,
+    timeout_seconds: float | None = None,
 ) -> str | None:
     """Call the LLM API and return the response text.
 
@@ -244,6 +247,10 @@ def _call_llm_api(
     Uses urllib (standard library) to avoid adding dependencies.
     A complete user_config (api_key/base_url/model) overrides the
     server-side settings for this call only.
+
+    ``max_attempts``/``timeout_seconds`` let latency-bounded callers
+    (quality checks) use a single short attempt without changing the
+    default scanner behaviour.
     """
     enabled, api_key, base_url, model = _resolve_llm_config(user_config)
     if not enabled:
@@ -282,9 +289,15 @@ def _call_llm_api(
         "temperature": 0.3,
     }).encode("utf-8")
 
+    attempts = (
+        settings.llm_max_retries + 1 if max_attempts is None else max(1, max_attempts)
+    )
+    request_timeout = (
+        settings.llm_timeout if timeout_seconds is None else max(1.0, timeout_seconds)
+    )
     last_error: Exception | None = None
     request_host = urlsplit(endpoint).hostname
-    for attempt in range(settings.llm_max_retries + 1):
+    for attempt in range(attempts):
         try:
             req = urllib.request.Request(
                 endpoint,
@@ -293,7 +306,7 @@ def _call_llm_api(
                 method="POST",
             )
             with urllib.request.urlopen(
-                req, timeout=settings.llm_timeout
+                req, timeout=request_timeout
             ) as resp:
                 # urllib follows redirects. A host that redirects into an
                 # internal address must not have its body returned.

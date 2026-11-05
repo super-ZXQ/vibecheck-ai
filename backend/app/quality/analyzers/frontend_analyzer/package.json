@@ -1,0 +1,15 @@
+{
+  "name": "vibecheck-frontend-dead-code-analyzer",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Offline ts-morph/postcss dead-code analyzer used as a bounded subprocess.",
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "postcss": "8.5.32",
+    "postcss-scss": "4.0.9",
+    "ts-morph": "28.0.0"
+  }
+}

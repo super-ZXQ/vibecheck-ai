@@ -14,3 +14,4 @@ htmlcov
 tests
 venv
 .venv
+app/quality/analyzers/frontend_analyzer/node_modules

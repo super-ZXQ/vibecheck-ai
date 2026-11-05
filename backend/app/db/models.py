@@ -166,5 +166,23 @@ class LlmAnalysisResultRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class QualityCheckResultRow(Base):
+    __tablename__ = "quality_check_results"
+
+    task_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tasks.id"), primary_key=True
+    )
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    overall_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    block_statuses_json: Mapped[Any] = mapped_column(Text, nullable=False)
+    quality_json: Mapped[Any] = mapped_column(Text, nullable=False)
+    total_items: Mapped[int] = mapped_column(Integer, nullable=False)
+    manual_items: Mapped[int] = mapped_column(Integer, nullable=False)
+    fixable_items: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_scan_updated_at: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 # Silence unused import warnings for type checkers that need Boolean.
 _ = (Boolean,)

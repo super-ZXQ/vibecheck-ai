@@ -23,6 +23,7 @@ import type {
   CheckRequest,
   CheckResponse,
   LLMAnalysisResult,
+  QualityReport,
   RepairPlan,
   ScanResult,
   TaskStatusResponse,
@@ -395,6 +396,20 @@ export async function getLLMAnalysis(
 ): Promise<LLMAnalysisResult> {
   return apiFetch<LLMAnalysisResult>(
     `/api/check/${encodeURIComponent(taskId)}/llm-analysis`,
+    { method: "GET", signal },
+  );
+}
+
+/**
+ * GET /api/check/{task_id}/quality-report — default-on quality report.
+ * 409 means the report is not available for this task (legacy/unfinished).
+ */
+export async function getQualityReport(
+  taskId: string,
+  signal?: AbortSignal,
+): Promise<QualityReport> {
+  return apiFetch<QualityReport>(
+    `/api/check/${encodeURIComponent(taskId)}/quality-report`,
     { method: "GET", signal },
   );
 }

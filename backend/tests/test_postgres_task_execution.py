@@ -32,8 +32,8 @@ async def _reset_tasks() -> None:
     async with factory() as session:
         await session.execute(
             text(
-                "TRUNCATE TABLE llm_analysis_results, repair_results, "
-                "assessment_results, scan_results, tasks CASCADE"
+                "TRUNCATE TABLE quality_check_results, llm_analysis_results, "
+                "repair_results, assessment_results, scan_results, tasks CASCADE"
             )
         )
         await session.commit()

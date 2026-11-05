@@ -130,6 +130,23 @@ class Settings(BaseSettings):
     scan_max_persisted_scan_errors_per_task: int = Field(default=500, ge=1)
     scan_max_result_json_bytes: int = Field(default=8 * 1024 * 1024, ge=1)
 
+    # --- Quality report (default-on, non-scoring) ---
+    # The stage is bounded independently from the security scan. A single
+    # analyzer failure degrades to an explicit block status; the task itself
+    # still completes.
+    quality_check_timeout: int = Field(default=60, ge=10)
+    quality_analyzer_timeout: int = Field(default=45, ge=5)
+    quality_max_items_per_block: int = Field(default=200, ge=1)
+    quality_max_evidence_per_item: int = Field(default=5, ge=1)
+    quality_max_json_bytes: int = Field(default=2 * 1024 * 1024, ge=1)
+
+    # --- Frontend dead-code analyzer (pinned Node subprocess) ---
+    frontend_analyzer_node_bin: str = "node"
+    frontend_analyzer_memory_mb: int = Field(default=512, ge=128, le=2048)
+    frontend_analyzer_max_output_bytes: int = Field(
+        default=4 * 1024 * 1024, ge=1
+    )
+
     # --- Assessment limits (P0-6) ---
     # Technical size limits for assessment results. These are NOT policy
     # values — they do not affect scoring. They prevent unbounded
@@ -248,6 +265,7 @@ class Settings(BaseSettings):
             self.download_timeout
             + self.extract_timeout
             + self.scan_timeout
+            + self.quality_check_timeout
             + self.assess_timeout
             + self.repair_plan_timeout
             + self.llm_analysis_timeout

@@ -84,6 +84,7 @@ from app.services.assessment_service import (
 )
 from app.services.llm_service import generate_and_save_llm_analysis
 from app.services.llm_user_config import get_user_config, pop_user_config
+from app.services.quality_service import run_quality_checks
 from app.services.repair_service import (
     RepairPlanInternalError,
     RepairPlanPersistError,
@@ -109,6 +110,7 @@ from app.services.task_manager import (
     STAGE_ASSESSING,
     STAGE_DOWNLOADING,
     STAGE_EXTRACTING,
+    STAGE_QUALITY_CHECKS,
     STAGE_REPAIRING,
     STAGE_SCANNING,
     STATUS_PENDING,
@@ -623,6 +625,37 @@ async def _process_task(task_id: str, claim_token: str | None = None) -> None:
             )
             return
 
+        if await _check_cancelled(task_id):
+            await mark_cancelled_async(task_id)
+            return
+        await _ensure_owned(task_id, claim_token)
+
+        # --- Stage 4b: Quality checks (default-on, non-scoring) ---
+        await _mark_running_owned(task_id, STAGE_QUALITY_CHECKS, 85, claim_token)
+        quality_started = time.monotonic()
+        try:
+            await asyncio.wait_for(
+                run_quality_checks(
+                    task_id,
+                    Path(extract_dest),
+                    cancel_check=lambda: _get_cancel_event(task_id).is_set(),
+                    scanner_version=task.scanner_version,
+                    llm_user_config=get_user_config(task_id),
+                ),
+                timeout=settings.quality_check_timeout + 5,
+            )
+            metrics_mod.observe(
+                "vibecheck_stage_duration_seconds",
+                time.monotonic() - quality_started,
+                {"stage": STAGE_QUALITY_CHECKS},
+            )
+        except Exception as e:
+            # Quality findings never fail the task: a missing/partial report is
+            # exposed explicitly through the quality-report API 409 state.
+            logger.warning(
+                "Quality checks failed for task %s: %s",
+                task_id, type(e).__name__,
+            )
         if await _check_cancelled(task_id):
             await mark_cancelled_async(task_id)
             return
