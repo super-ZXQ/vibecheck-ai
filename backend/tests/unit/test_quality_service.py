@@ -296,6 +296,12 @@ def test_frontend_analyzer_stderr_not_exposed(tmp_path, monkeypatch, caplog):
     from app.quality.analyzers import frontend_dead_code
     from app.quality.repository_index import RepositoryIndex
 
+    # 分析器依赖目录被 .gitignore 排除，CI 未安装：显式注入存在性，
+    # 使用例只验证 stderr 脱敏，不受运行环境是否装了 Node 依赖影响。
+    analyzer_module = tmp_path / "ts-morph"
+    analyzer_module.mkdir()
+    monkeypatch.setattr(frontend_dead_code, "_REQUIRED_MODULE", analyzer_module)
+    monkeypatch.setattr(frontend_dead_code, "_node_binary", lambda: "/usr/bin/node")
     monkeypatch.setattr(
         frontend_dead_code,
         "_run_node",
