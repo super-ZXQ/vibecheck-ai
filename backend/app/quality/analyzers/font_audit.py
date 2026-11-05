@@ -420,9 +420,9 @@ def analyze_font_licenses(index: RepositoryIndex) -> QualityBlock:
                 }
             )
 
-    for source in external_sources:
-        if source.get("kind") in {"css_import", "html_link"}:
-            for family in source.get("families", []):
+    for external_source in external_sources:
+        if external_source.get("kind") in {"css_import", "html_link"}:
+            for family in external_source.get("families", []):
                 loaded_families.add(family.lower())
 
     # Local assets: referenced, unreferenced, and committed build outputs.
@@ -544,9 +544,9 @@ def analyze_font_licenses(index: RepositoryIndex) -> QualityBlock:
         [record for record in distributed_records if record.license.state == STATE_UNVERIFIED]
     )
     external_count = len(external_sources) + len(package_fonts)
-    risk_counts = defaultdict(int)
-    for item in items:
-        risk_counts[item.severity] += 1
+    risk_counts: dict[str, int] = defaultdict(int)
+    for quality_item in items:
+        risk_counts[quality_item.severity] += 1
 
     counts = {
         "font_assets": len(source_assets),

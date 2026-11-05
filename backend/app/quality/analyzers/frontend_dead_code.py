@@ -246,9 +246,14 @@ def analyze_frontend_dead_code(index: RepositoryIndex) -> QualityBlock:
     raw_items = payload.get("items")
     raw_items = raw_items if isinstance(raw_items, list) else []
     items = [item for raw in raw_items if isinstance(raw, dict) and (item := _item_from_payload(raw))]
-    counts = payload.get("counts") if isinstance(payload.get("counts"), dict) else {}
-    limitations = [str(row)[:300] for row in payload.get("limitations") or []]
-    build = payload.get("build_output") if isinstance(payload.get("build_output"), dict) else {}
+    raw_counts = payload.get("counts")
+    counts: dict[str, Any] = raw_counts if isinstance(raw_counts, dict) else {}
+    raw_limitations = payload.get("limitations")
+    limitations = [
+        str(row)[:300] for row in (raw_limitations if isinstance(raw_limitations, list) else [])
+    ]
+    raw_build = payload.get("build_output")
+    build: dict[str, Any] = raw_build if isinstance(raw_build, dict) else {}
     confidence_counts = {level: 0 for level in _ALLOWED_CONFIDENCE}
     for item in items:
         confidence_counts[item.confidence] += 1

@@ -287,10 +287,7 @@ class _RouteFileAnalyzer:
         return None
 
     def _resolve_router(self, node: ast.AST | None) -> tuple[str, str] | None:
-        resolved = self._resolve_expr(node)
-        if resolved and resolved in self._name_bindings:
-            return self._name_bindings[resolved]
-        return resolved
+        return self._resolve_expr(node)
 
     # -- pass A: imports, router/app assignments, guards -------------------
 
@@ -317,21 +314,21 @@ class _RouteFileAnalyzer:
 
         for node in ast.walk(tree):
             if isinstance(node, ast.Assign) and len(node.targets) == 1:
-                target = node.targets[0]
-                if not isinstance(target, ast.Name):
+                assign_target = node.targets[0]
+                if not isinstance(assign_target, ast.Name):
                     continue
                 value = node.value
                 if isinstance(value, (ast.Name, ast.Attribute)):
                     resolved = self._resolve_expr(value)
                     if resolved is not None:
-                        self._name_bindings[target.id] = resolved
+                        self._name_bindings[assign_target.id] = resolved
                     continue
                 if not isinstance(value, ast.Call):
                     continue
                 func_name = _call_name(value.func)
                 if func_name not in {"APIRouter", "FastAPI", "fastapi.APIRouter", "fastapi.FastAPI"}:
                     continue
-                key = (self.rel_path, target.id)
+                key = (self.rel_path, assign_target.id)
                 if func_name.endswith("APIRouter"):
                     prefix = _kw_const(value, "prefix") or ""
                     dependencies = _dependency_names(_kw(value, "dependencies"))
@@ -401,8 +398,8 @@ class _RouteFileAnalyzer:
             return
         if isinstance(node, ast.Call):
             self._handle_call(node)
-        for child in ast.iter_child_nodes(node):
-            self._visit(child)
+        for subnode in ast.iter_child_nodes(node):
+            self._visit(subnode)
 
     def _handle_decorator(self, node: ast.AST, endpoint_name: str) -> None:
         if not isinstance(node, ast.Call):
@@ -416,6 +413,7 @@ class _RouteFileAnalyzer:
         attr = func.attr
         if attr not in _METHOD_ATTRS and attr not in {"api_route", "websocket"}:
             return
+        methods: tuple[str, ...]
         if attr == "websocket":
             methods = ("WEBSOCKET",)
         elif attr == "api_route":
@@ -640,7 +638,7 @@ def analyze_backend_routes(index: RepositoryIndex) -> QualityBlock:
     has_conditional = conditional_count > 0
 
     items = _build_items(records)
-    risk_counts = defaultdict(int)
+    risk_counts: dict[str, int] = defaultdict(int)
     for item in items:
         risk_counts[item.severity] += 1
 

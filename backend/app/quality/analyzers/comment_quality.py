@@ -475,11 +475,11 @@ def analyze_backend_comments(
 
     items = _aggregate_report_items(_dedupe_items(items))
     counts_by_rule: dict[str, int] = {}
-    for item in items:
-        counts_by_rule[item.category] = counts_by_rule.get(item.category, 0) + 1
+    for quality_item in items:
+        counts_by_rule[quality_item.category] = counts_by_rule.get(quality_item.category, 0) + 1
     risk_counts: dict[str, int] = {}
-    for item in items:
-        risk_counts[item.severity] = risk_counts.get(item.severity, 0) + 1
+    for quality_item in items:
+        risk_counts[quality_item.severity] = risk_counts.get(quality_item.severity, 0) + 1
 
     deterministic_items = [
         item
@@ -1406,10 +1406,11 @@ def _function_evidence(info: _FunctionInfo, source: str) -> QualityEvidence:
 def _llm_ready(user_config: dict[str, Any] | None) -> bool:
     if not isinstance(user_config, dict):
         return False
-    return all(
-        isinstance(user_config.get(key), str) and user_config.get(key).strip()
-        for key in ("api_key", "base_url", "model")
-    )
+    for key in ("api_key", "base_url", "model"):
+        value = user_config.get(key)
+        if not isinstance(value, str) or not value.strip():
+            return False
+    return True
 
 
 def _select_semantic_candidates(
@@ -1471,7 +1472,7 @@ def _semantic_prompt(candidates: list[_FunctionInfo]) -> str:
         "没有问题的函数可以省略。函数清单：",
     ]
     for info in candidates:
-        doc = mask_snippet((info.docstring or "").strip(), limit=300)
+        doc = mask_snippet((info.docstring or "").strip())[:300]
         lines.append(
             f"- function={info.name}; file={info.file_path}; line={info.line}; "
             f"params={','.join(info.params) or '-'}; doc={doc}"
