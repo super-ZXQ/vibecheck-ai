@@ -70,13 +70,17 @@ _SNIPPET_LIMIT = 200
 
 
 def _safe_path(value: str) -> str:
-    """Mask explicit-format secrets embedded in a repository-relative path."""
-    return mask_untrusted_text(value[:1000])
+    """Mask secrets in a repository-relative path, then bound its size.
+
+    Masking MUST run before truncation: cutting a secret first can split
+    it into an unrecognizable fragment that the masker then misses.
+    """
+    return mask_untrusted_text(value)[:1000]
 
 
 def _safe_text(value: str, limit: int = _SNIPPET_LIMIT) -> str:
-    """Mask secrets in free text and bound its size before persistence."""
-    return mask_snippet(value[:limit])
+    """Mask secrets in free text first, then bound its size before persistence."""
+    return mask_snippet(value)[:limit]
 
 
 def sanitize_json(value: Any) -> Any:

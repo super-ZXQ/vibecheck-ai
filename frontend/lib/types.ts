@@ -52,7 +52,7 @@ export interface TaskStatusResponse {
   task_id: string;
   status: string; // API: "pending" | "running" | "completed" | "failed"
   // Backend may store cancelled/dead; API maps both to "failed".
-  stage: string; // "queued" | "downloading" | "extracting" | "scanning" | "assessing" | "repairing" | "finished"
+  stage: string; // "queued" | "downloading" | "extracting" | "scanning" | "quality_checks" | "assessing" | "repairing" | "analyzing" | "finished"
   progress: number;
   owner: string | null;
   repo_name: string | null;
@@ -306,7 +306,7 @@ export interface QualityBlock {
   reason_message: string;
   conclusion: {
     headline?: string;
-    counts?: Record<string, number>;
+    counts?: Record<string, number | Record<string, number>>;
   };
   evidence: QualityEvidence[];
   items: QualityItem[];

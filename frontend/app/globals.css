@@ -1415,7 +1415,8 @@ body::before {
 
 .severity-info {
   background: var(--bg-subtle);
-  color: var(--text-secondary);
+  /* #475569 on the subtle badge background is 6.9:1 (WCAG AA). */
+  color: #475569;
   box-shadow: inset 0 0 0 1px var(--border);
 }
 
@@ -1523,7 +1524,7 @@ body::before {
 .empty-state {
   text-align: center;
   padding: 2.4rem 1rem;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: 0.95rem;
   border: 1px dashed var(--border);
   border-radius: var(--radius-md);

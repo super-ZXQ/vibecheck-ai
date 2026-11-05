@@ -468,7 +468,7 @@ def analyze_backend_comments(
                 items.extend(_semantic_suggestion_items(candidates, suggestions))
                 llm_state = "completed"
 
-    if not functions:
+    if not functions and not items:
         return _not_applicable_block(
             message="未检测到路由 handler、阶段服务、工具/核心模块或状态写入函数，注释规范检查不适用。"
         )
@@ -496,11 +496,8 @@ def analyze_backend_comments(
     status = STATUS_COMPLETED
     reason_code: str | None = None
     reason_message = ""
-    if parse_errors:
-        status = STATUS_PARTIAL
-        reason_code = REASON_PARTIAL_ENUMERATION
-        reason_message = f"{parse_errors} 个 Python 文件无法解析，相关函数未纳入检查。"
-    elif llm_state in {"disabled", "failed"}:
+    if llm_state in {"disabled", "failed"}:
+        # LLM_DISABLED 优先于 PARTIAL_ENUMERATION，不能被解析错误吞掉。
         status = STATUS_PARTIAL
         reason_code = REASON_LLM_DISABLED
         reason_message = (
@@ -508,6 +505,12 @@ def analyze_backend_comments(
             if llm_state == "disabled"
             else "确定性注释检查已完成；BYOK 模型调用失败，语义判断未完成。"
         )
+        if parse_errors:
+            reason_message += f"另有 {parse_errors} 个 Python 文件无法解析。"
+    elif parse_errors:
+        status = STATUS_PARTIAL
+        reason_code = REASON_PARTIAL_ENUMERATION
+        reason_message = f"{parse_errors} 个 Python 文件无法解析，相关函数未纳入检查。"
 
     docstring_present = len([info for info in functions if info.docstring])
     coverage_pct = (

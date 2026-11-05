@@ -125,3 +125,14 @@ def test_report_summary_and_overall_status_are_explicit():
     assert data["summary"]["blocks_not_completed"] == 3
     assert data["overall_status"] == STATUS_PARTIAL
     assert data["blocks"][DIMENSION_FONT_LICENSE]["reason_code"]
+
+
+def test_snippet_masks_before_truncation():
+    from app.quality.models import QualityEvidence
+
+    secret = "s3cur3P@ssw0rd123"
+    # 让密钥值跨过 200 字符边界：先截断会留下部分明文。
+    snippet = ("A" * 175) + ' password = "' + secret + '"'
+    data = QualityEvidence(method="demo", snippet=snippet).to_dict()
+    assert "s3cur3P" not in data["snippet"]
+    assert len(data["snippet"]) <= 200

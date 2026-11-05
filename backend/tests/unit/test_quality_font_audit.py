@@ -292,3 +292,22 @@ def test_golden_repo_has_no_distributed_fonts_or_license_risk():
     categories = {item["category"] for item in items}
     assert categories <= {"dead_font_reference"}
     assert all(item["severity"] == "P3" for item in items)
+
+
+def test_distributed_system_family_is_not_double_counted(tmp_path):
+    index = _write(
+        tmp_path,
+        {
+            "src/app.css": (
+                "@font-face { font-family: 'Arial'; "
+                "src: url('/fonts/Arial.ttf') format('truetype'); }\n"
+                "body { font-family: Arial; }\n"
+            ),
+            "public/fonts/Arial.ttf": _ttf(),
+            "public/fonts/OFL.txt": "SIL OPEN FONT LICENSE Version 1.1\n",
+        },
+    )
+    block = analyze_font_licenses(index)
+    counts = block.to_dict()["conclusion"]["counts"]
+    assert counts["distributed_font_assets"] >= 1
+    assert counts["fonts_not_distributed"] == 0

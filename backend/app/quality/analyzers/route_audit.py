@@ -10,6 +10,7 @@ cross the execution trust boundary.
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import re
 from collections import defaultdict
@@ -142,6 +143,7 @@ class _RouterInfo:
     dependencies: tuple[str, ...]
     file_path: str
     line: int
+    prefix_unresolved: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +156,7 @@ class _IncludeEdge:
     conditional: bool
     condition: str
     unresolved: bool = False
+    dependencies: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -180,6 +183,7 @@ class _Chain:
     conditional: bool
     condition: str
     unresolved: bool
+    dependencies: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -330,13 +334,17 @@ class _RouteFileAnalyzer:
                     continue
                 key = (self.rel_path, assign_target.id)
                 if func_name.endswith("APIRouter"):
-                    prefix = _kw_const(value, "prefix") or ""
+                    prefix_node = _kw(value, "prefix")
+                    prefix = _const_str(prefix_node) or ""
                     dependencies = _dependency_names(_kw(value, "dependencies"))
                     self.router_infos[key] = _RouterInfo(
                         prefix=prefix,
                         dependencies=dependencies,
                         file_path=self.rel_path,
                         line=node.lineno,
+                        prefix_unresolved=(
+                            prefix_node is not None and _const_str(prefix_node) is None
+                        ),
                     )
                 else:
                     docs = {
@@ -348,6 +356,9 @@ class _RouteFileAnalyzer:
                         "file_path": self.rel_path,
                         "line": node.lineno,
                         "docs": docs,
+                        "dependencies": _dependency_names(
+                            _kw(value, "dependencies")
+                        ),
                     }
 
         for node in ast.walk(tree):
@@ -447,8 +458,12 @@ class _RouteFileAnalyzer:
         owner = self._resolve_router(func.value)
         if attr == "include_router" and node.args:
             child = self._resolve_router(node.args[0])
-            prefix = _kw_const(node, "prefix") or ""
-            unresolved = child is None
+            prefix_node = _kw(node, "prefix")
+            prefix = _const_str(prefix_node) or ""
+            # 非字面量 prefix 不能静默当作空前缀：标记 unresolved，进入人工确认。
+            prefix_unresolved = (
+                prefix_node is not None and _const_str(prefix_node) is None
+            )
             self.edges.append(
                 _IncludeEdge(
                     child=child or ("", ""),
@@ -458,7 +473,8 @@ class _RouteFileAnalyzer:
                     line=node.lineno,
                     conditional=bool(self._conditional),
                     condition="; ".join(self._conditional),
-                    unresolved=unresolved,
+                    unresolved=child is None or prefix_unresolved,
+                    dependencies=_dependency_names(_kw(node, "dependencies")),
                 )
             )
             return
@@ -789,16 +805,49 @@ def _resolve_route_records(
     ) -> list[_Chain]:
         if key in visited:
             return [_Chain("", False, False, "cycle", True)]
-        base = router_infos[key].prefix if key in router_infos else ""
+        info = router_infos.get(key)
+        base = info.prefix if info is not None else ""
+        base_unresolved = bool(info and info.prefix_unresolved)
+        base_dependencies = info.dependencies if info is not None else ()
         if key in app_infos:
-            return [_Chain(base, True, False, "", False)]
+            app_dependencies = tuple(
+                app_infos[key].get("dependencies") or ()
+            )
+            return [
+                _Chain(
+                    base,
+                    True,
+                    False,
+                    "",
+                    base_unresolved,
+                    app_dependencies,
+                )
+            ]
         outgoing = edges_by_child.get(key, [])
         if not outgoing:
-            return [_Chain(base, False, False, "", key not in router_infos)]
+            return [
+                _Chain(
+                    base,
+                    False,
+                    False,
+                    "",
+                    key not in router_infos or base_unresolved,
+                    base_dependencies,
+                )
+            ]
         result: list[_Chain] = []
         for edge in outgoing:
             if edge.parent is None:
-                result.append(_Chain(base, False, edge.conditional, edge.condition, True))
+                result.append(
+                    _Chain(
+                        base,
+                        False,
+                        edge.conditional,
+                        edge.condition,
+                        True,
+                        base_dependencies + edge.dependencies,
+                    )
+                )
                 continue
             parent_chain = chains(edge.parent, visited | {key})
             for chain in parent_chain[:8]:
@@ -810,7 +859,16 @@ def _resolve_route_records(
                         condition="; ".join(
                             part for part in (edge.condition, chain.condition) if part
                         ),
-                        unresolved=chain.unresolved or edge.unresolved,
+                        unresolved=(
+                            chain.unresolved
+                            or edge.unresolved
+                            or base_unresolved
+                        ),
+                        dependencies=(
+                            chain.dependencies
+                            + edge.dependencies
+                            + base_dependencies
+                        ),
                     )
                 )
         return result or [_Chain(base, False, False, "", True)]
@@ -821,8 +879,12 @@ def _resolve_route_records(
             continue
         route_chains = chains(decl.router, set())
         for chain in route_chains:
-            path = _join_path(chain.prefix, decl.path) if not decl.unresolved else ""
             unresolved = decl.unresolved or chain.unresolved
+            path = (
+                _join_path(chain.prefix, decl.path)
+                if not unresolved
+                else ""
+            )
             if unresolved:
                 unresolved_routes += 1
             for method in decl.methods:
@@ -838,7 +900,8 @@ def _resolve_route_records(
                         condition="; ".join(
                             part for part in (decl.condition, chain.condition) if part
                         ),
-                        auth_guard=decl.auth_guard,
+                        auth_guard=decl.auth_guard
+                        or _guard_from_names(chain.dependencies),
                         body_guard=decl.body_guard,
                         unresolved=unresolved,
                         framework_generated=decl.framework_generated,
@@ -1061,7 +1124,11 @@ def _build_items(records: list[_RouteRecord]) -> list[QualityItem]:
         manual = True
         items.append(
             QualityItem(
-                item_id=f"route-{record.method.lower()}-{_slug(record.path)}-{record.line}",
+                item_id=(
+                    f"route-{record.method.lower()}-"
+                    f"{_file_hash(record.file_path)}-"
+                    f"{_slug(record.path)}-{record.line}"
+                ),
                 dimension=DIMENSION_BACKEND_ROUTES,
                 category=category,
                 conclusion=conclusion,
@@ -1469,11 +1536,16 @@ def _dependency_name(node: ast.AST) -> str | None:
     return None
 
 
-def _decorator_guard(call: ast.Call) -> str | None:
-    names = list(_dependency_names(_kw(call, "dependencies")))
-    if names and any(_ACCESS_GUARD.search(name) or "auth" in name.lower() for name in names):
-        return names[0]
+def _guard_from_names(names: tuple[str, ...] | list[str]) -> str | None:
+    """Return the first auth-ish dependency (decorator or router-level)."""
+    for name in names:
+        if _ACCESS_GUARD.search(name) or "auth" in name.lower():
+            return name
     return None
+
+
+def _decorator_guard(call: ast.Call) -> str | None:
+    return _guard_from_names(list(_dependency_names(_kw(call, "dependencies"))))
 
 
 def _body_guard(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
@@ -1511,3 +1583,7 @@ def _join_path(*parts: str) -> str:
 
 def _slug(path: str) -> str:
     return re.sub(r"[^a-zA-Z0-9]+", "-", path).strip("-").lower()[:60] or "root"
+
+
+def _file_hash(rel_path: str) -> str:
+    return hashlib.sha1(rel_path.encode("utf-8")).hexdigest()[:8]

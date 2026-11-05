@@ -1,6 +1,6 @@
 /**
  * ResultTabs — tab navigation for scan results, assessment, repair plan,
- * and LLM analysis.
+ * LLM analysis, and quality checks.
  *
  * Each tab independently tracks its status:
  * - available → show content component
@@ -8,11 +8,13 @@
  * - error → show safe error message
  *
  * A single tab's error does NOT crash the entire results page.
+ * Panels are mounted lazily and kept mounted once visited, so per-tab
+ * state (expanded evidence, filters) survives tab switches.
  */
 
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 import { AssessmentDetails } from "@/components/AssessmentDetails";
 import LLMAnalysis from "@/components/LLMAnalysis";
@@ -28,7 +30,9 @@ import type {
 } from "@/lib/types";
 import type { ResultTabStatus } from "@/hooks/use-check-task";
 
-type TabKey = "scan" | "assessment" | "repair" | "llm" | "quality";
+const TAB_KEYS = ["scan", "assessment", "repair", "llm", "quality"] as const;
+
+type TabKey = (typeof TAB_KEYS)[number];
 
 interface ResultTabsProps {
   scanResult: ScanResult | null;
@@ -44,6 +48,12 @@ interface ResultTabsProps {
   /** Optional render override for the repair plan tab. */
   renderRepairPlan?: (plan: RepairPlan) => React.ReactNode;
 }
+
+const STATUS_ARIA: Record<ResultTabStatus, string> = {
+  available: "结果可用",
+  unavailable: "结果不可用",
+  error: "结果加载失败",
+};
 
 const TAB_LABELS: Record<TabKey, string> = {
   scan: "扫描结果",
@@ -149,93 +159,169 @@ export function ResultTabs({
   renderRepairPlan,
 }: ResultTabsProps) {
   const [activeTab, setActiveTab] = useState<TabKey>("scan");
+  // Lazy keep-alive: render a panel only after its tab is first opened,
+  // then leave it mounted while hidden so per-tab state is preserved.
+  const [visitedTabs, setVisitedTabs] = useState<ReadonlySet<TabKey>>(
+    () => new Set<TabKey>(["scan"]),
+  );
+  const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
   return (
     <div>
       {/* Tab bar */}
-      <div className="tabs">
-        {(Object.keys(TAB_LABELS) as TabKey[]).map((key) => (
-          <button
-            key={key}
-            className={`tab ${activeTab === key ? "tab-active" : ""}`}
-            onClick={() => setActiveTab(key)}
-          >
-            <span className="tab-icon">{TAB_ICONS[key]}</span>
-            {TAB_LABELS[key]}
-            {getStatusBadge(key)}
-          </button>
-        ))}
+      <div className="tabs" role="tablist" aria-label="检测结果">
+        {TAB_KEYS.map((key, index) => {
+          const selected = activeTab === key;
+          return (
+            <button
+              key={key}
+              ref={(node) => {
+                tabRefs.current[index] = node;
+              }}
+              type="button"
+              role="tab"
+              id={tabId(key)}
+              aria-selected={selected}
+              aria-controls={panelId(key)}
+              aria-label={`${TAB_LABELS[key]}，${STATUS_ARIA[statusFor(key)]}`}
+              tabIndex={selected ? 0 : -1}
+              className={`tab ${selected ? "tab-active" : ""}`}
+              onClick={() => selectTab(key)}
+              onKeyDown={(event) => handleTabKeyDown(event, index)}
+            >
+              <span className="tab-icon">{TAB_ICONS[key]}</span>
+              {TAB_LABELS[key]}
+              <span aria-hidden="true">{getStatusBadge(key)}</span>
+            </button>
+          );
+        })}
       </div>
 
       {/* Tab content */}
-      <div className="tab-content" key={activeTab}>
-        {activeTab === "scan" && (
-          <TabContent
-            status={scanResultStatus}
-            data={scanResult}
-            renderContent={(data) => (
-              <ScanResults scanResult={data} llmAnalysis={llmAnalysis} />
-            )}
-          />
-        )}
-
-        {activeTab === "assessment" && (
-          <TabContent
-            status={assessmentStatus}
-            data={assessment}
-            renderContent={(data) => <AssessmentDetails assessment={data} />}
-          />
-        )}
-
-        {activeTab === "repair" && (
-          <TabContent
-            status={repairPlanStatus}
-            data={repairPlan}
-            renderContent={(data) =>
-              renderRepairPlan ? renderRepairPlan(data) : <RepairPlanView plan={data} />
-            }
-          />
-        )}
-
-        {activeTab === "llm" && (
-          <TabContent
-            status={llmAnalysisStatus}
-            data={llmAnalysis}
-            renderContent={(data) => (
-              <LLMAnalysis
-                result={data}
-                totalFindings={scanResult?.summary.total_findings}
-              />
-            )}
-          />
-        )}
-
-        {activeTab === "quality" && (
-          <TabContent
-            status={qualityReportStatus}
-            data={qualityReport}
-            renderContent={(data) => <QualityReportView report={data} />}
-          />
-        )}
-      </div>
+      {TAB_KEYS.map((key) => (
+        <div
+          key={key}
+          className="tab-content"
+          role="tabpanel"
+          id={panelId(key)}
+          aria-labelledby={tabId(key)}
+          tabIndex={0}
+          hidden={activeTab !== key}
+        >
+          {visitedTabs.has(key) ? renderTab(key) : null}
+        </div>
+      ))}
     </div>
   );
 
+  function selectTab(key: TabKey) {
+    setActiveTab(key);
+    setVisitedTabs((previous) => {
+      if (previous.has(key)) return previous;
+      const next = new Set(previous);
+      next.add(key);
+      return next;
+    });
+  }
+
+  function handleTabKeyDown(
+    event: React.KeyboardEvent<HTMLButtonElement>,
+    index: number,
+  ) {
+    let nextIndex: number | null = null;
+    if (event.key === "ArrowRight") {
+      nextIndex = (index + 1) % TAB_KEYS.length;
+    } else if (event.key === "ArrowLeft") {
+      nextIndex = (index - 1 + TAB_KEYS.length) % TAB_KEYS.length;
+    } else if (event.key === "Home") {
+      nextIndex = 0;
+    } else if (event.key === "End") {
+      nextIndex = TAB_KEYS.length - 1;
+    }
+    if (nextIndex === null) return;
+    event.preventDefault();
+    const nextKey = TAB_KEYS[nextIndex];
+    selectTab(nextKey);
+    tabRefs.current[nextIndex]?.focus();
+  }
+
+  function renderTab(key: TabKey): React.ReactNode {
+    if (key === "scan") {
+      return (
+        <TabContent
+          status={scanResultStatus}
+          data={scanResult}
+          renderContent={(data) => (
+            <ScanResults scanResult={data} llmAnalysis={llmAnalysis} />
+          )}
+        />
+      );
+    }
+    if (key === "assessment") {
+      return (
+        <TabContent
+          status={assessmentStatus}
+          data={assessment}
+          renderContent={(data) => <AssessmentDetails assessment={data} />}
+        />
+      );
+    }
+    if (key === "repair") {
+      return (
+        <TabContent
+          status={repairPlanStatus}
+          data={repairPlan}
+          renderContent={(data) =>
+            renderRepairPlan ? renderRepairPlan(data) : <RepairPlanView plan={data} />
+          }
+        />
+      );
+    }
+    if (key === "llm") {
+      return (
+        <TabContent
+          status={llmAnalysisStatus}
+          data={llmAnalysis}
+          renderContent={(data) => (
+            <LLMAnalysis
+              result={data}
+              totalFindings={scanResult?.summary.total_findings}
+            />
+          )}
+        />
+      );
+    }
+    return (
+      <TabContent
+        status={qualityReportStatus}
+        data={qualityReport}
+        renderContent={(data) => <QualityReportView report={data} />}
+      />
+    );
+  }
+
+  function statusFor(key: TabKey): ResultTabStatus {
+    if (key === "scan") return scanResultStatus;
+    if (key === "assessment") return assessmentStatus;
+    if (key === "repair") return repairPlanStatus;
+    if (key === "llm") return llmAnalysisStatus;
+    return qualityReportStatus;
+  }
+
   function getStatusBadge(key: TabKey): string {
-    const status =
-      key === "scan"
-        ? scanResultStatus
-        : key === "assessment"
-          ? assessmentStatus
-          : key === "repair"
-            ? repairPlanStatus
-            : key === "llm"
-              ? llmAnalysisStatus
-              : qualityReportStatus;
+    const status = statusFor(key);
     if (status === "available") return " ✓";
     if (status === "unavailable") return " −";
     return " !";
   }
+}
+
+function tabId(key: TabKey): string {
+  return `result-tab-${key}`;
+}
+
+function panelId(key: TabKey): string {
+  return `result-panel-${key}`;
 }
 
 // ---------------------------------------------------------------------------

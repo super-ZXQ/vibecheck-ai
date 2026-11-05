@@ -142,27 +142,33 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
 
 
 async def check_database_ready() -> None:
-    """Raise when PostgreSQL is unreachable or required tables are missing."""
+    """Raise when PostgreSQL is unreachable or migrations are incomplete.
+
+    Required tables are derived from the ORM metadata, so adding a migration
+    (e.g. quality_check_results) automatically raises the readiness bar. A
+    database that was never migrated fails with an explicit message instead
+    of crashing later on the first query.
+    """
     from sqlalchemy import text
+
+    from app.db import models  # noqa: F401 — populate Base.metadata
+    from app.db.base import Base
 
     engine = get_engine()
     async with engine.connect() as conn:
         result = await conn.execute(
             text(
                 """
-                SELECT COUNT(*) AS cnt FROM information_schema.tables
+                SELECT table_name FROM information_schema.tables
                 WHERE table_schema = 'public'
-                  AND table_name IN (
-                    'tasks', 'scan_results', 'assessment_results',
-                    'repair_results', 'llm_analysis_results',
-                    'quality_check_results'
-                  )
                 """
             )
         )
-        row = result.first()
-        count = int(row[0]) if row else 0
-        if count < 6:
+        present = {str(row[0]) for row in result}
+        required = {table.name for table in Base.metadata.sorted_tables}
+        missing = sorted(required - present)
+        if missing:
             raise RuntimeError(
-                "database schema is not initialized — run `alembic upgrade head`"
+                "database schema is not migration-managed or incomplete "
+                f"(missing: {', '.join(missing)}) — run `alembic upgrade head`"
             )

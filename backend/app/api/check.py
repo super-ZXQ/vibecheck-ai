@@ -110,7 +110,9 @@ from app.services.scan_result_service import (
     get_scan_result_async,
 )
 from app.services.task_manager import (
+    STATUS_CANCELLED,
     STATUS_COMPLETED,
+    STATUS_DEAD,
     STATUS_FAILED,
     STATUS_PENDING,
     STATUS_RUNNING,
@@ -731,7 +733,7 @@ async def get_quality_report_result(
             },
         )
 
-    if task.status == STATUS_FAILED:
+    if task.status in (STATUS_FAILED, STATUS_CANCELLED, STATUS_DEAD):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={

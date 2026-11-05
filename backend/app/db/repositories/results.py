@@ -14,7 +14,9 @@ from app.db.models import (
     QualityCheckResultRow,
     RepairResultRow,
     ScanResultRow,
+    TaskRow,
 )
+from app.db.repositories.tasks import STATUS_COMPLETED
 
 
 def _now() -> datetime:
@@ -414,8 +416,24 @@ async def save_llm_analysis(
 async def get_quality_report_available(
     session: AsyncSession, task_id: str
 ) -> bool:
+    """Match GET /quality-report exactly: only a completed task with a
+    parseable persisted report is actually retrievable."""
+    task = await session.get(TaskRow, task_id)
+    if task is None or task.status != STATUS_COMPLETED:
+        return False
     row = await session.get(QualityCheckResultRow, task_id)
-    return row is not None
+    if row is None:
+        return False
+    raw = row.quality_json
+    if isinstance(raw, dict):
+        return True
+    if isinstance(raw, str):
+        try:
+            json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return False
+        return True
+    return False
 
 
 async def get_quality_report(
@@ -558,7 +576,11 @@ async def copy_task_results(
                 schema_version=src_quality.schema_version,
                 overall_status=src_quality.overall_status,
                 block_statuses_json=src_quality.block_statuses_json,
-                quality_json=src_quality.quality_json,
+                quality_json=_rebase_quality_json(
+                    src_quality.quality_json,
+                    dest_task_id,
+                    _as_dt(now).isoformat(),
+                ),
                 total_items=src_quality.total_items,
                 manual_items=src_quality.manual_items,
                 fixable_items=src_quality.fixable_items,
@@ -569,3 +591,19 @@ async def copy_task_results(
         )
     await session.flush()
     return copied
+
+
+def _rebase_quality_json(
+    raw: Any, task_id: str, generated_at: str
+) -> Any:
+    """Point a dedup-copied report at the destination task and generation time."""
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return raw
+    if not isinstance(parsed, dict):
+        return raw
+    parsed = dict(parsed)
+    parsed["task_id"] = task_id
+    parsed["generated_at"] = generated_at
+    return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))

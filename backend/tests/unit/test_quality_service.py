@@ -31,9 +31,10 @@ from app.services import quality_service
 def captured(monkeypatch):
     payload: dict = {}
 
-    async def fake_save(task_id, report, body):
+    async def fake_save(task_id, report, body, *, claim_token=None):
         payload["report"] = report
         payload["body"] = body
+        payload["claim_token"] = claim_token
         return True
 
     monkeypatch.setattr(quality_service, "_save_report", fake_save)
@@ -289,3 +290,119 @@ def test_frontend_analyzer_golden_sample():
         "visually-hidden",
     }
     assert all(item["confidence"] == "high" for item in data["items"])
+
+
+def test_frontend_analyzer_stderr_not_exposed(tmp_path, monkeypatch, caplog):
+    from app.quality.analyzers import frontend_dead_code
+    from app.quality.repository_index import RepositoryIndex
+
+    monkeypatch.setattr(
+        frontend_dead_code,
+        "_run_node",
+        lambda root, node: (
+            2,
+            "",
+            "/Users/secret/app/node_modules/boom.js: raw exception",
+            False,
+        ),
+    )
+    (tmp_path / "frontend" / "app").mkdir(parents=True)
+    (tmp_path / "frontend" / "app" / "page.tsx").write_text(
+        "export default function Page() { return null; }\n", encoding="utf-8"
+    )
+
+    with caplog.at_level("WARNING"):
+        block = frontend_dead_code.analyze_frontend_dead_code(RepositoryIndex(tmp_path))
+
+    data = block.to_dict()
+    assert data["reason_code"] == REASON_ANALYZER_ERROR
+    assert data["reason_message"] == "前端分析器运行失败（内部错误），未完成。"
+    assert "/Users/secret" not in str(data)
+    assert "/Users/secret" in caplog.text
+
+
+def test_frontend_analyzer_timeout_terminates_then_kills(tmp_path, monkeypatch):
+    import subprocess
+
+    from app.quality.analyzers import frontend_dead_code
+
+    calls: list[str] = []
+
+    class FakeProcess:
+        def wait(self, timeout=None):
+            if timeout is None:
+                return 0
+            raise subprocess.TimeoutExpired("node", timeout)
+
+        def terminate(self):
+            calls.append("terminate")
+
+        def kill(self):
+            calls.append("kill")
+
+    monkeypatch.setattr(
+        frontend_dead_code.subprocess,
+        "Popen",
+        lambda *args, **kwargs: FakeProcess(),
+    )
+    returncode, _, _, timed_out = frontend_dead_code._run_node(tmp_path, "/usr/bin/node")
+    assert returncode == -1
+    assert timed_out is True
+    assert calls == ["terminate", "kill"]
+
+
+def test_frontend_item_ids_include_file_prefix():
+    from app.quality.analyzers.frontend_dead_code import _item_from_payload
+
+    first = _item_from_payload(
+        {"category": "frontend_zero_call_export", "name": "helper", "file": "a.ts", "line": 10}
+    )
+    second = _item_from_payload(
+        {"category": "frontend_zero_call_export", "name": "helper", "file": "b.ts", "line": 10}
+    )
+    assert first is not None and second is not None
+    assert first.item_id != second.item_id
+
+
+def test_quality_service_never_creates_schema():
+    """生产只允许 Alembic 建表；_save_report 不得回退到 init_db/create_all。"""
+    import inspect
+
+    from app.services import quality_service
+
+    source = inspect.getsource(quality_service)
+    assert "init_db" not in source
+    assert "create_all" not in source
+
+
+def test_enforce_limits_rechecks_after_clearing(monkeypatch):
+    from app.quality.models import (
+        DIMENSION_BACKEND_COMMENTS,
+        DIMENSIONS,
+        STATUS_COMPLETED,
+        QualityBlock,
+        QualityReport,
+    )
+    from app.services import quality_service
+
+    report = QualityReport(
+        task_id="task-1",
+        generated_at="2026-01-01T00:00:00+00:00",
+        scanner_version="test",
+        blocks={},
+    )
+    block = QualityBlock(
+        dimension=DIMENSION_BACKEND_COMMENTS, status=STATUS_COMPLETED
+    )
+    block.details = {"payload": "x" * 500}
+    block.items = []
+    report.blocks = {dimension: block for dimension in DIMENSIONS}
+
+    monkeypatch.setattr(settings, "quality_max_json_bytes", 900)
+    payload = quality_service._enforce_limits(report)
+    assert len(payload.encode("utf-8")) <= 900
+    assert block.details == {}
+
+    monkeypatch.setattr(settings, "quality_max_json_bytes", 10)
+    with pytest.raises(ValueError):
+        quality_service._enforce_limits(report)

@@ -11,7 +11,12 @@ import { Project, SyntaxKind } from "ts-morph";
 import postcss from "postcss";
 import postcssScss from "postcss-scss";
 
-const MAX_FILES = 4000;
+// Env override exists so regression tests (and operators) can exercise the
+// large-repository truncation path without creating thousands of files.
+const MAX_FILES = (() => {
+  const raw = Number.parseInt(process.env.VIBECHECK_ANALYZER_MAX_FILES ?? "", 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 4000;
+})();
 const MAX_FINDINGS = 200;
 const MAX_BUILD_BYTES = 16 * 1024 * 1024;
 const SCAN_SKIP_DIRS = new Set([
@@ -27,6 +32,7 @@ const SCAN_SKIP_DIRS = new Set([
 
 const NEXT_ENTRY_RE =
   /\/app\/(?:.*\/)?(?:page|layout|route|template|default|loading|error|global-error|not-found|forbidden|unauthorized|instrumentation)\.(?:tsx?|jsx?)$/;
+const PAGES_ENTRY_RE = /^\/src\/pages\/.+\.(?:tsx?|jsx?)$|^\/pages\/.+\.(?:tsx?|jsx?)$/;
 const TEST_FILE_RE = /(?:\.spec|\.test)\.(?:tsx?|jsx?)$/;
 
 function jsonOut(payload) {
@@ -43,10 +49,10 @@ function readText(file, limit = 2 * 1024 * 1024) {
   }
 }
 
-function listFiles(root, extensions, maxFiles = MAX_FILES) {
+function listFiles(root, extensions, maxFiles = MAX_FILES, stats = null) {
   const result = [];
   const stack = [root];
-  while (stack.length && result.length < maxFiles) {
+  scan: while (stack.length && result.length < maxFiles) {
     const dir = stack.pop();
     let entries = [];
     try {
@@ -60,20 +66,76 @@ function listFiles(root, extensions, maxFiles = MAX_FILES) {
         if (!SCAN_SKIP_DIRS.has(entry.name)) stack.push(full);
       } else if (entry.isFile()) {
         const ext = path.extname(entry.name).toLowerCase();
-        if (extensions.includes(ext)) result.push(full);
+        if (!extensions.includes(ext)) continue;
+        if (result.length >= maxFiles) {
+          // 同一目录里仍有未枚举的源文件：必须显式标记截断，
+          // 不能因为本次 readdir 返回超过上限就静默多收或漏报。
+          if (stats) stats.truncated = true;
+          break scan;
+        }
+        result.push(full);
       }
     }
   }
+  if (stats && result.length >= maxFiles && stack.length) stats.truncated = true;
   return result;
 }
 
+function readPackageJson(dir) {
+  const file = path.join(dir, "package.json");
+  const text = readText(file, 512 * 1024);
+  if (!text) return null;
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function packageHasDependency(manifest, names) {
+  if (!manifest) return false;
+  for (const section of ["dependencies", "devDependencies", "peerDependencies"]) {
+    const deps = manifest[section];
+    if (!deps || typeof deps !== "object") continue;
+    for (const name of names) {
+      if (Object.prototype.hasOwnProperty.call(deps, name)) return true;
+    }
+  }
+  return false;
+}
+
+function hasNextConfig(dir) {
+  return ["next.config.js", "next.config.mjs", "next.config.ts", "next.config.cjs"]
+    .map((name) => path.join(dir, name))
+    .some((file) => fs.existsSync(file));
+}
+
+function hasRouterDirectory(dir) {
+  return ["app", "src/app", "pages", "src/pages"]
+    .map((name) => path.join(dir, name))
+    .some((candidate) => {
+      try {
+        return fs.statSync(candidate).isDirectory();
+      } catch {
+        return false;
+      }
+    });
+}
+
 function findFrontendRoot(repoRoot) {
-    const marker = (dir) =>
-    fs.existsSync(path.join(dir, "next.config.js")) ||
-    fs.existsSync(path.join(dir, "next.config.mjs")) ||
-    fs.existsSync(path.join(dir, "next.config.ts")) ||
-    fs.existsSync(path.join(dir, "app")) ||
-    fs.existsSync(path.join(dir, "src", "app"));
+  // 纯后端仓库（例如 Django 的 app/ 目录）不能被误判为前端工程：
+  // 目录存在只是必要条件，React/Next 依赖才是充分条件。
+  const marker = (dir) => {
+    if (hasNextConfig(dir)) return true;
+    const manifest = readPackageJson(dir);
+    if (!manifest) return false;
+    if (packageHasDependency(manifest, ["next"])) return true;
+    return (
+      packageHasDependency(manifest, ["react", "react-dom"]) &&
+      hasRouterDirectory(dir)
+    );
+  };
   if (marker(repoRoot)) return repoRoot;
   const candidates = ["frontend", "web", "apps/web", "client", "ui"];
   for (const candidate of candidates) {
@@ -100,15 +162,22 @@ function lineOf(sourceFile, start) {
   return sourceFile.getLineAndColumnAtPos(start).line;
 }
 
-function collectNextEntries(frontendRoot) {
+function collectNextEntries(frontendRoot, stats = null) {
   const entries = [];
-  const candidates = listFiles(frontendRoot, [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
+  const candidates = listFiles(
+    frontendRoot,
+    [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"],
+    MAX_FILES,
+    stats,
+  );
   for (const file of candidates) {
     const rel = relative(frontendRoot, file);
+    const normalized = `/${rel}`;
     if (
-      NEXT_ENTRY_RE.test(`/${rel}`) ||
-      /^(?:\/)?(?:middleware|instrumentation)\.(?:tsx?|jsx?)$/.test(`/${rel}`) ||
-      /^\/next\.config\.(?:js|mjs|ts)$/.test(`/${rel}`)
+      NEXT_ENTRY_RE.test(normalized) ||
+      PAGES_ENTRY_RE.test(normalized) ||
+      /^(?:\/)?(?:middleware|instrumentation)\.(?:tsx?|jsx?)$/.test(normalized) ||
+      /^\/next\.config\.(?:js|mjs|ts)$/.test(normalized)
     ) {
       entries.push(file);
     }
@@ -156,14 +225,14 @@ function buildSearchText(frontendRoot) {
       const text = readText(file, 1024 * 1024);
       if (!text) continue;
       total += Buffer.byteLength(text);
-      if (total > MAX_BUILD_BYTES) return chunks.join("\n");
+      if (total > MAX_BUILD_BYTES) return { text: chunks.join("\n"), truncated: true };
       chunks.push(text);
     }
   }
-  return chunks.join("\n");
+  return { text: chunks.join("\n"), truncated: false };
 }
 
-function createProject(frontendRoot) {
+function createProject(frontendRoot, stats = null) {
   const tsconfig = ["tsconfig.json", "jsconfig.json"]
     .map((name) => path.join(frontendRoot, name))
     .find((file) => fs.existsSync(file));
@@ -185,7 +254,12 @@ function createProject(frontendRoot) {
         baseUrl: frontendRoot,
       },
     });
-    const files = listFiles(frontendRoot, [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
+    const files = listFiles(
+      frontendRoot,
+      [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"],
+      MAX_FILES,
+      stats,
+    );
     project.addSourceFilesAtPaths(files);
   }
   // e2e helpers are often excluded by the app tsconfig; include them explicitly.
@@ -228,6 +302,7 @@ function collectUsage(project) {
   const dynamicImportDirs = new Set();
   const functionCalls = new Map(); // "absPath#localName" -> count
   const stringReferences = new Set(); // symbol names seen in string literals
+  const propertyReferences = new Set(); // member names seen in obj.member / obj["member"]
 
   const markUsed = (file, name) => {
     usedExports.set(`${file.getFilePath()}#${name}`, true);
@@ -300,6 +375,9 @@ function collectUsage(project) {
     for (const text of file.getDescendantsOfKind(SyntaxKind.NoSubstitutionTemplateLiteral)) {
       stringReferences.add(text.getLiteralText());
     }
+    for (const access of file.getDescendantsOfKind(SyntaxKind.PropertyAccessExpression)) {
+      propertyReferences.add(access.getName());
+    }
   }
 
   // Propagate barrel re-exports: importing a barrel name marks the upstream
@@ -325,47 +403,57 @@ function collectUsage(project) {
     dynamicImportDirs,
     functionCalls,
     stringReferences,
+    propertyReferences,
     importedNames,
   };
+}
+
+function containsIdentifier(text, name) {
+  // 边界匹配，避免 "foo" 命中 "foobar"/"myFoo" 之类的子串。
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[^A-Za-z0-9_$])${escaped}([^A-Za-z0-9_$]|$)`).test(text);
 }
 
 function collectFunctions(project, repoRoot, frontendRoot, usage, entries, buildAvailable) {
   const findings = [];
   const entryPaths = new Set(entries.map((file) => file.getFilePath?.() ?? file));
-  const buildText = buildAvailable ? buildSearchText(frontendRoot) : "";
+  const buildScan = buildAvailable
+    ? buildSearchText(frontendRoot)
+    : { text: "", truncated: false };
+  const buildText = buildScan.text;
   for (const file of usage.files) {
     const rel = relative(frontendRoot, file.getFilePath());
     if (TEST_FILE_RE.test(rel)) continue;
     if (entryPaths.has(file.getFilePath())) continue;
-    const functions = file.getFunctions();
-    for (const fn of functions) {
-      if (!fn.isExported()) continue;
-      const name = fn.getName();
-      if (!name) continue;
-      const key = `${file.getFilePath()}#${name}`;
-      if (usage.usedExports.has(key)) continue;
-      if (usage.sideEffectModules.has(file.getFilePath())) continue;
-      if ((usage.functionCalls.get(key) ?? 0) > 0) continue;
-      if (buildText && buildText.includes(name)) continue;
-      if (usage.stringReferences.has(name)) {
+    const filePath = file.getFilePath();
+    const dir = path.dirname(filePath);
+    const dynamicNearby = usage.dynamicImportDirs.has(dir);
+    const confidence = dynamicNearby || !buildAvailable ? "medium" : "high";
+
+    const emit = (displayName, lookupName, start, isMember = false) => {
+      if (!lookupName) return;
+      const key = `${filePath}#${lookupName}`;
+      if (usage.usedExports.has(key)) return;
+      if (usage.sideEffectModules.has(filePath)) return;
+      if (!isMember && (usage.functionCalls.get(key) ?? 0) > 0) return;
+      if (isMember && usage.propertyReferences.has(lookupName)) return;
+      if (buildText && containsIdentifier(buildText, lookupName)) return;
+      if (usage.stringReferences.has(lookupName)) {
         findings.push({
           category: "frontend_reflection_reference",
-          name,
-          file: relative(repoRoot, file.getFilePath()),
-          line: lineOf(file, fn.getStart()),
+          name: displayName,
+          file: relative(repoRoot, filePath),
+          line: lineOf(file, start),
           confidence: "low",
           reason: "symbol name appears as a string literal; runtime/reflection registration cannot be excluded",
         });
-        continue;
+        return;
       }
-      const dir = path.dirname(file.getFilePath());
-      const dynamicNearby = usage.dynamicImportDirs.has(dir);
-      const confidence = dynamicNearby || !buildAvailable ? "medium" : "high";
       findings.push({
         category: "frontend_zero_call_export",
-        name,
-        file: relative(repoRoot, file.getFilePath()),
-        line: lineOf(file, fn.getStart()),
+        name: displayName,
+        file: relative(repoRoot, filePath),
+        line: lineOf(file, start),
         confidence,
         reason: dynamicNearby
           ? "zero references; directory contains dynamic import/template resolution"
@@ -373,9 +461,74 @@ function collectFunctions(project, repoRoot, frontendRoot, usage, entries, build
             ? "zero references and absent from build output"
             : "zero references but build output is unavailable",
       });
+    };
+
+    for (const fn of file.getFunctions()) {
+      if (!fn.isExported()) continue;
+      const name = fn.getName();
+      if (name) emit(name, name, fn.getStart());
+    }
+
+    for (const declaration of file.getVariableDeclarations()) {
+      if (!declaration.isExported()) continue;
+      const name = declaration.getName();
+      if (!name) continue;
+      const initializer = declaration.getInitializer();
+      const kind = initializer?.getKind();
+      // 标量常量可能是对外公开的配置项，噪声大；只纳入函数/对象常量。
+      if (
+        kind !== SyntaxKind.ObjectLiteralExpression &&
+        kind !== SyntaxKind.ArrowFunction &&
+        kind !== SyntaxKind.FunctionExpression
+      ) {
+        continue;
+      }
+      emit(name, name, declaration.getStart());
+      // 对象成员只在对象本身被使用时检查，避免未使用对象的重复报告。
+      if (
+        kind === SyntaxKind.ObjectLiteralExpression &&
+        usage.usedExports.has(`${filePath}#${name}`)
+      ) {
+        for (const property of initializer.getProperties()) {
+          if (property.getKind() !== SyntaxKind.PropertyAssignment) continue;
+          // 只把可执行对象成员视为候选；数据字段不是"死代码"。
+          const propertyValue = property.getInitializer();
+          const valueKind = propertyValue?.getKind();
+          if (
+            valueKind !== SyntaxKind.ArrowFunction &&
+            valueKind !== SyntaxKind.FunctionExpression
+          ) {
+            continue;
+          }
+          const member = property.getName();
+          if (!member) continue;
+          emit(`${name}.${member}`, member, property.getStart(), true);
+        }
+      }
+    }
+
+    for (const declaration of file.getClasses()) {
+      if (!declaration.isExported()) continue;
+      const className = declaration.getName();
+      if (!className) continue;
+      const classKey = `${filePath}#${className}`;
+      const classUsed =
+        usage.usedExports.has(classKey) ||
+        (usage.functionCalls.get(classKey) ?? 0) > 0;
+      if (!classUsed) {
+        emit(className, className, declaration.getStart());
+        continue;
+      }
+      for (const method of declaration.getMethods()) {
+        const methodName = method.getName();
+        if (!methodName || methodName === "constructor" || methodName.startsWith("#")) {
+          continue;
+        }
+        emit(`${className}.${methodName}`, methodName, method.getStart(), true);
+      }
     }
   }
-  return findings;
+  return { findings, build_truncated: buildScan.truncated };
 }
 
 function classTokensFromText(text) {
@@ -389,25 +542,83 @@ function classTokensFromText(text) {
   return tokens;
 }
 
+const CSS_MODULE_RE = /\.module\.(?:css|scss|sass|less)$/i;
+const CLASS_HELPER_RE = /^(?:clsx|classnames|cn|cx|twmerge|twjoin|cva)$/i;
+const CLASS_LIST_METHODS = new Set(["add", "remove", "toggle", "contains", "replace"]);
+
 function collectClassUsage(project) {
   const used = new Set();
   const familyPrefixes = new Set();
-  for (const file of project.getSourceFiles()) {
-    const filePath = file.getFilePath().split(path.sep).join("/");
-    if (filePath.includes("/node_modules/") || filePath.includes("/.next/")) continue;
-    if (!/\.(?:tsx?|jsx?|mjs|cjs)$/.test(filePath)) continue;
-    for (const text of file.getDescendantsOfKind(SyntaxKind.StringLiteral)) {
-      for (const token of classTokensFromText(text.getLiteralText())) used.add(token);
+  const moduleUsage = new Map(); // normalized css module path -> Set(local class)
+  const bindings = new Map(); // local import/namespace name -> css module path
+
+  const normalize = (value) => value.split(path.sep).join("/");
+  const addTokens = (text) => {
+    for (const token of classTokensFromText(text)) used.add(token);
+  };
+  const addModuleClass = (modulePath, className) => {
+    if (!className) return;
+    let set = moduleUsage.get(modulePath);
+    if (!set) {
+      set = new Set();
+      moduleUsage.set(modulePath, set);
     }
-    for (const text of file.getDescendantsOfKind(SyntaxKind.NoSubstitutionTemplateLiteral)) {
-      for (const token of classTokensFromText(text.getLiteralText())) used.add(token);
+    set.add(className);
+  };
+  const addTemplateTokens = (template) => {
+    addTokens(template.getHead().getLiteralText());
+    for (const span of template.getTemplateSpans()) {
+      addTokens(span.getLiteral().getLiteralText());
     }
-    for (const template of file.getDescendantsOfKind(SyntaxKind.TemplateExpression)) {
+  };
+  const addPrefixFromChunk = (chunk) => {
+    const trailing = chunk.trimEnd().split(/\s+/).pop();
+    if (!trailing) return;
+    const prefix = trailing.replace(/^[`"'.#]+/, "").replace(/[`"']+$/, "");
+    if (/^[A-Za-z_][A-Za-z0-9_-]*$/.test(prefix) && prefix.length >= 2) {
+      familyPrefixes.add(prefix);
+    }
+  };
+  const addStringsInNode = (node) => {
+    if (!node) return;
+    const kind = node.getKind();
+    if (kind === SyntaxKind.StringLiteral) {
+      addTokens(node.getLiteralText());
+      return;
+    }
+    if (kind === SyntaxKind.NoSubstitutionTemplateLiteral) {
+      addTokens(node.getLiteralText());
+      return;
+    }
+    if (kind === SyntaxKind.TemplateExpression) {
+      addTemplateTokens(node);
+      // 只有插值之前的前缀片段才算 family prefix，末尾片段不是前缀。
+      addPrefixFromChunk(node.getHead().getLiteralText());
+      const spans = node.getTemplateSpans();
+      for (let index = 0; index < spans.length - 1; index += 1) {
+        addPrefixFromChunk(spans[index].getLiteral().getLiteralText());
+      }
+      return;
+    }
+    for (const text of node.getDescendantsOfKind(SyntaxKind.StringLiteral)) {
+      addTokens(text.getLiteralText());
+    }
+    for (const text of node.getDescendantsOfKind(SyntaxKind.NoSubstitutionTemplateLiteral)) {
+      addTokens(text.getLiteralText());
+    }
+    for (const template of node.getDescendantsOfKind(SyntaxKind.TemplateExpression)) {
+      addTemplateTokens(template);
+      addPrefixFromChunk(template.getHead().getLiteralText());
+      const spans = template.getTemplateSpans();
+      for (let index = 0; index < spans.length - 1; index += 1) {
+        addPrefixFromChunk(spans[index].getLiteral().getLiteralText());
+      }
+    }
+  };
+  const addTemplatePrefixes = (node) => {
+    for (const template of node.getDescendantsOfKind(SyntaxKind.TemplateExpression)) {
       const text = template.getText();
       const chunks = text.split(/\$\{[^}]*\}/);
-      for (const chunk of chunks) {
-        for (const token of classTokensFromText(chunk)) used.add(token);
-      }
       for (let index = 0; index < chunks.length - 1; index += 1) {
         const trailing = chunks[index].trimEnd().split(/\s+/).pop();
         if (!trailing) continue;
@@ -417,8 +628,86 @@ function collectClassUsage(project) {
         }
       }
     }
+  };
+
+  for (const file of project.getSourceFiles()) {
+    const filePath = normalize(file.getFilePath());
+    if (filePath.includes("/node_modules/") || filePath.includes("/.next/")) continue;
+    if (!/\.(?:tsx?|jsx?|mjs|cjs)$/.test(filePath)) continue;
+
+    // 1) 解析 CSS Modules：只认 import 绑定后的局部类名。
+    for (const declaration of file.getImportDeclarations()) {
+      const specifier = declaration.getModuleSpecifierValue();
+      if (!CSS_MODULE_RE.test(specifier)) continue;
+      const modulePath = normalize(path.resolve(path.dirname(filePath), specifier));
+      if (!fs.existsSync(modulePath)) continue;
+      const defaultImport = declaration.getDefaultImport();
+      if (defaultImport) bindings.set(defaultImport.getText(), modulePath);
+      const namespaceImport = declaration.getNamespaceImport();
+      if (namespaceImport) bindings.set(namespaceImport.getText(), modulePath);
+      for (const named of declaration.getNamedImports()) {
+        const local = named.getAliasNode()?.getText() ?? named.getName();
+        bindings.set(local, modulePath);
+        addModuleClass(modulePath, named.getName());
+      }
+    }
+    for (const access of file.getDescendantsOfKind(SyntaxKind.PropertyAccessExpression)) {
+      const owner = access.getExpression().getText();
+      const modulePath = bindings.get(owner);
+      if (modulePath) addModuleClass(modulePath, access.getName());
+    }
+    for (const access of file.getDescendantsOfKind(SyntaxKind.ElementAccessExpression)) {
+      const modulePath = bindings.get(access.getExpression().getText());
+      if (!modulePath) continue;
+      const argument = access.getArgumentExpression();
+      if (!argument) continue;
+      if (
+        argument.getKind() === SyntaxKind.StringLiteral ||
+        argument.getKind() === SyntaxKind.NoSubstitutionTemplateLiteral
+      ) {
+        addModuleClass(modulePath, argument.getLiteralText());
+      }
+    }
+    for (const declaration of file.getVariableDeclarations()) {
+      const nameNode = declaration.getNameNode();
+      if (nameNode.getKind() !== SyntaxKind.ObjectBindingPattern) continue;
+      const modulePath = bindings.get(declaration.getInitializer()?.getText() ?? "");
+      if (!modulePath) continue;
+      for (const element of nameNode.getElements()) {
+        addModuleClass(modulePath, element.getName());
+      }
+    }
+
+    // 2) 全局 CSS 的来源：className/class、class helper、classList，
+    // 以及变量常量/映射与 return 值中的类名字符串（常见间接用法）。
+    for (const attribute of file.getDescendantsOfKind(SyntaxKind.JsxAttribute)) {
+      const attributeName = attribute.getNameNode().getText();
+      if (attributeName !== "className" && attributeName !== "class") continue;
+      addStringsInNode(attribute.getInitializer());
+    }
+    for (const declaration of file.getVariableDeclarations()) {
+      addStringsInNode(declaration.getInitializer());
+    }
+    for (const statement of file.getDescendantsOfKind(SyntaxKind.ReturnStatement)) {
+      addStringsInNode(statement.getExpression());
+    }
+    for (const call of file.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+      const callee = call.getExpression().getText().split(".").pop() ?? "";
+      if (CLASS_HELPER_RE.test(callee)) {
+        for (const argument of call.getArguments()) addStringsInNode(argument);
+        addTemplatePrefixes(call);
+        continue;
+      }
+      if (call.getExpression().getKind() !== SyntaxKind.PropertyAccessExpression) {
+        continue;
+      }
+      const property = call.getExpression().getName?.() ?? "";
+      if (!CLASS_LIST_METHODS.has(property)) continue;
+      const argument = call.getArguments()[0];
+      if (argument) addStringsInNode(argument);
+    }
   }
-  return { used, familyPrefixes };
+  return { used, familyPrefixes, moduleUsage };
 }
 
 function matchesFamily(className, prefixes) {
@@ -482,6 +771,9 @@ function collectCssFindings(
       }
     }
     const rel = relative(repoRoot, file);
+    const moduleUsed = CSS_MODULE_RE.test(file)
+      ? usedClasses.moduleUsage.get(file.split(path.sep).join("/")) ?? new Set()
+      : null;
     root.walkRules((rule) => {
       if (rule.parent && rule.parent.type === "atrule" && /keyframes/i.test(rule.parent.name)) {
         return;
@@ -491,8 +783,14 @@ function collectCssFindings(
           const className = match[1];
           if (seen.has(`${rel}#${className}`)) continue;
           seen.add(`${rel}#${className}`);
-          if (usedClasses.used.has(className)) continue;
-          if (matchesFamily(className, usedClasses.familyPrefixes)) continue;
+          if (moduleUsed) {
+            // CSS Modules 只认同一模块 import 绑定后的局部类名。
+            if (moduleUsed.has(className)) continue;
+            if (/:global\(/.test(selector) && usedClasses.used.has(className)) continue;
+          } else {
+            if (usedClasses.used.has(className)) continue;
+            if (matchesFamily(className, usedClasses.familyPrefixes)) continue;
+          }
           findings.push({
             category: "frontend_unused_css_class",
             class_name: className,
@@ -551,22 +849,25 @@ function main() {
     });
     return;
   }
-  const entries = collectNextEntries(frontendRoot);
+  const scanStats = { truncated: false };
+  const entries = collectNextEntries(frontendRoot, scanStats);
   const build = buildOutputState(frontendRoot);
   let project;
   try {
-    project = createProject(frontendRoot);
+    project = createProject(frontendRoot, scanStats);
   } catch (error) {
+    // 原始异常只写服务端 stderr，对外只给稳定错误码与简短描述。
+    console.error(`ts-morph project creation failed: ${error?.stack ?? error}`);
     jsonOut({
       status: "not_completed",
       reason_code: "ANALYZER_ERROR",
-      message: `ts-morph project creation failed: ${error.message}`,
+      message: "前端分析器项目初始化失败，未完成。",
       items: [],
     });
     return;
   }
   const usage = collectUsage(project);
-  const functions = collectFunctions(
+  const functionScan = collectFunctions(
     project,
     repoRoot,
     frontendRoot,
@@ -583,22 +884,46 @@ function main() {
     build.available,
     minifiedClasses,
   );
-  const items = [...functions, ...css]
-    .sort((a, b) => (a.file === b.file ? a.line - b.line : a.file.localeCompare(b.file)))
-    .slice(0, MAX_FINDINGS);
+  const allItems = [...functionScan.findings, ...css].sort((a, b) =>
+    a.file === b.file ? a.line - b.line : a.file.localeCompare(b.file),
+  );
+  const items = allItems.slice(0, MAX_FINDINGS);
+  const omittedItems = Math.max(0, allItems.length - items.length);
+  const outputTruncated = omittedItems > 0;
+  const enumerationTruncated = scanStats.truncated;
+  const degraded = !build.available || enumerationTruncated || functionScan.build_truncated;
   const limitations = [];
   if (!build.available) {
     limitations.push("构建产物缺失，前端死代码最高只能给出中等置信度。");
   }
-  if (items.length >= MAX_FINDINGS) {
-    limitations.push("分析结果达到输出条数上限，已截断。");
+  if (outputTruncated) {
+    limitations.push(`分析结果超过输出上限，已省略 ${omittedItems} 条。`);
+  }
+  if (enumerationTruncated) {
+    limitations.push("源文件枚举达到上限，部分文件未分析（省略数量未知）。");
+  }
+  if (functionScan.build_truncated) {
+    limitations.push("构建产物扫描达到字节上限，部分产物未参与比对。");
+  }
+  const truncated = outputTruncated || enumerationTruncated;
+  let status = truncated || degraded ? "partial" : "completed";
+  let reasonCode = truncated
+    ? "RESULT_TRUNCATED"
+    : degraded
+      ? "PARTIAL_ENUMERATION"
+      : null;
+  let message = "前端死代码静态分析完成。";
+  if (outputTruncated) {
+    message = `分析结果超出容量上限，已省略 ${omittedItems} 条。`;
+  } else if (enumerationTruncated) {
+    message = "源文件数量超过枚举上限，部分文件未分析（省略数量未知）。";
+  } else if (degraded) {
+    message = "部分输入缺失或达到上限，结果可能不完整。";
   }
   jsonOut({
-    status: build.available ? "completed" : "partial",
-    reason_code: build.available ? null : "PARTIAL_ENUMERATION",
-    message: build.available
-      ? "前端死代码静态分析完成。"
-      : "构建产物缺失，置信度已降级。",
+    status,
+    reason_code: reasonCode,
+    message,
     frontend_root: path.relative(repoRoot, frontendRoot).split(path.sep).join("/") || ".",
     build_output: build,
     next_entries: entries.map((file) => relative(repoRoot, file)),
@@ -606,11 +931,13 @@ function main() {
     counts: {
       source_files: usage.files.length,
       next_entries: entries.length,
-      zero_call_functions: functions.length,
+      zero_call_functions: functionScan.findings.length,
       css_classes: css.length,
       used_class_tokens: usedClasses.used.size,
       family_prefixes: usedClasses.familyPrefixes.size,
       minified_css_classes: minifiedClasses.size,
+      omitted_items: omittedItems,
+      omitted_source_files: scanStats.truncated ? null : 0,
     },
     limitations,
     items,

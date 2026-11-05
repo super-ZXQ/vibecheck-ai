@@ -297,3 +297,41 @@ def test_english_explanatory_comment_is_not_trivial():
     ]
     assert not _looks_like_trivial_translation(lines[0], lines, 0)
     assert _looks_like_trivial_translation(lines[2], lines, 2)
+
+
+def test_module_level_findings_are_not_discarded_when_no_functions(tmp_path):
+    index = _write(
+        tmp_path,
+        {
+            "app/constants.py": (
+                "VERSION = '1.0'\n"
+                "# TODO: remove this legacy flag\n"
+                "LEGACY_FLAG = True\n"
+            ),
+        },
+    )
+    block = analyze_backend_comments(index)
+    assert block.to_dict()["status"] != STATUS_NOT_APPLICABLE
+    assert "todo_without_owner" in _categories(block)
+
+
+def test_llm_disabled_reason_not_masked_by_parse_errors(tmp_path):
+    index = _write(
+        tmp_path,
+        {
+            "app/api/routes.py": (
+                "from fastapi import APIRouter\n"
+                "router = APIRouter()\n"
+                "@router.get('/x')\n"
+                "def get_x():\n"
+                "    \"\"\"Return x.\"\"\"\n"
+                "    return {}\n"
+            ),
+            "app/broken.py": "def broken(:\n    pass\n",
+        },
+    )
+    block = analyze_backend_comments(index)
+    data = block.to_dict()
+    assert data["status"] == STATUS_PARTIAL
+    assert data["reason_code"] == REASON_LLM_DISABLED
+    assert "无法解析" in data["reason_message"]

@@ -81,6 +81,10 @@ def _create_status_task(status: str):
         task_manager.mark_running(task.id, "quality_checks", 85)
     elif status == "failed":
         task_manager.mark_failed(task.id, "INTERNAL_ERROR", "内部错误")
+    elif status == "cancelled":
+        task_manager.mark_cancelled(task.id)
+    elif status == "dead":
+        task_manager.mark_dead(task.id, "WORKER_LOST")
     return task.id
 
 
@@ -164,8 +168,16 @@ class TestQualityReportBranches:
         assert resp.status_code == 409
         assert resp.json()["detail"]["error_code"] == QUALITY_REPORT_NOT_AVAILABLE
 
-    def test_failed_with_residual_row_does_not_leak(self, client):
-        task_id = _create_status_task("failed")
+    @pytest.mark.parametrize("status", ["cancelled", "dead"])
+    def test_409_cancelled_and_dead_use_explicit_contract(self, client, status):
+        task_id = _create_status_task(status)
+        resp = client.get(f"/api/check/{task_id}/quality-report")
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["error_code"] == QUALITY_REPORT_NOT_AVAILABLE
+
+    @pytest.mark.parametrize("status", ["failed", "cancelled", "dead"])
+    def test_terminal_status_with_residual_row_does_not_leak(self, client, status):
+        task_id = _create_status_task(status)
         _insert_quality_row(task_id, _valid_body(task_id))
         resp = client.get(f"/api/check/{task_id}/quality-report")
         assert resp.status_code == 409
@@ -233,3 +245,150 @@ class TestQualityPollingEnrichment:
         task_id = _create_status_task("failed")
         data = client.get(f"/api/check/{task_id}").json()
         assert data.get("quality_report_available") is not True
+
+    @pytest.mark.parametrize("status", ["failed", "cancelled", "dead"])
+    def test_terminal_status_with_residual_row_is_not_advertised(self, client, status):
+        task_id = _create_status_task(status)
+        _insert_quality_row(task_id, _valid_body(task_id))
+        data = client.get(f"/api/check/{task_id}").json()
+        assert data.get("quality_report_available") is not True
+        assert data.get("quality_report_url") is None
+
+
+class _StubReport:
+    generated_at = "2026-01-01T00:00:00+00:00"
+    blocks: dict = {}
+
+    def summary(self):
+        return {
+            "total_items": 0,
+            "manual_decision_items": 0,
+            "fixable_items": 0,
+        }
+
+    def overall_status(self):
+        return "completed"
+
+
+def _create_running_owned_task(worker_id: str) -> str:
+    task = task_manager.create_task("https://github.com/test/repo", "test", "repo")
+    claimed = task_manager.claim_next_pending(worker_id)
+    assert claimed is not None and claimed.id == task.id
+    return task.id
+
+
+def _quality_row_exists(task_id: str) -> bool:
+    from app.db.models import QualityCheckResultRow
+    from app.db.session import get_session_factory
+
+    async def _run():
+        async with get_session_factory()() as session:
+            return await session.get(QualityCheckResultRow, task_id) is not None
+
+    return asyncio.run(_run())
+
+
+def _steal_task(task_id: str, new_worker_id: str) -> None:
+    from app.db.models import TaskRow
+    from app.db.session import get_session_factory
+
+    async def _run():
+        async with get_session_factory()() as session:
+            row = await session.get(TaskRow, task_id)
+            row.worker_id = new_worker_id
+            await session.commit()
+
+    asyncio.run(_run())
+
+
+class TestQualityReportFencing:
+    def test_current_claim_token_writes(self, test_db):
+        from app.services import quality_service
+
+        task_id = _create_running_owned_task("worker-a")
+        ok = asyncio.run(
+            quality_service._save_report(
+                task_id, _StubReport(), "{}", claim_token="worker-a"
+            )
+        )
+        assert ok is True
+        assert _quality_row_exists(task_id) is True
+
+    def test_stolen_task_cannot_write_report(self, test_db):
+        from app.services import quality_service
+
+        task_id = _create_running_owned_task("worker-a")
+        _steal_task(task_id, "worker-b")
+        ok = asyncio.run(
+            quality_service._save_report(
+                task_id, _StubReport(), "{}", claim_token="worker-a"
+            )
+        )
+        assert ok is False
+        assert _quality_row_exists(task_id) is False
+
+    def test_cancelled_task_cannot_write_report(self, test_db):
+        from app.services import quality_service
+
+        task_id = _create_running_owned_task("worker-a")
+        task_manager.mark_cancelled(task_id)
+        ok = asyncio.run(
+            quality_service._save_report(
+                task_id, _StubReport(), "{}", claim_token="worker-a"
+            )
+        )
+        assert ok is False
+        assert _quality_row_exists(task_id) is False
+
+    def test_concurrent_stale_and_current_worker_only_current_writes(self, test_db):
+        from app.services import quality_service
+
+        task_id = _create_running_owned_task("worker-b")
+
+        async def _run():
+            stale, current = await asyncio.gather(
+                quality_service._save_report(
+                    task_id, _StubReport(), "{}", claim_token="worker-a"
+                ),
+                quality_service._save_report(
+                    task_id, _StubReport(), "{}", claim_token="worker-b"
+                ),
+            )
+            return stale, current
+
+        stale, current = asyncio.run(_run())
+        assert stale is False
+        assert current is True
+        assert _quality_row_exists(task_id) is True
+
+
+class TestDedupCopyReport:
+    def test_copy_rebinds_task_id_and_generated_at(self, test_db):
+        from app.db.models import QualityCheckResultRow
+        from app.db.repositories import results as result_repo
+        from app.db.session import get_session_factory
+
+        source = _create_completed_task()
+        _insert_quality_row(source, _valid_body(source))
+        dest = _create_completed_task()
+
+        async def _run():
+            async with get_session_factory()() as session:
+                copied = await result_repo.copy_task_results(
+                    session, source, dest
+                )
+                await session.commit()
+                return copied
+
+        # 只插入了质量报告行，copy_task_results 的布尔返回值表示是否复制了
+        # 扫描结果；此处直接校验质量行本身是否完成复制与重绑定。
+        asyncio.run(_run())
+
+        async def _load():
+            async with get_session_factory()() as session:
+                row = await session.get(QualityCheckResultRow, dest)
+                return json.loads(row.quality_json)
+
+        payload = asyncio.run(_load())
+        assert payload["task_id"] == dest
+        assert payload["generated_at"] != "2026-01-01T00:00:00+00:00"

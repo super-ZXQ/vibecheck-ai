@@ -2,10 +2,14 @@
 
 import type {
   QualityBlock,
-  QualityBlockStatus,
   QualityItem,
   QualityReport as QualityReportData,
 } from "@/lib/types";
+import {
+  formatQualityCounts,
+  qualityStatusMeta,
+  splitQualityItems,
+} from "@/lib/quality-report.mjs";
 
 const BLOCK_ORDER = [
   "frontend_dead_code",
@@ -13,20 +17,6 @@ const BLOCK_ORDER = [
   "backend_route_audit",
   "backend_comment_quality",
 ];
-
-const STATUS_LABELS: Record<QualityBlockStatus, string> = {
-  completed: "已完成",
-  partial: "部分完成",
-  not_completed: "未完成",
-  not_applicable: "不适用",
-};
-
-const STATUS_CLASSES: Record<QualityBlockStatus, string> = {
-  completed: "severity-info",
-  partial: "severity-medium",
-  not_completed: "severity-high",
-  not_applicable: "severity-low",
-};
 
 const FIXABILITY_LABELS: Record<string, string> = {
   auto_fix: "可自动修复",
@@ -79,12 +69,12 @@ export function QualityReport({ report }: QualityReportProps) {
         <QualityBlockCard key={block.dimension} block={block} />
       ))}
 
-      {report.limitations.length > 0 && (
+      {(report.limitations ?? []).length > 0 && (
         <div className="card">
           <h3>覆盖范围与限制</h3>
           <ul>
-            {report.limitations.map((line) => (
-              <li key={line}>{line}</li>
+            {(report.limitations ?? []).map((line, index) => (
+              <li key={index}>{line}</li>
             ))}
           </ul>
         </div>
@@ -95,8 +85,11 @@ export function QualityReport({ report }: QualityReportProps) {
 
 function QualityBlockCard({ block }: { block: QualityBlock }) {
   const counts = block.conclusion?.counts ?? {};
-  const fixable = block.items.filter((item) => !item.manual_decision_required);
-  const manual = block.items.filter((item) => item.manual_decision_required);
+  // Backend id lists are authoritative: report_only items that belong to
+  // neither group must not be presented as fixable.
+  const { fixable, manual, other } = splitQualityItems(block);
+  const statusMeta = qualityStatusMeta(block.status);
+  const { scalars, nested } = formatQualityCounts(counts);
   const needsReason = block.status !== "completed";
 
   return (
@@ -111,8 +104,8 @@ function QualityBlockCard({ block }: { block: QualityBlock }) {
         }}
       >
         <h3 style={{ margin: 0 }}>{block.label}</h3>
-        <span className={`severity-badge ${STATUS_CLASSES[block.status]}`}>
-          {STATUS_LABELS[block.status]}
+        <span className={`severity-badge ${statusMeta.className}`}>
+          {statusMeta.label}
         </span>
       </div>
 
@@ -131,12 +124,28 @@ function QualityBlockCard({ block }: { block: QualityBlock }) {
 
       <p>{block.conclusion?.headline || "未生成结论。"}</p>
 
-      {Object.keys(counts).length > 0 && (
-        <p style={{ opacity: 0.75, fontSize: "0.9em" }}>
-          {Object.entries(counts)
-            .map(([key, value]) => `${key}: ${value}`)
-            .join(" · ")}
-        </p>
+      {(scalars.length > 0 || nested.length > 0) && (
+        <div style={{ color: "var(--text-secondary)", fontSize: "0.9em" }}>
+          {scalars.length > 0 && (
+            <p style={{ margin: 0 }}>
+              {scalars.map(([key, value]) => `${key}: ${value}`).join(" · ")}
+            </p>
+          )}
+          {nested.map(([key, entries]) => (
+            <details key={key} style={{ marginTop: "6px" }}>
+              <summary style={{ cursor: "pointer" }}>
+                {key} 明细（{entries.length}）
+              </summary>
+              <ul style={{ margin: "6px 0 0 18px" }}>
+                {entries.map(([name, value]) => (
+                  <li key={name} style={{ overflowWrap: "anywhere" }}>
+                    {name}: {value}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          ))}
+        </div>
       )}
 
       {block.items.length === 0 ? (
@@ -144,10 +153,13 @@ function QualityBlockCard({ block }: { block: QualityBlock }) {
       ) : (
         <>
           {fixable.length > 0 && (
-            <QualityItemList title="可修复项" items={fixable} />
+            <QualityItemList title="可修复项" group="fixable" items={fixable} />
           )}
           {manual.length > 0 && (
-            <QualityItemList title="需人工确认项" items={manual} />
+            <QualityItemList title="需人工确认项" group="manual" items={manual} />
+          )}
+          {other.length > 0 && (
+            <QualityItemList title="其他发现（仅报告）" group="other" items={other} />
           )}
         </>
       )}
@@ -165,9 +177,17 @@ function emptyMessage(block: QualityBlock): string {
   return `该维度未完成/结果不完整：${block.reason_message || "未提供原因。"}`;
 }
 
-function QualityItemList({ title, items }: { title: string; items: QualityItem[] }) {
+function QualityItemList({
+  title,
+  items,
+  group,
+}: {
+  title: string;
+  items: QualityItem[];
+  group: "fixable" | "manual" | "other";
+}) {
   return (
-    <div style={{ marginTop: "12px" }}>
+    <div style={{ marginTop: "12px" }} data-quality-group={group}>
       <h4 style={{ marginBottom: "8px" }}>
         {title}（{items.length}）
       </h4>
@@ -213,12 +233,15 @@ function QualityItemList({ title, items }: { title: string; items: QualityItem[]
               </p>
             )}
 
-            {item.evidence.length > 0 && (
+            {(item.evidence ?? []).length > 0 && (
               <details style={{ marginTop: "8px" }}>
                 <summary style={{ cursor: "pointer" }}>证据</summary>
                 <ul style={{ marginTop: "6px" }}>
-                  {item.evidence.map((evidence, index) => (
-                    <li key={`${item.item_id}-${index}`}>
+                  {(item.evidence ?? []).map((evidence, index) => (
+                    <li
+                      key={`${item.item_id}-${index}`}
+                      style={{ overflowWrap: "anywhere" }}
+                    >
                       {evidence.file_path
                         ? `${evidence.file_path}${evidence.line_start ? `:${evidence.line_start}` : ""}`
                         : evidence.detail}

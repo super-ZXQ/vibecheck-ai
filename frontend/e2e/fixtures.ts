@@ -371,6 +371,232 @@ export const mockRepairPlan = {
 };
 
 // ---------------------------------------------------------------------------
+// Mock quality report
+// ---------------------------------------------------------------------------
+
+function qualityEvidence(
+  filePath: string,
+  detail: string,
+  snippet = "",
+): {
+  method: string;
+  detail: string;
+  file_path: string | null;
+  line_start: number | null;
+  line_end: number | null;
+  snippet: string;
+} {
+  return {
+    method: "static_analysis",
+    detail,
+    file_path: filePath,
+    line_start: 10,
+    line_end: null,
+    snippet,
+  };
+}
+
+export const mockQualityReport = {
+  schema_version: 1,
+  task_id: TEST_TASK_ID,
+  generated_at: "2025-01-01T00:00:00Z",
+  scanner_version: "quality-v1",
+  overall_status: "partial",
+  summary: {
+    total_items: 4,
+    manual_decision_items: 1,
+    fixable_items: 1,
+    auto_fixable_items: 1,
+    blocks_completed: 1,
+    blocks_not_completed: 1,
+  },
+  blocks: {
+    frontend_dead_code: {
+      dimension: "frontend_dead_code",
+      label: "前端死代码",
+      status: "completed",
+      reason_code: null,
+      reason_message: "",
+      conclusion: {
+        headline: "发现 1 个可自动修复项、1 个仅报告项。",
+        counts: { total_items: 2, by_severity: { P2: 1, P3: 1 } },
+      },
+      evidence: [qualityEvidence("frontend/lib", "扫描了 42 个前端模块")],
+      items: [
+        {
+          item_id: "dead-export-1",
+          dimension: "frontend_dead_code",
+          category: "unused_export",
+          conclusion: "导出未被任何模块引用。",
+          confidence: "high",
+          severity: "P2",
+          title: "未引用的导出 helper",
+          impact: "增加维护成本与打包体积。",
+          suggestion: "删除该导出函数。",
+          fixability: "auto_fix",
+          manual_decision_required: false,
+          limitation: "动态 import 无法完全排除。",
+          rule_id: "FE001",
+          evidence: [
+            qualityEvidence(
+              "src/components/ExtremelyLongUnbrokenIdentifierNameThatCannotBreakOnNarrowScreens.tsx",
+              "全仓引用检索结果为 0。",
+              "export function orphanHelper() {}",
+            ),
+          ],
+          details: {},
+        },
+        {
+          item_id: "dead-report-1",
+          dimension: "frontend_dead_code",
+          category: "unused_css",
+          conclusion: "CSS 类未在代码中出现。",
+          confidence: "medium",
+          severity: "P3",
+          title: "CSS 类可能未使用",
+          impact: "样式冗余。",
+          suggestion: "人工确认模板字符串拼接后删除。",
+          fixability: "report_only",
+          manual_decision_required: false,
+          limitation: "可能由运行时拼接使用。",
+          rule_id: "FE002",
+          evidence: [qualityEvidence("app/globals.css", "仅定义，未发现字面量引用。")],
+          details: {},
+        },
+      ],
+      fixable_item_ids: ["dead-export-1"],
+      manual_confirm_item_ids: [] as string[],
+      verification: {},
+      coverage: {},
+      details: {},
+      truncated: false,
+      truncation_reason: "",
+    },
+    font_license_compliance: {
+      dimension: "font_license_compliance",
+      label: "字体许可与冗余",
+      status: "partial",
+      reason_code: "FONT_ASSET_UNREADABLE",
+      reason_message: "有一份字体文件无法读取元数据。",
+      conclusion: {
+        headline: "1 项需人工确认、1 项仅报告。",
+        counts: { total_fonts: 2, by_source: { css: 1, asset: 1 } },
+      },
+      evidence: [qualityEvidence("", "枚举到 2 个字体来源。")],
+      items: [
+        {
+          item_id: "font-manual-1",
+          dimension: "font_license_compliance",
+          category: "license_unverified",
+          conclusion: "许可无法确认。",
+          confidence: "low",
+          severity: "P2",
+          title: "Inter 字体许可需人工确认",
+          impact: "存在法务风险。",
+          suggestion: "确认 LICENSE 后再决定是否分发。",
+          fixability: "report_only",
+          manual_decision_required: true,
+          limitation: "未找到 LICENSE 文件。",
+          rule_id: "FONT001",
+          evidence: [qualityEvidence("app/globals.css", "仅声明 font-family，未加载字体。")],
+          details: { license: "unverified" },
+        },
+        {
+          item_id: "font-report-1",
+          dimension: "font_license_compliance",
+          category: "declared_not_loaded",
+          conclusion: "字体声明但未加载。",
+          confidence: "high",
+          severity: "P3",
+          title: "声明但未加载的字体",
+          impact: "视觉回退到系统字体。",
+          suggestion: "删除声明或正式引入字体。",
+          fixability: "report_only",
+          manual_decision_required: false,
+          limitation: "不涉及授权义务。",
+          rule_id: "FONT002",
+          evidence: [qualityEvidence("app/globals.css", "未找到 @font-face。")],
+          details: {},
+        },
+      ],
+      fixable_item_ids: [] as string[],
+      manual_confirm_item_ids: ["font-manual-1"],
+      verification: {},
+      coverage: {},
+      details: {},
+      truncated: false,
+      truncation_reason: "",
+    },
+    backend_route_audit: {
+      dimension: "backend_route_audit",
+      label: "后端路由审计",
+      status: "not_completed",
+      reason_code: "ANALYZER_TIMEOUT",
+      reason_message: "路由分析超出时间预算。",
+      conclusion: { headline: "", counts: {} as Record<string, number> },
+      evidence: [],
+      items: [],
+      fixable_item_ids: [] as string[],
+      manual_confirm_item_ids: [] as string[],
+      verification: {},
+      coverage: {},
+      details: {},
+      truncated: false,
+      truncation_reason: "",
+    },
+    backend_comment_quality: {
+      dimension: "backend_comment_quality",
+      label: "中文注释规范",
+      status: "not_applicable",
+      reason_code: "NO_BACKEND",
+      reason_message: "未发现后端源码目录。",
+      conclusion: { headline: "", counts: {} as Record<string, number> },
+      evidence: [],
+      items: [],
+      fixable_item_ids: [] as string[],
+      manual_confirm_item_ids: [] as string[],
+      verification: {},
+      coverage: {},
+      details: {},
+      truncated: false,
+      truncation_reason: "",
+    },
+  },
+  limitations: ["仅覆盖已成功解析的文件。", "仅覆盖已成功解析的文件。"],
+};
+
+/** Empty quality report: all four dimensions completed with no findings. */
+export const mockEmptyQualityReport = {
+  ...mockQualityReport,
+  overall_status: "completed",
+  summary: {
+    total_items: 0,
+    manual_decision_items: 0,
+    fixable_items: 0,
+    auto_fixable_items: 0,
+    blocks_completed: 4,
+    blocks_not_completed: 0,
+  },
+  blocks: Object.fromEntries(
+    Object.entries(mockQualityReport.blocks).map(([key, block]) => [
+      key,
+      {
+        ...block,
+        status: "completed",
+        reason_code: null,
+        reason_message: "",
+        conclusion: { headline: "", counts: {} },
+        evidence: [],
+        items: [],
+        fixable_item_ids: [],
+        manual_confirm_item_ids: [],
+      },
+    ]),
+  ),
+  limitations: [],
+};
+
+// ---------------------------------------------------------------------------
 // Route helpers
 // ---------------------------------------------------------------------------
 
@@ -476,13 +702,16 @@ export function mockAllResults(page: Page, opts?: {
   scanResultStatus?: number;
   assessmentStatus?: number;
   repairPlanStatus?: number;
+  qualityReportStatus?: number;
   scanResultBody?: unknown;
   assessmentBody?: unknown;
   repairPlanBody?: unknown;
+  qualityReportBody?: unknown;
 }) {
   const sr = opts?.scanResultStatus ?? 200;
   const ar = opts?.assessmentStatus ?? 200;
   const rr = opts?.repairPlanStatus ?? 200;
+  const qr = opts?.qualityReportStatus ?? 200;
 
   page.route(`${API_BASE}/api/check/${TEST_TASK_ID}/result`, (route: Route) => {
     if (sr !== 200) {
@@ -543,6 +772,31 @@ export function mockAllResults(page: Page, opts?: {
         status: 200,
         contentType: "application/json",
         body: JSON.stringify(opts?.repairPlanBody ?? mockRepairPlan),
+      });
+    }
+  });
+
+  page.route(`${API_BASE}/api/check/${TEST_TASK_ID}/quality-report`, (route: Route) => {
+    if (qr !== 200) {
+      route.fulfill({
+        status: qr,
+        contentType: "application/json",
+        body: JSON.stringify({
+          detail: {
+            error_code:
+              qr === 409 ? "QUALITY_REPORT_NOT_AVAILABLE" : "QUALITY_REPORT_FAILED",
+            error_message:
+              qr === 409
+                ? "质量报告不可用，请重新提交检测。"
+                : "质量报告生成失败。",
+          },
+        }),
+      });
+    } else {
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(opts?.qualityReportBody ?? mockQualityReport),
       });
     }
   });

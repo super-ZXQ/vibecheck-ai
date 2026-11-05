@@ -641,6 +641,7 @@ async def _process_task(task_id: str, claim_token: str | None = None) -> None:
                     cancel_check=lambda: _get_cancel_event(task_id).is_set(),
                     scanner_version=task.scanner_version,
                     llm_user_config=get_user_config(task_id),
+                    claim_token=claim_token,
                 ),
                 timeout=settings.quality_check_timeout + 5,
             )

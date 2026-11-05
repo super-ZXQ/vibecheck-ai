@@ -12,7 +12,13 @@ const repoRoot = path.resolve(here, "..", "..", "..", "..", "..", "..");
 
 function makeRepo(files) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "frontend-analyzer-test-"));
-  for (const [rel, content] of Object.entries(files)) {
+  const withManifest = {
+    "package.json": JSON.stringify({
+      dependencies: { next: "14.0.0", react: "18.0.0" },
+    }),
+    ...files,
+  };
+  for (const [rel, content] of Object.entries(withManifest)) {
     const target = path.join(root, rel);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(target, content);
@@ -20,10 +26,11 @@ function makeRepo(files) {
   return root;
 }
 
-function run(root) {
+function run(root, env = {}) {
   const stdout = execFileSync(process.execPath, [analyzer, root], {
     encoding: "utf8",
     timeout: 60_000,
+    env: { ...process.env, ...env },
   });
   return JSON.parse(stdout);
 }
@@ -146,4 +153,119 @@ test("dynamic import in the same directory degrades a candidate to medium", () =
   const item = payload.items.find((row) => row.name === "maybeLoaded");
   assert.ok(item);
   assert.equal(item.confidence, "medium");
+});
+
+test("CSS Modules resolve local classes through import bindings", () => {
+  const root = makeRepo({
+    "app/page.tsx": `
+      import { Card } from "../components/Card";
+      export default function Page() { return <Card />; }
+    `,
+    "components/Card.tsx": `
+      import styles from "./card.module.css";
+      const label = "orphan";
+      export function Card() {
+        return <div className={styles.card}><span className={styles["title"]} /></div>;
+      }
+    `,
+    "components/card.module.css": `
+      .card { color: red; }
+      .title { color: blue; }
+      .orphan { color: green; }
+    `,
+  });
+  const payload = run(root);
+  const cssNames = payload.items
+    .filter((item) => item.category === "frontend_unused_css_class")
+    .map((item) => item.class_name)
+    .sort();
+  assert.deepEqual(cssNames, ["orphan"]);
+});
+
+test("Pages Router files are treated as entries and not reported dead", () => {
+  const root = makeRepo({
+    "pages/about.tsx": `
+      export function aboutHelper() { return 1; }
+      export default function About() { return <div>{aboutHelper()}</div>; }
+    `,
+  });
+  const payload = run(root);
+  assert.deepEqual(itemNames(payload), []);
+});
+
+test("arrow functions, exported objects and class methods are candidates", () => {
+  const root = makeRepo({
+    "app/page.tsx": `
+      import { Widget } from "../components/Widget";
+      import { handlers } from "../components/handlers";
+      export default function Page() { return <div><Widget /><span>{handlers.idle()}</span></div>; }
+    `,
+    "components/symbols.ts": `
+      export const deadArrow = () => 1;
+    `,
+    "components/handlers.ts": `
+      export const handlers = {
+        idle: () => 0,
+        deadAction: () => 1,
+      };
+    `,
+    "components/Widget.tsx": `
+      export class Widget {
+        render() { return null; }
+        deadMethod() { return 1; }
+      }
+    `,
+  });
+  const payload = run(root);
+  const names = itemNames(payload).sort();
+  assert.ok(names.includes("deadArrow"));
+  assert.ok(names.includes("handlers.deadAction"));
+  assert.ok(names.includes("Widget.deadMethod"));
+  assert.ok(!names.includes("handlers.idle"));
+});
+
+test("build output matching uses identifier boundaries", () => {
+  const root = makeRepo({
+    ".next/chunk.js": `const foobar = 1;`,
+    "components/symbols.ts": `export function foo() { return 1; }`,
+  });
+  const payload = run(root);
+  assert.ok(itemNames(payload).includes("foo"));
+});
+
+test("pure backend repository is not mistaken for a frontend project", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "frontend-analyzer-backend-"));
+  fs.mkdirSync(path.join(root, "app"), { recursive: true });
+  fs.writeFileSync(path.join(root, "app", "main.py"), "def main():\n    return 1\n");
+  fs.writeFileSync(path.join(root, "requirements.txt"), "django\n");
+  const payload = run(root);
+  assert.equal(payload.status, "not_applicable");
+});
+
+test("output truncation degrades to partial with omitted count", () => {
+  const exports = Array.from(
+    { length: 205 },
+    (_, index) => `export const unused${index} = () => ${index};`,
+  ).join("\n");
+  const root = makeRepo({ "components/many.ts": exports });
+  const payload = run(root);
+  assert.equal(payload.status, "partial");
+  assert.equal(payload.reason_code, "RESULT_TRUNCATED");
+  assert.equal(payload.items.length, 200);
+  assert.equal(payload.counts.omitted_items, 5);
+});
+
+test("source enumeration truncation degrades to partial and never claims completion", () => {
+  const files = {};
+  for (let index = 0; index < 6; index += 1) {
+    files[`components/c${index}.ts`] = `export const unused${index} = () => ${index};`;
+  }
+  const root = makeRepo(files);
+  const payload = run(root, { VIBECHECK_ANALYZER_MAX_FILES: "3" });
+  assert.equal(payload.status, "partial");
+  assert.equal(payload.reason_code, "RESULT_TRUNCATED");
+  assert.equal(payload.counts.omitted_source_files, null);
+  assert.ok(
+    payload.limitations.some((line) => line.includes("源文件枚举")),
+  );
 });

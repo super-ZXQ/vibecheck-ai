@@ -13,9 +13,9 @@ from typing import Any
 
 from app.core.config import settings
 from app.core.scanner_version import SCANNER_VERSION
-from app.db.database import init_db
-from app.db.models import QualityCheckResultRow
+from app.db.models import QualityCheckResultRow, TaskRow
 from app.db.repositories import results as result_repo
+from app.db.repositories.tasks import STATUS_RUNNING
 from app.db.session import get_session_factory
 from app.quality.analyzers.comment_quality import analyze_backend_comments
 from app.quality.analyzers.font_audit import analyze_font_licenses
@@ -107,15 +107,49 @@ def _enforce_limits(report: QualityReport) -> str:
         block.items = []
         block.details = {}
         _mark_truncated(block)
-    return json.dumps(report.to_dict(), ensure_ascii=False, separators=(",", ":"))
+    # 清空明细后必须按最终体积重新校验，不能默认已回到上限内。
+    payload = json.dumps(report.to_dict(), ensure_ascii=False, separators=(",", ":"))
+    if len(payload.encode("utf-8")) <= settings.quality_max_json_bytes:
+        return payload
+    for block in report.blocks.values():
+        block.verification = {}
+        block.coverage = {}
+        block.conclusion = {}
+        _mark_truncated(block)
+    report.limitations = []
+    payload = json.dumps(report.to_dict(), ensure_ascii=False, separators=(",", ":"))
+    if len(payload.encode("utf-8")) > settings.quality_max_json_bytes:
+        raise ValueError("quality report exceeds size limit after truncation")
+    return payload
 
 
-async def _save_report(task_id: str, report: QualityReport, payload: str) -> bool:
-    init_db()
+async def _save_report(
+    task_id: str,
+    report: QualityReport,
+    payload: str,
+    *,
+    claim_token: str | None = None,
+) -> bool:
     factory = get_session_factory()
     summary = report.summary()
     try:
         async with factory() as session:
+            if claim_token is not None:
+                # 与其他状态写入一致：锁定任务行并校验 claim token。
+                # reaper 抢走任务后 worker_id/状态会变化，本 worker 不得覆盖报告。
+                task_row = await session.get(
+                    TaskRow, task_id, with_for_update=True
+                )
+                if (
+                    task_row is None
+                    or task_row.worker_id != claim_token
+                    or task_row.status != STATUS_RUNNING
+                    or task_row.cancelled_at is not None
+                ):
+                    logger.warning(
+                        "quality report write fenced for task %s", task_id
+                    )
+                    return False
             row = await session.get(QualityCheckResultRow, task_id)
             if row is None:
                 row = QualityCheckResultRow(task_id=task_id)
@@ -147,6 +181,7 @@ async def run_quality_checks(
     cancel_check: Callable[[], bool] | None = None,
     scanner_version: str | None = None,
     llm_user_config: dict[str, Any] | None = None,
+    claim_token: str | None = None,
 ) -> bool:
     """Run all default-on quality checks and persist a structured report.
 
@@ -247,7 +282,9 @@ async def run_quality_checks(
     )
     try:
         payload = _enforce_limits(report)
-        return await _save_report(task_id, report, payload)
+        return await _save_report(
+            task_id, report, payload, claim_token=claim_token
+        )
     except Exception:
         logger.warning("quality report build failed for task %s", task_id, exc_info=True)
         return False

@@ -213,3 +213,93 @@ def test_this_repository_is_the_golden_sample():
         assert any(ops_path in title for title in ops_titles), (
             f"{ops_path} must land in manual confirmation"
         )
+
+
+def test_non_literal_include_router_prefix_is_unresolved(tmp_path):
+    index = _write_repo(
+        tmp_path,
+        {
+            "backend/app/api/users.py": (
+                "from fastapi import APIRouter\n"
+                "router = APIRouter(prefix='/users')\n"
+                "@router.get('/list')\n"
+                "def list_users():\n"
+                "    return []\n"
+            ),
+            "backend/app/main.py": (
+                "import os\n"
+                "from fastapi import FastAPI\n"
+                "from app.api import users\n"
+                "app = FastAPI()\n"
+                "app.include_router(users.router, prefix=os.environ['API_PREFIX'])\n"
+            ),
+        },
+    )
+    block = analyze_backend_routes(index)
+    rows = [
+        row
+        for row in _routes(block)
+        if row["registration"]["file_path"].endswith("api/users.py")
+    ]
+    assert len(rows) == 1
+    assert rows[0]["path"] == "<unresolved>"
+    manual = [
+        item
+        for item in block.to_dict()["items"]
+        if item["category"] == "unresolved_route"
+    ]
+    assert manual and all(item["manual_decision_required"] for item in manual)
+
+
+def test_router_and_include_router_dependencies_count_as_auth_guards(tmp_path):
+    index = _write_repo(
+        tmp_path,
+        {
+            "backend/app/api/users.py": (
+                "from fastapi import APIRouter, Depends\n"
+                "def require_auth():\n"
+                "    return None\n"
+                "router = APIRouter(prefix='/users', dependencies=[Depends(require_auth)])\n"
+                "@router.get('/list')\n"
+                "def list_users():\n"
+                "    return []\n"
+            ),
+            "backend/app/api/orders.py": (
+                "from fastapi import APIRouter\n"
+                "router = APIRouter(prefix='/orders')\n"
+                "@router.get('/list')\n"
+                "def list_orders():\n"
+                "    return []\n"
+            ),
+            "backend/app/main.py": (
+                "from fastapi import Depends, FastAPI\n"
+                "from app.api import users, orders\n"
+                "def require_auth():\n"
+                "    return None\n"
+                "app = FastAPI()\n"
+                "app.include_router(users.router)\n"
+                "app.include_router(orders.router, dependencies=[Depends(require_auth)])\n"
+            ),
+        },
+    )
+    block = analyze_backend_routes(index)
+    assert _route(block, "/users/list")["auth_guard"] == "require_auth"
+    assert _route(block, "/orders/list")["auth_guard"] == "require_auth"
+
+
+def test_route_item_ids_are_unique_across_files(tmp_path):
+    body = (
+        "from fastapi import APIRouter\n"
+        "router = APIRouter()\n"
+        "@router.get('/same')\n"
+        "def same():\n"
+        "    return {}\n"
+    )
+    index = _write_repo(
+        tmp_path,
+        {"backend/app/api/a.py": body, "backend/app/api/b.py": body},
+    )
+    block = analyze_backend_routes(index)
+    item_ids = [item["item_id"] for item in block.to_dict()["items"]]
+    assert item_ids
+    assert len(item_ids) == len(set(item_ids))

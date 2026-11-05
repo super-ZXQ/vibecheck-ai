@@ -466,8 +466,21 @@ def analyze_font_licenses(index: RepositoryIndex) -> QualityBlock:
 
     items: list[QualityItem] = []
     classifications: list[dict[str, Any]] = []
+    # 三态互斥：已随仓库分发的字体族不得再计入 not_distributed。
+    distributed_family_keys: set[str] = set()
+    for face in faces:
+        family = face["family"]
+        if family and (face["src_urls"] or face["data_uris"]):
+            distributed_family_keys.add(family.lower())
+    for next_font in next_fonts:
+        if next_font["mode"] == "local" and next_font["src_paths"]:
+            distributed_family_keys.add(next_font["family"].lower())
     system_families = sorted(
-        {used[key].family for key in used if _is_system_family(key)}
+        {
+            used[key].family
+            for key in used
+            if _is_system_family(key) and key not in distributed_family_keys
+        }
     )
     distributed_records = [
         record
@@ -692,6 +705,7 @@ def analyze_font_licenses(index: RepositoryIndex) -> QualityBlock:
         details={
             "fonts": classifications[:_MAX_BUILD_FONTS_LISTED],
             "system_family_names": system_families,
+            "not_distributed_family_names": system_families,
             "external_sources": external_sources,
             "npm_font_packages": package_fonts,
             "unreferenced_assets": [

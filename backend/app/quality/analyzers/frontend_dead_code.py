@@ -7,7 +7,9 @@ npm scripts. Timeout, heap size and output size are enforced here.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import shutil
 import subprocess
 import tempfile
@@ -25,6 +27,7 @@ from app.quality.models import (
     REASON_ANALYZER_UNAVAILABLE,
     REASON_INPUT_MISSING,
     REASON_PARTIAL_ENUMERATION,
+    REASON_RESULT_TRUNCATED,
     STATUS_COMPLETED,
     STATUS_NOT_APPLICABLE,
     STATUS_NOT_COMPLETED,
@@ -34,6 +37,8 @@ from app.quality.models import (
     QualityItem,
 )
 from app.quality.repository_index import RepositoryIndex
+
+logger = logging.getLogger(__name__)
 
 _ANALYZER_DIR = Path(__file__).resolve().parent / "frontend_analyzer"
 _SCRIPT = _ANALYZER_DIR / "analyzer.mjs"
@@ -94,8 +99,16 @@ def _run_node(root: Path, node: str) -> tuple[int, str, str, bool]:
             try:
                 returncode = process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+                # 尽力终止子进程：先 SIGTERM，宽限期后 SIGKILL。
+                # 限制：Python 线程内的 CPU 计算无法被强制终止，若 Node 进程
+                # 已退出但线程仍卡在解析，外层 asyncio 超时后该线程仍会跑到
+                # 自然结束；这里只能保证子进程不继续占用资源。
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
                 return -1, "", "", True
         stdout_size = stdout_path.stat().st_size if stdout_path.exists() else 0
         if stdout_size > max_output:
@@ -107,6 +120,13 @@ def _run_node(root: Path, node: str) -> tuple[int, str, str, bool]:
             else ""
         )
         return returncode, stdout, stderr, False
+
+
+def _file_token(file_path: str) -> str:
+    """Stable short file prefix so item ids never collide across files."""
+    if not file_path:
+        return "nofile"
+    return hashlib.sha1(file_path.encode("utf-8")).hexdigest()[:8]
 
 
 def _item_from_payload(payload: dict[str, Any]) -> QualityItem | None:
@@ -150,7 +170,9 @@ def _item_from_payload(payload: dict[str, Any]) -> QualityItem | None:
         line_start=line if isinstance(line, int) else None,
         line_end=line if isinstance(line, int) else None,
     )
-    item_id = f"frontend-{category}-{line or 0}-{name}"
+    item_id = (
+        f"frontend-{category}-{_file_token(file_path)}-{line or 0}-{name}"
+    )
     return QualityItem(
         item_id=item_id,
         dimension=DIMENSION_FRONTEND_DEAD_CODE,
@@ -207,10 +229,16 @@ def analyze_frontend_dead_code(index: RepositoryIndex) -> QualityBlock:
             "前端分析器输出超出上限，未完成。",
         )
     if returncode != 0:
+        # 原始 stderr/退出码可能包含内部绝对路径与异常栈：只进服务端日志。
+        logger.warning(
+            "frontend analyzer failed: returncode=%s stderr=%s",
+            returncode,
+            stderr,
+        )
         return _block(
             STATUS_NOT_COMPLETED,
             REASON_ANALYZER_ERROR,
-            f"前端分析器退出异常（{returncode}）：{stderr[:200]}",
+            "前端分析器运行失败（内部错误），未完成。",
         )
     try:
         payload = json.loads(stdout)
@@ -235,12 +263,16 @@ def analyze_frontend_dead_code(index: RepositoryIndex) -> QualityBlock:
         block.details = {"limitations": []}
         return block
     if status not in {STATUS_COMPLETED, STATUS_PARTIAL}:
-        message = str(payload.get("message") or "前端分析器未完成。")
+        # 分析器自报的 message 可能含内部异常细节：只记日志，对外固定文案。
+        logger.warning(
+            "frontend analyzer reported %s: %s",
+            status or "<empty>",
+            payload.get("message") or "<no message>",
+        )
         return _block(
             STATUS_NOT_COMPLETED,
             REASON_ANALYZER_ERROR,
-            message,
-            limitations=[message],
+            "前端分析器内部错误，未完成。",
         )
 
     raw_items = payload.get("items")
@@ -259,20 +291,28 @@ def analyze_frontend_dead_code(index: RepositoryIndex) -> QualityBlock:
         confidence_counts[item.confidence] += 1
     headline = (
         f"前端死代码静态分析：{len(items)} 条只读报告"
-        f"（零调用函数 {counts.get('zero_call_functions', 0)}，"
+        f"（零调用导出 {counts.get('zero_call_functions', 0)}，"
         f"未引用 CSS 类 {counts.get('css_classes', 0)}）。"
     )
     status = STATUS_PARTIAL if status == STATUS_PARTIAL or not build.get("available") else STATUS_COMPLETED
-    reason_code = (
-        REASON_PARTIAL_ENUMERATION if status == STATUS_PARTIAL else None
-    )
+    if status == STATUS_PARTIAL and payload.get("reason_code") == REASON_RESULT_TRUNCATED:
+        reason_code = REASON_RESULT_TRUNCATED
+        reason_message = (
+            str(payload.get("message") or "结果超出容量上限，已截断。")[:300]
+        )
+    elif status == STATUS_PARTIAL:
+        reason_code = REASON_PARTIAL_ENUMERATION
+        reason_message = str(
+            payload.get("message") or "部分输入缺失或达到上限，结果可能不完整。"
+        )[:300]
+    else:
+        reason_code = None
+        reason_message = "前端死代码静态分析完成。"
     block = QualityBlock(
         dimension=DIMENSION_FRONTEND_DEAD_CODE,
         status=status,
         reason_code=reason_code,
-        reason_message=(
-            "构建产物缺失，置信度已降级。" if status == STATUS_PARTIAL else "前端死代码静态分析完成。"
-        ),
+        reason_message=reason_message,
         conclusion={
             "headline": headline,
             "counts": {
@@ -286,6 +326,8 @@ def analyze_frontend_dead_code(index: RepositoryIndex) -> QualityBlock:
                 "confidence": confidence_counts,
                 "source_files": counts.get("source_files", 0),
                 "next_entries": counts.get("next_entries", 0),
+                "omitted_items": counts.get("omitted_items", 0),
+                "omitted_source_files": counts.get("omitted_source_files", 0),
             },
         },
         items=items,
